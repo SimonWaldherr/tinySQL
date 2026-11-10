@@ -395,23 +395,44 @@ func simpleFloatOrderColumn(plan *simpleSelectPlan) (int, bool) {
 // variant of the ordered raw fast path. Its ordering intentionally uses the
 // same < and > comparisons as compareFloat, including treating NaN as equal
 // to every other value, so it preserves the generic comparator's behavior.
-func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, sourceRows [][]any, column, keepCount int) (*ResultSet, error) {
+func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, sourceRows [][]any, column, keepCount int, fullSort bool) (*ResultSet, error) {
 	var scanPhase *queryPhase
 	if env.profile != nil {
-		_, scanPhase = startQueryPhase(env, "SCAN/TOP-N", "raw float ordering")
+		operation := "SCAN/TOP-N"
+		if fullSort {
+			operation = "SCAN"
+		}
+		_, scanPhase = startQueryPhase(env, operation, "raw float ordering")
 		defer scanPhase.finish(-1)
+	}
+	capacity := simpleSelectInitialCap(plan)
+	if fullSort {
+		capacity = len(sourceRows)
 	}
 	topRows := floatOrderedRawRowHeap{
 		desc:  plan.orderBy[0].Desc,
-		items: make([]floatOrderedRawRow, 0, simpleSelectInitialCap(plan)),
+		items: make([]floatOrderedRawRow, 0, capacity),
 	}
-	for i, raw := range sourceRows {
-		if i&63 == 0 {
-			if err := checkCtx(env.ctx); err != nil {
-				return nil, err
+	// Keep the mode branch outside the row loop: small pages retain their
+	// original heap loop without an extra condition for every source row.
+	if fullSort {
+		for i, raw := range sourceRows {
+			if i&63 == 0 {
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
 			}
+			topRows.items = append(topRows.items, floatOrderedRawRow{raw: raw, key: raw[column].(float64), idx: i})
 		}
-		topRows.pushBounded(floatOrderedRawRow{raw: raw, key: raw[column].(float64), idx: i}, keepCount)
+	} else {
+		for i, raw := range sourceRows {
+			if i&63 == 0 {
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
+			}
+			topRows.pushBounded(floatOrderedRawRow{raw: raw, key: raw[column].(float64), idx: i}, keepCount)
+		}
 	}
 
 	rows := topRows.items
@@ -420,7 +441,13 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 	if env.profile != nil {
 		_, sortPhase = startQueryPhase(env, "SORT", "order retained float candidates")
 	}
-	sort.Stable(floatOrderedRawRowsAsc{desc: topRows.desc, items: rows})
+	order := floatOrderedRawRowsAsc{desc: topRows.desc, items: rows}
+	if fullSort {
+		// Validated keys form a total order, with scan position breaking ties.
+		sort.Sort(order)
+	} else {
+		sort.Stable(order)
+	}
 	sortPhase.finish(int64(len(rows)))
 	start := 0
 	if plan.offset != nil && *plan.offset > 0 {
@@ -755,6 +782,10 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	if plan.limit != nil {
 		keepCount = boundedLimitRows(plan.limit, plan.offset, rowCount)
 	}
+	fullSort, err := preferFullRawSort(env, plan, sourceRows, keepCount)
+	if err != nil {
+		return nil, true, err
+	}
 	if scorer, ok := simpleFloatOrderScorer(plan); ok && keepCount > 0 {
 		rs, err := executeSimpleSelectFloatScoredTopN(env, plan, sourceRows, rowCount, keepCount, scorer)
 		return rs, true, err
@@ -787,7 +818,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		}
 		validatePhase.finish(0)
 		if allFloat64 {
-			rs, err := executeSimpleSelectFloatOrderedTopN(env, plan, sourceRows, column, keepCount)
+			rs, err := executeSimpleSelectFloatOrderedTopN(env, plan, sourceRows, column, keepCount, fullSort)
 			return rs, true, err
 		}
 	}
@@ -796,7 +827,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	if env.profile != nil {
 		detail := "collect raw ordering keys"
 		operation := "SCAN/FILTER"
-		if keepCount > 0 {
+		if keepCount > 0 && !fullSort {
 			detail = "retain bounded ordering candidates"
 			operation = "SCAN/FILTER/TOP-N"
 		}
@@ -815,7 +846,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	// the chunks cost a handful of allocations instead of one per row.
 	var keyArena, reusableKeys []any
 	var topRows orderedRawRowHeap
-	useTopN := keepCount > 0
+	useTopN := keepCount > 0 && !fullSort
 	if useTopN {
 		if len(plan.orderBy) > 1 {
 			keyArena = make([]any, 0, min(keepCount+1, rawKeyArenaChunkRows)*len(plan.orderBy))
@@ -825,7 +856,11 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			items: make([]orderedRawRow, 0, simpleSelectInitialCap(plan)),
 		}
 	} else {
-		rows = make([]orderedRawRow, 0, simpleSelectInitialCap(plan))
+		capacity := simpleSelectInitialCap(plan)
+		if fullSort {
+			capacity = rowCount
+		}
+		rows = make([]orderedRawRow, 0, capacity)
 	}
 	for i := 0; i < rowCount; i++ {
 		rowID := i
@@ -966,7 +1001,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 
 func sortFullOrderedRawPositions(plan *simpleSelectPlan, rows []orderedRawRow, perm []int32) {
 	slices.SortFunc(perm, func(i, j int32) int {
-		if cmp := compareOrderedRawRows(plan, rows[i], rows[j]); cmp != 0 {
+		if cmp := compareOrderedRawRows(plan, &rows[i], &rows[j]); cmp != 0 {
 			return cmp
 		}
 		if i < j {
@@ -1009,7 +1044,7 @@ type orderedRawRowsPermAsc struct {
 func (s orderedRawRowsPermAsc) Len() int { return len(s.perm) }
 func (s orderedRawRowsPermAsc) Less(i, j int) bool {
 	pi, pj := s.perm[i], s.perm[j]
-	if cmp := compareOrderedRawRows(s.plan, s.items[pi], s.items[pj]); cmp != 0 {
+	if cmp := compareOrderedRawRows(s.plan, &s.items[pi], &s.items[pj]); cmp != 0 {
 		return cmp < 0
 	}
 	return pi < pj
@@ -1024,7 +1059,7 @@ type orderedRawRowHeap struct {
 func (h orderedRawRowHeap) Len() int { return len(h.items) }
 
 func (h orderedRawRowHeap) Less(i, j int) bool {
-	return compareOrderedRawRows(h.plan, h.items[i], h.items[j]) > 0
+	return compareOrderedRawRows(h.plan, &h.items[i], &h.items[j]) > 0
 }
 
 func (h orderedRawRowHeap) Swap(i, j int) {
@@ -1082,7 +1117,7 @@ func (h *orderedRawRowHeap) pushBounded(item orderedRawRow, keepCount int) []any
 		orderedRawRowHeapPush(h, item)
 		return nil
 	}
-	if compareOrderedRawRows(h.plan, h.items[0], item) > 0 {
+	if compareOrderedRawRows(h.plan, &h.items[0], &item) > 0 {
 		reusable := h.items[0].keys
 		h.items[0] = item
 		orderedRawRowHeapDown(*h, 0)
@@ -1091,7 +1126,7 @@ func (h *orderedRawRowHeap) pushBounded(item orderedRawRow, keepCount int) []any
 	return item.keys
 }
 
-func compareOrderedRawRows(plan *simpleSelectPlan, a, b orderedRawRow) int {
+func compareOrderedRawRows(plan *simpleSelectPlan, a, b *orderedRawRow) int {
 	if len(plan.orderBy) == 1 {
 		if cmp := compareOrderedValueNulls(a.key, b.key, plan.orderBy[0].Desc, plan.orderBy[0].Nulls); cmp != 0 {
 			return cmp

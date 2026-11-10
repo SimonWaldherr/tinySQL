@@ -84,6 +84,10 @@ current behavior and keep performance claims scoped to the workload they measure
   allocation-churn tradeoffs.
 - [Driver and engine performance](driver-engine-performance.md) — shared
   allocation and execution-path improvements; it links to focused records below.
+- [Standard SQL execution](standard-query-performance.md) — bound SELECT, WHERE
+  and UPDATE expressions, plus raw ordering without copying sort candidates.
+- [Query optimizer research](query-optimizer-research.md) — PostgreSQL, DuckDB
+  and SQLite techniques assessed against tinySQL, with adaptive large-page sorts.
 - [CTE alignment](cte-performance.md), [CTE and indexed SELECT](cte-select-performance.md),
   [ORDER BY and aggregates](order-aggregate-performance.md), and
   [windows, DISTINCT, and LIMIT](window-distinct-limit-performance.md).

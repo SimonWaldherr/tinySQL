@@ -30,6 +30,9 @@ async function main() {
   const result = success(db.query('SELECT id, label, active FROM items ORDER BY id'));
   assert.deepEqual(result.columns, ['id', 'label', 'active']);
   assert.deepEqual(result.rows, expected); // Exercises the bulk result bridge.
+  assert.deepEqual(success(db.query(`SELECT SUM((id+1)*2) AS total, AVG((id+1)*2) AS mean,
+    COUNT(DISTINCT (id+1)%5) AS kinds, MIN(CAST(id AS FLOAT)+0.5) AS smallest,
+    MAX((id+1)*2) AS largest FROM items`)).rows, [[40200, 201, 5, 0.5, 400]]);
   assert.deepEqual(success(db.query('SELECT id FROM items WHERE id = -1')).rows, []);
   // Cross multiple result-transfer blocks, including the small/large boundary.
   success(db.exec('CREATE TABLE bulk_transfer (id INT, label TEXT, active BOOL)'));
@@ -45,6 +48,20 @@ async function main() {
     assert.deepEqual(bulk.rows, bulkExpected.slice(0, limit));
     assert.equal(bulk.count, limit);
     assert.equal(typeof bulk.elapsed_ms, 'number');
+  }
+  // Large/deep pages exercise adaptive generic and unboxed float ordering.
+  const byActivity = bulkExpected.slice().sort((a, b) => Number(b[2]) - Number(a[2]) || b[0] - a[0]);
+  for (const [limit, offset] of [[4900, 0], [5, 4998]]) {
+    assert.deepEqual(success(db.query(`SELECT id FROM bulk_transfer ORDER BY active DESC,id DESC LIMIT ${limit} OFFSET ${offset}`)).rows,
+      byActivity.slice(offset, offset + limit).map(row => [row[0]]));
+  }
+  success(db.exec('CREATE TABLE ordered_floats (id INT, score FLOAT)'));
+  const floatRows = Array.from({ length: 200 }, (_, id) => [id, ((id * 97) % 31) / 4]);
+  success(db.exec(`INSERT INTO ordered_floats VALUES ${floatRows.map(([id, score]) => `(${id},${score})`).join(',')}`));
+  const byScore = floatRows.slice().sort((a, b) => b[1] - a[1]);
+  for (const [limit, offset] of [[190, 0], [3, 197]]) {
+    assert.deepEqual(success(db.query(`SELECT id FROM ordered_floats ORDER BY score DESC LIMIT ${limit} OFFSET ${offset}`)).rows,
+      byScore.slice(offset, offset + limit).map(row => [row[0]]));
   }
   // CTE ordering binds source qualifiers and output aliases before pagination.
   const orderedCTE = success(db.query('WITH c AS (SELECT id,label,active FROM bulk_transfer) SELECT q.id AS id,q.label AS caption FROM c q WHERE q.id>=4900 ORDER BY q.active DESC,id DESC LIMIT 5 OFFSET 2'));

@@ -67,6 +67,7 @@ type simpleAggregateProjection struct {
 	// argument needs evaluation. It belongs to this table-bound plan only.
 	argColumn  int
 	argBinary  *aggregateBinaryArg
+	argValue   rawValueEvaluator
 	groupIndex int // only used by aggGroupCol
 }
 
@@ -428,6 +429,9 @@ func evalSimpleAggregateArg(rawPlan *simpleSelectPlan, raw []any, proj simpleAgg
 			return nil, fmt.Errorf("column %q is out of range", proj.arg.(*VarRef).Name)
 		}
 		return raw[col], nil
+	}
+	if proj.argValue != nil {
+		return proj.argValue(raw)
 	}
 	return evalRawExpr(rawPlan, raw, proj.arg)
 }
@@ -825,7 +829,8 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 		}
 	}
 
-	// Bind direct arguments and simple SUM/AVG arithmetic once per execution.
+	// Bind argument evaluation once per execution, keeping the direct-column
+	// and unboxed SUM/AVG paths ahead of the general bound evaluator.
 	// Unknown names and other expressions retain the evaluator's existing
 	// error/lazy semantics.
 	for i := range projs {
@@ -839,6 +844,12 @@ func buildSimpleAggregatePlan(env ExecEnv, s *Select) (*simpleAggregatePlan, boo
 			}
 			if col, found := colIndex[key]; found && col >= 0 {
 				projs[i].argColumn = col + 1
+			}
+		}
+		if projs[i].arg != nil && projs[i].argColumn == 0 && projs[i].argBinary == nil {
+			switch projs[i].arg.(type) {
+			case *Binary, *FuncCall:
+				projs[i].argValue = compileRawValue(colIndex, projs[i].arg)
 			}
 		}
 	}

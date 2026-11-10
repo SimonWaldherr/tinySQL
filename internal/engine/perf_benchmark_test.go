@@ -319,6 +319,14 @@ func BenchmarkInsertIntoLargePKTable(b *testing.B) {
 // statement atomicity. The constraint seek and row-local rollback snapshot
 // should keep work independent of the 20k-row table size.
 func BenchmarkUpdateByPrimaryKey(b *testing.B) {
+	benchmarkUpdateByPrimaryKey(b, "42")
+}
+
+func BenchmarkUpdateArithmeticByPrimaryKey(b *testing.B) {
+	benchmarkUpdateByPrimaryKey(b, "score + 1")
+}
+
+func benchmarkUpdateByPrimaryKey(b *testing.B, value string) {
 	db := storage.NewDB()
 	ctx := context.Background()
 	if _, err := Execute(ctx, db, "default", mustParse(
@@ -339,7 +347,7 @@ func BenchmarkUpdateByPrimaryKey(b *testing.B) {
 		`CREATE INDEX idx_updates_bucket ON updates(bucket)`)); err != nil {
 		b.Fatal(err)
 	}
-	stmt := mustParse(`UPDATE updates SET score = 42 WHERE id = 12345`)
+	stmt := mustParse(`UPDATE updates SET score = ` + value + ` WHERE id = 12345`)
 
 	b.ReportAllocs()
 	b.ResetTimer()

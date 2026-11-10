@@ -137,13 +137,17 @@ func buildSimpleSelectProjection(it SelectItem, idx int, colIndex map[string]int
 			colIdx = idx
 		}
 	}
+	var value rawValueEvaluator
+	if colIdx < 0 {
+		value = compileRawValue(colIndex, it.Expr)
+	}
 	return simpleProjection{
 		name:   name,
 		key:    strings.ToLower(name),
 		side:   -1,
 		colIdx: colIdx,
 		expr:   it.Expr,
-		value:  compileRawConversion(colIndex, it.Expr),
+		value:  value,
 	}, true
 }
 

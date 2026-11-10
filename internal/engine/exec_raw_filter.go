@@ -257,6 +257,12 @@ func buildRawExprFilter(colIndex map[string]int, e Expr) func([]any) (bool, erro
 	if filter := buildRawConversionFilter(colIndex, e); filter != nil {
 		return filter
 	}
+	if value := compileRawValue(colIndex, e); value != nil {
+		return func(raw []any) (bool, error) {
+			v, err := value(raw)
+			return toTri(v) == tvTrue, err
+		}
+	}
 	// Eager, not lazy: this plan is captured by the closure below, and that
 	// closure can end up in a cached plan template (see
 	// loadSimpleSelectPlanTemplate) shared by concurrently executing

@@ -317,6 +317,24 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	if indexed {
 		candidateCount = len(plan.rowIDs)
 	}
+	// Amortize binding across a scan. Keep evaluators local to this execution
+	// and leave small/point updates and the shared DML plan's SET list alone.
+	var setValues []rawValueEvaluator
+	if candidateCount >= 64 {
+		for i, set := range plan.sets {
+			if _, binary := set.expr.(*Binary); !binary {
+				continue
+			}
+			value := compileRawValue(plan.colIndex, set.expr)
+			if value == nil {
+				continue
+			}
+			if setValues == nil {
+				setValues = make([]rawValueEvaluator, len(plan.sets))
+			}
+			setValues[i] = value
+		}
+	}
 	arena := dmlRowArena{rowsPerBlock: 1}
 	if plan.where == nil {
 		// Only pack whole-table updates: a selective predicate must not
@@ -353,7 +371,13 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		}
 
 		for i, set := range plan.sets {
-			v, err := evalRawExpr(rawPlan, raw, set.expr)
+			var v any
+			var err error
+			if setValues != nil && setValues[i] != nil {
+				v, err = setValues[i](raw)
+			} else {
+				v, err = evalRawExpr(rawPlan, raw, set.expr)
+			}
 			if err != nil {
 				return nil, true, err
 			}
