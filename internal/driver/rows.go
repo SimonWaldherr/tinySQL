@@ -49,8 +49,10 @@ func (r *rows) Close() error {
 		if r.stream != nil {
 			r.closeErr = r.stream.Close()
 		}
-		if r.onClose != nil {
-			r.onClose()
+		onClose := r.onClose
+		r.onClose = nil
+		if onClose != nil {
+			onClose()
 		}
 	})
 	return r.closeErr

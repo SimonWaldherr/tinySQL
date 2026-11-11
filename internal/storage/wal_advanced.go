@@ -1140,7 +1140,10 @@ func applyOperation(db *DB, record *WALRecord) (*Table, error) {
 	case WALOpDelete:
 		// Find and remove the row
 		if i, ok := locateLoggedRow(table, record); ok {
-			table.Rows = append(table.Rows[:i], table.Rows[i+1:]...)
+			last := len(table.Rows) - 1
+			copy(table.Rows[i:], table.Rows[i+1:])
+			table.Rows[last] = nil
+			table.Rows = table.Rows[:last]
 			table.noteStructuralChange()
 			// Every later row shifts down one position, which executor
 			// state built from row positions cannot reconcile.

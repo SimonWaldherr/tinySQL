@@ -441,6 +441,9 @@ func (bp *BufferPool) Remove(tenant, name string) {
 			bp.stats.TablesInMemory--
 			bp.stats.mu.Unlock()
 		}
+		if len(tenantCache) == 0 {
+			delete(bp.cache, tenant)
+		}
 	}
 
 	bp.updateStats()
@@ -484,6 +487,9 @@ func (bp *BufferPool) evictLRU(needed int64) {
 				bp.evictionSaver(tenant, name, cached.Table)
 			}
 			delete(tenantCache, name)
+			if len(tenantCache) == 0 {
+				delete(bp.cache, tenant)
+			}
 			freed += cached.Size
 			evicted++
 

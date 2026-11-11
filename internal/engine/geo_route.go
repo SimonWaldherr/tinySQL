@@ -28,6 +28,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -494,6 +495,8 @@ type routeSearchScratch struct {
 	heap               routeHeap
 }
 
+// Limit every retained scratch instance, in both the hot slot and sync.Pool.
+// Searches may use larger graphs, but release their arrays when finished.
 const routeScratchHotMaxBytes = 64 << 20
 
 var routeSearchScratchPool = sync.Pool{New: func() any { return &routeSearchScratch{} }}
@@ -587,38 +590,58 @@ func acquireRouteSearchScratch(nodes int, needParents bool) *routeSearchScratch 
 		scratch.prevEdge = scratch.prevEdge[:0]
 	}
 	scratch.heap = scratch.heap[:0]
-	scratch.mark++
-	if scratch.mark == 0 {
-		clear(scratch.generation)
-		scratch.mark = 1
-	}
+	scratch.nextGeneration()
 	return scratch
 }
 
-func releaseRouteSearchScratch(scratch *routeSearchScratch) {
-	scratch.heap = scratch.heap[:0]
-	if routeSearchScratchBytes(scratch) <= routeScratchHotMaxBytes {
-		routeSearchScratchHot.Lock()
-		if routeSearchScratchHot.scratch == nil || routeSearchScratchBytes(scratch) > routeSearchScratchBytes(routeSearchScratchHot.scratch) {
-			pooled := routeSearchScratchHot.scratch
-			routeSearchScratchHot.scratch = scratch
-			routeSearchScratchHot.Unlock()
-			if pooled != nil {
-				routeSearchScratchPool.Put(pooled)
-			}
-			return
-		}
-		routeSearchScratchHot.Unlock()
+func (scratch *routeSearchScratch) nextGeneration() {
+	scratch.mark++
+	if scratch.mark == 0 {
+		// A smaller graph may have shortened the slice since an old mark was
+		// written. Clear its full capacity before an epoch can be reused.
+		clear(scratch.generation[:cap(scratch.generation)])
+		scratch.mark = 1
 	}
+}
+
+func releaseRouteSearchScratch(scratch *routeSearchScratch) {
+	if !scratch.resetForPool() {
+		routeSearchScratchPool.Put(scratch)
+		return
+	}
+	routeSearchScratchHot.Lock()
+	if routeSearchScratchHot.scratch == nil || routeSearchScratchBytes(scratch) > routeSearchScratchBytes(routeSearchScratchHot.scratch) {
+		pooled := routeSearchScratchHot.scratch
+		routeSearchScratchHot.scratch = scratch
+		routeSearchScratchHot.Unlock()
+		if pooled != nil {
+			routeSearchScratchPool.Put(pooled)
+		}
+		return
+	}
+	routeSearchScratchHot.Unlock()
 	routeSearchScratchPool.Put(scratch)
 }
 
-func routeSearchScratchBytes(scratch *routeSearchScratch) int {
+// resetForPool keeps the small wrapper reusable when dropping large arrays.
+func (scratch *routeSearchScratch) resetForPool() bool {
+	if routeSearchScratchBytes(scratch) > routeScratchHotMaxBytes {
+		*scratch = routeSearchScratch{}
+		return false
+	}
+	scratch.heap = scratch.heap[:0]
+	return true
+}
+
+func routeSearchScratchBytes(scratch *routeSearchScratch) uint64 {
 	if scratch == nil {
 		return 0
 	}
-	return cap(scratch.dist)*8 + cap(scratch.heuristic)*8 + cap(scratch.prevNode)*8 + cap(scratch.prevEdge)*8 +
-		cap(scratch.generation)*4 + cap(scratch.heap)*16
+	const intBytes = uint64(unsafe.Sizeof(int(0)))
+	const heapEntryBytes = uint64(unsafe.Sizeof(routeHeapEntry{}))
+	return uint64(cap(scratch.dist))*8 + uint64(cap(scratch.heuristic))*8 +
+		uint64(cap(scratch.prevNode))*intBytes + uint64(cap(scratch.prevEdge))*intBytes +
+		uint64(cap(scratch.generation))*4 + uint64(cap(scratch.heap))*heapEntryBytes
 }
 
 func (scratch *routeSearchScratch) distance(node int, inf float64) float64 {

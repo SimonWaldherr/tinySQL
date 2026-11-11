@@ -265,6 +265,7 @@ func (c *CatalogManager) RevokeRoleFromUser(userName, roleName string) error {
 			out = append(out, r)
 		}
 	}
+	clear(u.Roles[len(out):])
 	u.Roles = out
 	return nil
 }
@@ -369,6 +370,7 @@ func (c *CatalogManager) RevokePermission(roleName string, perm Permission, sche
 		}
 		out = append(out, g)
 	}
+	clear(r.Grants[len(out):])
 	r.Grants = out
 	return nil
 }

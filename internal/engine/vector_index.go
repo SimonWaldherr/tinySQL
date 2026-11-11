@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine/search"
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -229,6 +230,14 @@ type vecHNSWScratch struct {
 	pruneSelected []vecScoredRow
 }
 
+// These are per-instance retained-capacity limits, not query-size limits.
+// Ordinary ef=40/64 traversals are far smaller; large one-off searches should
+// not leave their full candidate heaps or node marks in the pools.
+const (
+	vecHNSWScratchMaxBytes = 8 << 20
+	vecVisitedMaxBytes     = 16 << 20
+)
+
 var vecHNSWScratchPool = sync.Pool{
 	New: func() any { return new(vecHNSWScratch) },
 }
@@ -238,7 +247,25 @@ func acquireHNSWScratch() *vecHNSWScratch {
 }
 
 func releaseHNSWScratch(s *vecHNSWScratch) {
+	s.resetForPool()
 	vecHNSWScratchPool.Put(s)
+}
+
+func (s *vecHNSWScratch) resetForPool() {
+	const rowBytes = uint64(unsafe.Sizeof(vecScoredRow{}))
+	retained := uint64(cap(s.candidates))*rowBytes + uint64(cap(s.results))*rowBytes +
+		uint64(cap(s.selected))*rowBytes + uint64(cap(s.pruneScored))*rowBytes + uint64(cap(s.pruneSelected))*rowBytes
+	if retained > vecHNSWScratchMaxBytes {
+		*s = vecHNSWScratch{}
+		return
+	}
+	// These arrays contain only row numbers and scores, so shortening them is
+	// sufficient; no pointer values need clearing.
+	s.candidates = s.candidates[:0]
+	s.results = s.results[:0]
+	s.selected = s.selected[:0]
+	s.pruneScored = s.pruneScored[:0]
+	s.pruneSelected = s.pruneSelected[:0]
 }
 
 // vecVisitedSet marks the rows one HNSW layer traversal has already scored.
@@ -263,7 +290,15 @@ func acquireVisited(n int) *vecVisitedSet {
 }
 
 func releaseVisited(v *vecVisitedSet) {
+	v.resetForPool()
 	vecVisitedPool.Put(v)
+}
+
+func (v *vecVisitedSet) resetForPool() {
+	if uint64(cap(v.marks))*4 > vecVisitedMaxBytes {
+		v.marks = nil
+		v.epoch = 0
+	}
 }
 
 // ensure makes rows [0, n) addressable. Growing within capacity is safe

@@ -66,6 +66,10 @@ var rawRowPool = sync.Pool{
 	New: func() any { return make(Row) },
 }
 
+// Keep ordinary projections reusable without retaining the map buckets of a
+// one-off, very wide result. Count keys before clear, including qualified keys.
+const rawRowPoolMaxKeys = 256
+
 // projectRawRowPooled is projectRawRow, but drawing its output map from
 // rawRowPool instead of allocating a fresh one every row. See rawRowPool's
 // doc comment for the safety argument and ReleaseRow for the release side.
@@ -79,8 +83,7 @@ func projectRawRowPooled(plan *simpleSelectPlan, raw []any) (Row, error) {
 			var err error
 			v, err = evalRawProjection(plan, raw, p)
 			if err != nil {
-				clear(out)
-				rawRowPool.Put(out)
+				releasePooledRow(out)
 				return nil, err
 			}
 		}
@@ -97,11 +100,21 @@ func projectRawRowPooled(plan *simpleSelectPlan, raw []any) (Row, error) {
 // pool (e.g. because pooling was not in effect for this stream): sync.Pool
 // does not care about an object's provenance.
 func releasePooledRow(row Row) {
-	if row == nil {
-		return
+	if resetPooledRow(row) {
+		rawRowPool.Put(row)
 	}
+}
+
+// resetPooledRow releases values even when the map is too wide to retain.
+// Map bucket capacity is not exposed by Go; the producer's key count is the
+// bound available here, rather than a precise byte limit on arbitrary maps.
+func resetPooledRow(row Row) bool {
+	if row == nil {
+		return false
+	}
+	retain := len(row) <= rawRowPoolMaxKeys
 	clear(row)
-	rawRowPool.Put(row)
+	return retain
 }
 
 // projectRawValues computes the projected value of every select-list item into

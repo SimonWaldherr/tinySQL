@@ -270,6 +270,12 @@ func recordVecQuery(event VectorQueryEvent) {
 	if max <= 0 {
 		max = 128
 	}
+	if len(vecQueryCacheState.events) == max {
+		// Reuse the full window instead of allocating a copy on every query.
+		copy(vecQueryCacheState.events, vecQueryCacheState.events[1:])
+		vecQueryCacheState.events[max-1] = event
+		return
+	}
 	vecQueryCacheState.events = append(vecQueryCacheState.events, event)
 	if len(vecQueryCacheState.events) > max {
 		vecQueryCacheState.events = append([]VectorQueryEvent(nil), vecQueryCacheState.events[len(vecQueryCacheState.events)-max:]...)
@@ -319,6 +325,7 @@ func pruneVecQueryCacheForce(now time.Time) {
 				n++
 			}
 		}
+		clear(vecQueryCacheState.events[n:])
 		vecQueryCacheState.events = vecQueryCacheState.events[:n]
 	}
 }
