@@ -269,14 +269,19 @@ func (s *vecHNSWScratch) resetForPool() {
 }
 
 // vecVisitedSet marks the rows one HNSW layer traversal has already scored.
-// A row counts as visited when its mark equals the current epoch, so starting
-// the next traversal is a single increment instead of clearing (or tracking
-// and un-marking) every touched row. That matters most for large tables: a
-// cleared []bool cost one memclr of len(rows) bytes per query even though a
-// search touches only a few hundred rows.
+// Dense epoch marks make starting a traversal a single increment. Once that
+// array would exceed the retention budget, a bitmap plus dirty-word list
+// makes storage proportional to corpus bits and reset work proportional to
+// the traversal, instead of allocating a large epoch array on every search.
 type vecVisitedSet struct {
 	marks []uint32
 	epoch uint32
+	// A bitmap avoids allocating a full epoch array for very large corpora.
+	// Record only words changed by a traversal, so reset remains proportional
+	// to its visited nodes rather than the size of the corpus.
+	words   []uint64
+	touched []int
+	rows    int
 }
 
 var vecVisitedPool = sync.Pool{
@@ -295,9 +300,10 @@ func releaseVisited(v *vecVisitedSet) {
 }
 
 func (v *vecVisitedSet) resetForPool() {
-	if uint64(cap(v.marks))*4 > vecVisitedMaxBytes {
-		v.marks = nil
-		v.epoch = 0
+	retained := uint64(cap(v.marks))*4 + uint64(cap(v.words))*8 +
+		uint64(cap(v.touched))*uint64(unsafe.Sizeof(int(0)))
+	if retained > vecVisitedMaxBytes {
+		*v = vecVisitedSet{}
 	}
 }
 
@@ -307,6 +313,14 @@ func (v *vecVisitedSet) resetForPool() {
 // append's own doubling) because extendVecHNSWIndex, called once per
 // single-row INSERT, asks for one more row on every call.
 func (v *vecVisitedSet) ensure(n int) {
+	if n > vecVisitedMaxBytes/4 {
+		v.ensureBitmap(n)
+		return
+	}
+	if v.words != nil {
+		v.words, v.touched = nil, nil
+		v.rows = 0
+	}
 	if n <= len(v.marks) {
 		return
 	}
@@ -314,12 +328,36 @@ func (v *vecVisitedSet) ensure(n int) {
 		v.marks = v.marks[:n]
 		return
 	}
-	v.marks = make([]uint32, n, n+n/2+64)
+	capacity := min(n+n/2+64, vecVisitedMaxBytes/4)
+	v.marks = make([]uint32, n, capacity)
 	v.epoch = 0
+}
+
+func (v *vecVisitedSet) ensureBitmap(n int) {
+	v.marks = nil
+	v.epoch = 0
+	needed := (n-1)/64 + 1
+	if needed > len(v.words) {
+		if needed <= cap(v.words) {
+			v.words = v.words[:needed]
+		} else {
+			capacity := max(needed, min(needed+needed/2+64, vecVisitedMaxBytes/8))
+			v.words = make([]uint64, needed, capacity)
+			v.touched = v.touched[:0]
+		}
+	}
+	v.rows = max(v.rows, n)
 }
 
 // reset starts a new traversal in which every row reads as unvisited.
 func (v *vecVisitedSet) reset() {
+	if v.words != nil {
+		for _, word := range v.touched {
+			v.words[word] = 0
+		}
+		v.touched = v.touched[:0]
+		return
+	}
 	v.epoch++
 	if v.epoch == 0 {
 		clear(v.marks[:cap(v.marks)])
@@ -329,10 +367,34 @@ func (v *vecVisitedSet) reset() {
 
 // visit marks row and reports whether it was unvisited in this traversal.
 func (v *vecVisitedSet) visit(row int) bool {
+	if v.words != nil {
+		return v.visitBitmap(row)
+	}
+	return v.visitDense(row)
+}
+
+func (v *vecVisitedSet) visitDense(row int) bool {
 	if uint(row) >= uint(len(v.marks)) || v.marks[row] == v.epoch {
 		return false
 	}
 	v.marks[row] = v.epoch
+	return true
+}
+
+func (v *vecVisitedSet) visitBitmap(row int) bool {
+	if uint(row) >= uint(v.rows) {
+		return false
+	}
+	word := row / 64
+	mask := uint64(1) << uint(row%64)
+	old := v.words[word]
+	if old&mask != 0 {
+		return false
+	}
+	if old == 0 {
+		v.touched = append(v.touched, word)
+	}
+	v.words[word] = old | mask
 	return true
 }
 
@@ -1143,7 +1205,15 @@ func (idx *vecHNSWIndex) greedyClosest(s *vecRowScorer, current int, currentDist
 	for changed := true; changed; {
 		changed = false
 		for _, nb := range idx.neighborLayer(current, layer) {
-			if !visited.visit(nb) {
+			// Keep the dense helper inlinable in this neighbor loop; the full
+			// dense/bitmap dispatcher exceeds the compiler's inline budget.
+			var fresh bool
+			if visited.words == nil {
+				fresh = visited.visitDense(nb)
+			} else {
+				fresh = visited.visitBitmap(nb)
+			}
+			if !fresh {
 				continue
 			}
 			d, ok := s.distance(nb)
@@ -1180,7 +1250,13 @@ func (idx *vecHNSWIndex) searchLayer(s *vecRowScorer, entry int, entryDist float
 			break
 		}
 		for _, nb := range idx.neighborLayer(nearest.rowIdx, layer) {
-			if !visited.visit(nb) {
+			var fresh bool
+			if visited.words == nil {
+				fresh = visited.visitDense(nb)
+			} else {
+				fresh = visited.visitBitmap(nb)
+			}
+			if !fresh {
 				continue
 			}
 			d, ok := s.distance(nb)

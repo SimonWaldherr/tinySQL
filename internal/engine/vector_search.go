@@ -717,7 +717,12 @@ func mergeVecColumnSegments(segments []vecColumnSegment, normsReady bool) []vecC
 		if len(left.vectors) == 0 || len(right.vectors) == 0 || len(left.vectors) != len(right.vectors) {
 			break
 		}
-		segments = append(segments[:len(segments)-2], mergeTwoVecColumnSegments(left, right, normsReady))
+		last := len(segments) - 1
+		segments[last-1] = mergeTwoVecColumnSegments(left, right, normsReady)
+		// The header slice is owned by this extension; release the superseded
+		// segment's packed arrays instead of keeping them in its unused tail.
+		segments[last] = vecColumnSegment{}
+		segments = segments[:last]
 	}
 	return segments
 }

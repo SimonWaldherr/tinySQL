@@ -79,17 +79,14 @@ func (pb *PageBackend) GC() (*GCResult, error) {
 
 	// 5. Find orphans: allocated pages that are not reachable and not
 	//    already on the free-list.
-	freeSet := make(map[PageID]struct{})
-	for _, pid := range pb.pager.freeMgr.AllFree() {
-		freeSet[pid] = struct{}{}
-	}
-
 	var reclaimed int
 	for pid := PageID(0); pid < PageID(totalPages); pid++ {
 		if _, isReachable := reachable[pid]; isReachable {
 			continue
 		}
-		if _, isFree := freeSet[pid]; isFree {
+		// GC requires exclusive writer access, so the authoritative free set
+		// is stable apart from the orphans this loop adds. Avoid copying it.
+		if _, isFree := pb.pager.freeMgr.free[pid]; isFree {
 			continue
 		}
 		// Orphan found — add to free-list.
@@ -194,7 +191,7 @@ func (pb *PageBackend) walkFreeListChain(headID PageID, reachable map[PageID]str
 	}
 }
 
-// collectTableRoots reads all catalog entries and returns their root page IDs.
+// collectTableRoots returns every table and persistent secondary-index root.
 func (pb *PageBackend) collectTableRoots() ([]PageID, error) {
 	var roots []PageID
 	// Scan the entire catalog tree.
@@ -204,6 +201,9 @@ func (pb *PageBackend) collectTableRoots() ([]PageID, error) {
 			return true // skip broken entries
 		}
 		roots = append(roots, entry.RootPageID)
+		for _, index := range entry.Indexes {
+			roots = append(roots, index.RootPageID)
+		}
 		return true
 	})
 	return roots, err

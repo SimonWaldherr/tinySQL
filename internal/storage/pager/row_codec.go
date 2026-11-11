@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 )
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -115,6 +116,9 @@ func MarshalRow(row []any, buf []byte) []byte {
 			}
 			buf = append(buf, val...)
 		case []float64:
+			// Reserve once rather than growing and copying the encoded prefix
+			// repeatedly for every few dimensions of a large embedding.
+			buf = slices.Grow(buf, 5+8*len(val))
 			buf = append(buf, tagVecF64)
 			var b [4]byte
 			binary.LittleEndian.PutUint32(b[:], uint32(len(val)))

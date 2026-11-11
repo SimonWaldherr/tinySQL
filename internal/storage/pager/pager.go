@@ -74,8 +74,10 @@ func newPageBufferPool(maxPages int) *PageBufferPool {
 		maxPages = 1024
 	}
 	pool := &PageBufferPool{
-		maxPages:  maxPages,
-		pages:     make(map[PageID]*PageFrame, maxPages),
+		maxPages: maxPages,
+		// The limit is a ceiling, not a startup allocation. Larger caches
+		// grow with the pages actually read, preserving the default hint.
+		pages:     make(map[PageID]*PageFrame, min(maxPages, 1024)),
 		dirty:     make(map[PageID]*PageFrame),
 		loads:     make(map[PageID]*pageLoad),
 		transient: make(map[PageID]int),

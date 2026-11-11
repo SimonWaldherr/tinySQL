@@ -111,15 +111,11 @@ func ImportTileArtifact(ctx context.Context, source TileArtifactSource, artifact
 	}
 	progress := &artifactProgress{opts: opts, total: info.TileCount, batchSize: opts.BatchSize}
 	tileDigest := sha256.New()
-	batch := make([][]any, 0, opts.BatchSize)
-	var actualBytes, actualMax int64
-	flush := func() error {
-		if err := appendArtifactRows(ctx, db, "default", "tiles", batch, opts.BatchSize, progress, opts); err != nil {
-			return err
-		}
-		batch = batch[:0]
-		return nil
+	batch, err := newArtifactRowBatch(opts.BatchSize, 4)
+	if err != nil {
+		return nil, err
 	}
+	var actualBytes, actualMax int64
 	err = source.ScanTiles(ctx, func(tile TileArtifactTile) error {
 		if err := checkContext(ctx); err != nil {
 			return err
@@ -139,16 +135,17 @@ func ImportTileArtifact(ctx context.Context, source TileArtifactSource, artifact
 		hashTile(tileDigest, tile.Z, tile.X, tile.Y, data)
 		progress.read++
 		progress.bytesRead += size
-		batch = append(batch, []any{tile.Z, tile.X, tile.Y, data})
-		if len(batch) == opts.BatchSize {
-			return flush()
+		row := batch.row()
+		row[0], row[1], row[2], row[3] = tile.Z, tile.X, tile.Y, data
+		if len(batch.rows) == opts.BatchSize {
+			return batch.flush(ctx, db, "tiles", progress, opts)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scan tile source: %w", err)
 	}
-	if err := flush(); err != nil {
+	if err := batch.flush(ctx, db, "tiles", progress, opts); err != nil {
 		return nil, err
 	}
 	if progress.read != info.TileCount || actualBytes != info.TileBytes || actualMax != info.MaxTileBytes {

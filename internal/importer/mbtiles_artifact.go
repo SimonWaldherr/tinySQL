@@ -310,7 +310,10 @@ func importFlatToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p *artif
 		return fmt.Errorf("query flat MBTiles: %w", err)
 	}
 	defer errutil.Close(rows, &err, "close flat tile rows")
-	batch := make([][]any, 0, p.batchSize)
+	batch, err := newArtifactRowBatch(p.batchSize, 4)
+	if err != nil {
+		return err
+	}
 	for rows.Next() {
 		var z, x, y int
 		var data []byte
@@ -323,18 +326,18 @@ func importFlatToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p *artif
 		hashTile(digest, z, x, y, data)
 		p.read++
 		p.bytesRead += int64(len(data))
-		batch = append(batch, []any{z, x, y, data})
-		if len(batch) == p.batchSize {
-			if err := appendArtifactRows(ctx, db, "default", "tiles", batch, p.batchSize, p, nil); err != nil {
+		row := batch.row()
+		row[0], row[1], row[2], row[3] = z, x, y, data
+		if len(batch.rows) == p.batchSize {
+			if err := batch.flush(ctx, db, "tiles", p, nil); err != nil {
 				return err
 			}
-			batch = batch[:0]
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return appendArtifactRows(ctx, db, "default", "tiles", batch, p.batchSize, p, nil)
+	return batch.flush(ctx, db, "tiles", p, nil)
 }
 
 func importFlatToNormalized(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) (err error) {
@@ -343,8 +346,14 @@ func importFlatToNormalized(ctx context.Context, src *sql.DB, db *storage.DB, p 
 		return fmt.Errorf("query flat MBTiles: %w", err)
 	}
 	defer errutil.Close(rows, &err, "close flat tile rows")
-	mapRows := make([][]any, 0, p.batchSize)
-	imageRows := make([][]any, 0, p.batchSize)
+	mapRows, err := newArtifactRowBatch(p.batchSize, 4)
+	if err != nil {
+		return err
+	}
+	imageRows, err := newArtifactRowBatch(p.batchSize, 2)
+	if err != nil {
+		return err
+	}
 	for rows.Next() {
 		var z, x, y int
 		var data []byte
@@ -358,26 +367,26 @@ func importFlatToNormalized(ctx context.Context, src *sql.DB, db *storage.DB, p 
 		hashTile(digest, z, x, y, data)
 		p.read++
 		p.bytesRead += int64(len(data))
-		mapRows = append(mapRows, []any{z, x, y, id})
-		imageRows = append(imageRows, []any{id, data})
-		if len(mapRows) == p.batchSize {
-			if err := appendArtifactRows(ctx, db, "default", "map", mapRows, p.batchSize, p, nil); err != nil {
+		mapRow := mapRows.row()
+		mapRow[0], mapRow[1], mapRow[2], mapRow[3] = z, x, y, id
+		imageRow := imageRows.row()
+		imageRow[0], imageRow[1] = id, data
+		if len(mapRows.rows) == p.batchSize {
+			if err := mapRows.flush(ctx, db, "map", p, nil); err != nil {
 				return err
 			}
-			if err := appendArtifactRows(ctx, db, "default", "images", imageRows, p.batchSize, nil, nil); err != nil {
+			if err := imageRows.flush(ctx, db, "images", nil, nil); err != nil {
 				return err
 			}
-			mapRows = mapRows[:0]
-			imageRows = imageRows[:0]
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if err := appendArtifactRows(ctx, db, "default", "map", mapRows, p.batchSize, p, nil); err != nil {
+	if err := mapRows.flush(ctx, db, "map", p, nil); err != nil {
 		return err
 	}
-	return appendArtifactRows(ctx, db, "default", "images", imageRows, p.batchSize, nil, nil)
+	return imageRows.flush(ctx, db, "images", nil, nil)
 }
 
 func importNormalizedToNormalized(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress, digest io.Writer) (err error) {
@@ -386,7 +395,10 @@ func importNormalizedToNormalized(ctx context.Context, src *sql.DB, db *storage.
 		return fmt.Errorf("query normalized MBTiles: %w", err)
 	}
 	defer errutil.Close(rows, &err, "close normalized tile rows")
-	batch := make([][]any, 0, p.batchSize)
+	batch, err := newArtifactRowBatch(p.batchSize, 4)
+	if err != nil {
+		return err
+	}
 	for rows.Next() {
 		var z, x, y int
 		var id string
@@ -400,18 +412,18 @@ func importNormalizedToNormalized(ctx context.Context, src *sql.DB, db *storage.
 		hashTile(digest, z, x, y, data)
 		p.read++
 		p.bytesRead += int64(len(data))
-		batch = append(batch, []any{z, x, y, id})
-		if len(batch) == p.batchSize {
-			if err := appendArtifactRows(ctx, db, "default", "map", batch, p.batchSize, p, nil); err != nil {
+		row := batch.row()
+		row[0], row[1], row[2], row[3] = z, x, y, id
+		if len(batch.rows) == p.batchSize {
+			if err := batch.flush(ctx, db, "map", p, nil); err != nil {
 				return err
 			}
-			batch = batch[:0]
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if err := appendArtifactRows(ctx, db, "default", "map", batch, p.batchSize, p, nil); err != nil {
+	if err := batch.flush(ctx, db, "map", p, nil); err != nil {
 		return err
 	}
 	return importNormalizedImages(ctx, src, db, p)
@@ -423,7 +435,10 @@ func importNormalizedToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p 
 		return fmt.Errorf("query normalized MBTiles: %w", err)
 	}
 	defer errutil.Close(rows, &err, "close normalized tile rows")
-	batch := make([][]any, 0, p.batchSize)
+	batch, err := newArtifactRowBatch(p.batchSize, 4)
+	if err != nil {
+		return err
+	}
 	for rows.Next() {
 		var z, x, y int
 		var data []byte
@@ -436,18 +451,18 @@ func importNormalizedToFlat(ctx context.Context, src *sql.DB, db *storage.DB, p 
 		hashTile(digest, z, x, y, data)
 		p.read++
 		p.bytesRead += int64(len(data))
-		batch = append(batch, []any{z, x, y, data})
-		if len(batch) == p.batchSize {
-			if err := appendArtifactRows(ctx, db, "default", "tiles", batch, p.batchSize, p, nil); err != nil {
+		row := batch.row()
+		row[0], row[1], row[2], row[3] = z, x, y, data
+		if len(batch.rows) == p.batchSize {
+			if err := batch.flush(ctx, db, "tiles", p, nil); err != nil {
 				return err
 			}
-			batch = batch[:0]
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return appendArtifactRows(ctx, db, "default", "tiles", batch, p.batchSize, p, nil)
+	return batch.flush(ctx, db, "tiles", p, nil)
 }
 
 func importNormalizedImages(ctx context.Context, src *sql.DB, db *storage.DB, p *artifactProgress) (err error) {
@@ -456,23 +471,26 @@ func importNormalizedImages(ctx context.Context, src *sql.DB, db *storage.DB, p 
 		return err
 	}
 	defer errutil.Close(rows, &err, "close normalized image rows")
-	batch := make([][]any, 0, p.batchSize)
+	batch, err := newArtifactRowBatch(p.batchSize, 2)
+	if err != nil {
+		return err
+	}
 	for rows.Next() {
 		var id string
 		var data []byte
 		if err := rows.Scan(&id, &data); err != nil {
 			return err
 		}
-		batch = append(batch, []any{id, data})
-		if len(batch) == p.batchSize {
-			if err := appendArtifactRows(ctx, db, "default", "images", batch, p.batchSize, nil, nil); err != nil {
+		row := batch.row()
+		row[0], row[1] = id, data
+		if len(batch.rows) == p.batchSize {
+			if err := batch.flush(ctx, db, "images", nil, nil); err != nil {
 				return err
 			}
-			batch = batch[:0]
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return appendArtifactRows(ctx, db, "default", "images", batch, p.batchSize, nil, nil)
+	return batch.flush(ctx, db, "images", nil, nil)
 }

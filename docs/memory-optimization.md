@@ -89,7 +89,7 @@ Returned values must never alias scratch that another operation can reuse.
 |---|---|
 | Stream row maps | Clear keys and values; retain maps with at most 256 keys, counting qualified keys. |
 | HNSW candidate/result/selection arrays | Retain at most 8 MiB of combined backing capacity per scratch instance. |
-| HNSW visited marks | Retain at most 16 MiB of `uint32` backing capacity per instance. |
+| HNSW visited state | Dense `uint32` epochs through 4,194,304 rows, then a bitmap and touched-word list; retain at most 16 MiB combined capacity. |
 | Routing arrays and heap | Retain at most 64 MiB of combined backing capacity, in either the hot slot or pool. |
 
 Oversized numeric buffers are detached while their small wrapper remains
@@ -120,6 +120,78 @@ The four focused warm-reuse benchmarks below retained 0 B/op and 0 allocs/op
 before and after these limits in the same three-run comparison. Larger
 operations remain supported; buffers above the limits are allocated again
 on subsequent requests rather than kept idle in the pools.
+
+## Large datasets
+
+Dense visited-array growth stops at the retention budget. Larger HNSW corpora
+use one bit per row and record which bitmap words a traversal changes. Reset
+clears those words, so a sparse search does not clear the entire corpus-sized
+bitmap. For ten million rows the initial bitmap has about 1.88 MB of capacity
+(including growth room), plus its touched-word list. It is reusable across
+searches instead of allocating a new approximately 60 MB epoch array each
+time. Segment compaction also clears discarded headers so old packed vectors
+and norm buffers do not stay reachable through slice capacity.
+
+Fresh checkpoint, disk-table, and replication decoders transfer ownership of
+secondary indexes, full-text postings, and statistics to the restored table.
+The restored ANN graph adopts its outer headers and levels, but packs inner
+layers and links into two arenas. Adopting every decoder allocation directly
+would retain an extra heap object per row/layer. An opt-in 100,000-row probe
+observed about 700,000 live objects with compact topology versus 850,000 with
+uncompacted adoption; the final loader preserves the compact footprint. WAL
+records that remain caller-owned still use the independent copying path.
+Legacy nil/empty index shapes and writable omitted maps remain compatible.
+
+Paged caches reserve bookkeeping for at most the default 1,024 pages at open,
+then grow toward the configured cache limit as pages are used. The limit and
+LRU policy are unchanged. Row encoding reserves each vector payload once and
+preserves the existing binary format, including IEEE-754 payload bits.
+
+Artifact imports reuse exclusively owned row cells across synchronous paged
+writes and clear them after each successful full or partial batch. Tile data
+borrowed from a source callback is still copied. This reuse does not apply to
+generic importers whose in-memory fallback retains caller row slices. Physical
+page GC uses the existing free set and marks persistent secondary-index trees,
+including their overflow pages, before reclaiming unreachable pages.
+
+The following are allocation measurements, not peak RSS. Each workload ran
+three times against `e44dc47` with the same fixtures, in separate before/after
+test processes (Go 1.27.3, Apple M2 Max, `GOMAXPROCS=2`):
+
+| Workload | Before B/op | After B/op | Before → after allocs/op |
+|---|---:|---:|---:|
+| Warm visited set, 3 million rows, 1,000 visited nodes | 18,006,280 | 0 | 3 → 0 |
+| Warm visited set, 10 million rows, 1,000 visited nodes | 60,006,664 | 0 | 3 → 0 |
+| Empty page-cache bookkeeping, 131,072-page limit | 4,729,088 | 36,944 | 513 → 5 |
+| Fresh row encoding, 768-dimensional vector | 24,800 | 6,560 | 12 → 2 |
+| Fresh row encoding, 1,536-dimensional vector | 62,944 | 13,600 | 15 → 2 |
+| Snapshot load, 10,000 rows with secondary/FTS/ANN indexes | 10,036,112 | 8,449,136 | 251,807 → 231,776 |
+
+Warm visited-set figures exclude first allocation and assume the disposable
+pool entry survives; they measure traversal bookkeeping, not an entire ANN
+query. Actual cached HNSW controls at k=20/100/200 retained their allocation
+counts and comparable timings. Reused encoding buffers remain allocation-free.
+The complete 1,025-tile artifact workload saved approximately 1,000 allocations
+per import; its file I/O and validation dominate total allocations and timing.
+
+Reproduce the focused workloads with fixed operation counts:
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkVecVisitedLargeCorpus$' -benchtime=20x -count=3 -benchmem
+GOMAXPROCS=2 go test ./internal/storage/pager -run '^$' \
+  -bench '^Benchmark(PageBufferPoolStartup|MarshalRowEmbeddingBuffers)$' \
+  -benchtime=1000x -count=3 -benchmem
+GOMAXPROCS=2 go test ./internal/storage -run '^$' \
+  -bench '^BenchmarkIndexedSnapshotLoadReader$' -benchtime=10x -count=3 -benchmem
+GOMAXPROCS=2 go test ./internal/importer -run '^$' \
+  -bench '^BenchmarkImportTileArtifactBatch$' -benchtime=3x -count=3 -benchmem
+TINYSQL_INDEXED_LOAD_MEMORY=1 go test ./internal/storage \
+  -run '^TestIndexedSnapshotLoadFootprint$' -count=1 -v
+```
+
+The last command deliberately collects a retained snapshot for observation;
+it does not assert GC timing, object counts, or a memory threshold.
 
 ## Profiling a change
 

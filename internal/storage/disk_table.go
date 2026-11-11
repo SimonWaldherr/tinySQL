@@ -163,9 +163,9 @@ func diskToTable(dt diskTable) *Table {
 	return restoreDiskTable(dt, false)
 }
 
-// Fresh decoders own their row slices. Transfer them instead of allocating a
-// second set of headers and cells; WAL callers that retain records keep using
-// diskToTable's copying behavior.
+// Fresh decoders own their rows, indexes and statistics. Transfer them instead
+// of allocating a second image; WAL callers that retain records keep using
+// diskToTable's copying behavior. The caller must not use dt after this call.
 func diskToTableOwned(dt diskTable) *Table {
 	return restoreDiskTable(dt, true)
 }
@@ -178,10 +178,38 @@ func restoreDiskTable(dt diskTable, owned bool) *Table {
 	t := NewTable(dt.Name, cols, dt.IsTemp)
 	t.Version = dt.Version
 	t.structVersion = dt.StructVersion
-	t.Indexes = cloneSecondaryIndexes(dt.Indexes)
-	t.FTSIndexes = cloneFTSIndexes(dt.FTSIndexes)
-	t.VectorIndexes = cloneVectorIndexes(dt.VectorIndexes)
-	t.Stats = cloneTableStats(dt.Stats)
+	if owned {
+		// Keep the same nil/empty map conventions as the copying path and
+		// discard nil entries that its clone helpers would skip.
+		t.Indexes = nil
+		if len(dt.Indexes) != 0 {
+			t.Indexes = takeDecodedIndexes(dt.Indexes)
+			for _, index := range t.Indexes {
+				normalizeDecodedSecondaryIndex(index)
+			}
+		}
+		if len(dt.FTSIndexes) != 0 {
+			t.FTSIndexes = takeDecodedIndexes(dt.FTSIndexes)
+			for _, index := range t.FTSIndexes {
+				normalizeDecodedFTSIndex(index)
+			}
+		}
+		if len(dt.VectorIndexes) != 0 {
+			t.VectorIndexes = takeDecodedIndexes(dt.VectorIndexes)
+			for _, index := range t.VectorIndexes {
+				compactDecodedVectorTopology(index)
+			}
+		}
+		t.Stats = dt.Stats
+		if t.Stats != nil && t.Stats.Columns == nil {
+			t.Stats.Columns = make(map[string]ColumnStats)
+		}
+	} else {
+		t.Indexes = cloneSecondaryIndexes(dt.Indexes)
+		t.FTSIndexes = cloneFTSIndexes(dt.FTSIndexes)
+		t.VectorIndexes = cloneVectorIndexes(dt.VectorIndexes)
+		t.Stats = cloneTableStats(dt.Stats)
+	}
 	if owned && dt.Rows != nil {
 		t.Rows = dt.Rows[:len(dt.Rows):len(dt.Rows)]
 	} else {
@@ -232,4 +260,110 @@ func restoreDiskTable(dt diskTable, owned bool) *Table {
 		t.Rows[ri] = row
 	}
 	return t
+}
+
+func normalizeDecodedSecondaryIndex(index *SecondaryIndex) {
+	if len(index.Columns) == 0 {
+		index.Columns = nil
+	}
+	if index.Entries == nil {
+		index.Entries = []IndexEntry{}
+	}
+	for i := range index.Entries {
+		entry := &index.Entries[i]
+		if len(entry.Key) == 0 {
+			entry.Key = nil
+		}
+		if len(entry.RowIDs) == 0 {
+			entry.RowIDs = nil
+		}
+	}
+}
+
+func normalizeDecodedFTSIndex(index *FTSIndex) {
+	// Older images may omit these maps. The copying restore has
+	// always made them writable, including when they are empty.
+	if index.Postings == nil {
+		index.Postings = make(map[string][]int32)
+	}
+	if index.PostingCounts == nil {
+		index.PostingCounts = make(map[string][]int32)
+	}
+	if index.PostingBlocks == nil {
+		index.PostingBlocks = make(map[string][]FTSPostingBlock)
+	}
+	if index.TermIDs == nil {
+		index.TermIDs = make(map[string]int32)
+	}
+	if len(index.Docs) == 0 {
+		index.Docs = nil
+	}
+	if len(index.DocTermIDs) == 0 {
+		index.DocTermIDs = nil
+	}
+	if len(index.DocTermCounts) == 0 {
+		index.DocTermCounts = nil
+	}
+	if len(index.DocTokenIDs) == 0 {
+		index.DocTokenIDs = nil
+	}
+	for term, rows := range index.Postings {
+		if len(rows) == 0 {
+			index.Postings[term] = nil
+		}
+	}
+	for term, counts := range index.PostingCounts {
+		if len(counts) == 0 {
+			index.PostingCounts[term] = nil
+		}
+	}
+	for term, blocks := range index.PostingBlocks {
+		if len(blocks) == 0 {
+			index.PostingBlocks[term] = nil
+		}
+	}
+}
+
+func takeDecodedIndexes[T any](indexes map[string]*T) map[string]*T {
+	for key, index := range indexes {
+		if index == nil {
+			delete(indexes, key)
+		}
+	}
+	return indexes
+}
+
+// Adopt the outer decoded arrays, but pack the inner graph into two arenas.
+// Keeping every decoder-allocated neighbor list would save a copy at load time
+// while retaining an extra heap object for each row/layer for the table's life.
+func compactDecodedVectorTopology(index *VectorIndex) {
+	if len(index.Levels) == 0 {
+		index.Levels = nil
+	}
+	if index.Neighbors == nil {
+		index.Neighbors = [][][]int{}
+	}
+	layerCount, linkCount := 0, 0
+	for _, layers := range index.Neighbors {
+		layerCount += len(layers)
+		for _, links := range layers {
+			linkCount += len(links)
+		}
+	}
+	layerArena := make([][]int, layerCount)
+	linkArena := make([]int, linkCount)
+	for row, layers := range index.Neighbors {
+		rowLayers := layerArena[:len(layers):len(layers)]
+		layerArena = layerArena[len(layers):]
+		for layer, links := range layers {
+			if len(links) == 0 {
+				continue
+			}
+			dst := linkArena[:len(links):len(links)]
+			linkArena = linkArena[len(links):]
+			copy(dst, links)
+			rowLayers[layer] = dst
+		}
+		index.Neighbors[row] = rowLayers
+	}
 }

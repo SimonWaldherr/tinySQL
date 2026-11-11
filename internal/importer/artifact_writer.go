@@ -153,6 +153,46 @@ func (p *artifactProgress) emit(phase string) {
 	p.lastEmit = now
 }
 
+// artifactRowBatch owns reusable row cells for the paged artifact writer.
+// AppendRowsFast encodes them synchronously; reset must run only after it
+// succeeds. Generic importers cannot use this storage because their in-memory
+// fallback retains row slices after insertion.
+type artifactRowBatch struct {
+	rows  [][]any
+	cells []any
+	width int
+}
+
+func newArtifactRowBatch(size, width int) (artifactRowBatch, error) {
+	if size <= 0 || width <= 0 || size > int(^uint(0)>>1)/width {
+		return artifactRowBatch{}, errors.New("artifact batch size exceeds row capacity")
+	}
+	return artifactRowBatch{
+		rows: make([][]any, 0, size), cells: make([]any, size*width), width: width,
+	}, nil
+}
+
+func (b *artifactRowBatch) row() []any {
+	start := len(b.rows) * b.width
+	row := b.cells[start : start+b.width : start+b.width]
+	b.rows = append(b.rows, row)
+	return row
+}
+
+func (b *artifactRowBatch) reset() {
+	clear(b.cells[:len(b.rows)*b.width])
+	clear(b.rows)
+	b.rows = b.rows[:0]
+}
+
+func (b *artifactRowBatch) flush(ctx context.Context, db *storage.DB, table string, progress *artifactProgress, opts *MBTilesArtifactOptions) error {
+	if err := appendArtifactRows(ctx, db, "default", table, b.rows, cap(b.rows), progress, opts); err != nil {
+		return err
+	}
+	b.reset()
+	return nil
+}
+
 func appendArtifactRows(ctx context.Context, db *storage.DB, tenant, table string, rows [][]any, batchSize int, progress *artifactProgress, opts *MBTilesArtifactOptions) error {
 	// Put stores an empty compatibility snapshot in DB.tenants. This writer
 	// bypasses it, so discard it even when there are no rows to append; otherwise
