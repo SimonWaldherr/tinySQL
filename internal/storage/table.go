@@ -86,7 +86,7 @@ type Table struct {
 	// reset dirtyRows, whereas derived search indexes may be queried much later.
 	// A DELETE, reorder or schema mutation clears the log and raises its base,
 	// because physical row positions can no longer be translated safely.
-	rowUpdateLog  []rowUpdateDelta
+	rowUpdateLog  rowUpdateHistory
 	rowUpdateBase int
 	// derived is a slot for executor-owned state that is a pure function of
 	// this table's contents and can always be rebuilt from them: today, the
@@ -129,6 +129,64 @@ type Table struct {
 type rowUpdateDelta struct {
 	structVersion int
 	row           int
+}
+
+// rowUpdateChunk is the number of deltas per sealed block of a rowUpdateHistory.
+const rowUpdateChunk = 64
+
+// rowUpdateHistory is an append-only list stored in blocks. Existing deltas
+// and sealed block headers are never overwritten, so clones can share them.
+// Clipped capacities make each clone copy a buffer before extending it.
+type rowUpdateHistory struct {
+	sealed [][]rowUpdateDelta // full blocks of rowUpdateChunk deltas, immutable
+	open   []rowUpdateDelta   // the block being filled, owned by this history
+}
+
+func (h *rowUpdateHistory) len() int { return len(h.sealed)*rowUpdateChunk + len(h.open) }
+
+func (h *rowUpdateHistory) at(i int) rowUpdateDelta {
+	if block := i / rowUpdateChunk; block < len(h.sealed) {
+		return h.sealed[block][i%rowUpdateChunk]
+	}
+	return h.open[i-len(h.sealed)*rowUpdateChunk]
+}
+
+func (h *rowUpdateHistory) add(delta rowUpdateDelta) {
+	if len(h.open) == rowUpdateChunk {
+		h.sealed = append(h.sealed, h.open[:rowUpdateChunk:rowUpdateChunk])
+		h.open = nil
+	}
+	if len(h.open) == cap(h.open) {
+		// A cloned prefix has no spare capacity. Copy before extending it;
+		// the lender may independently append to its own open block.
+		capacity := rowUpdateChunk
+		if len(h.open) > 0 {
+			// Reserve less for small cloned tails. Geometric growth bounds
+			// repeated prefix copies when a statement updates many rows.
+			capacity = min(rowUpdateChunk, 2*len(h.open))
+		}
+		open := make([]rowUpdateDelta, len(h.open), capacity)
+		copy(open, h.open)
+		h.open = open
+	}
+	h.open = append(h.open, delta)
+}
+
+func (h *rowUpdateHistory) reset() { *h = rowUpdateHistory{} }
+
+// clone shares immutable prefixes. Appends only write beyond those prefixes;
+// clipped capacities ensure a borrower cannot overwrite a lender's next slot.
+func (h *rowUpdateHistory) clone() rowUpdateHistory {
+	return rowUpdateHistory{
+		sealed: h.sealed[:len(h.sealed):len(h.sealed)],
+		open:   h.open[:len(h.open):len(h.open)],
+	}
+}
+
+// search returns the position of the first delta whose structVersion is at
+// least version.
+func (h *rowUpdateHistory) search(version int) int {
+	return sort.Search(h.len(), func(i int) bool { return h.at(i).structVersion >= version })
 }
 
 // FTSDocument is the compact per-row directory for a persisted FTS index.
@@ -597,7 +655,7 @@ func (t *Table) noteStructuralChange() {
 
 func (t *Table) noteStructuralInvalidation() {
 	t.structVersion++
-	t.rowUpdateLog = nil
+	t.rowUpdateLog.reset()
 	t.rowUpdateBase = t.structVersion
 }
 
@@ -606,11 +664,11 @@ func (t *Table) noteRowUpdated(row int) {
 	// Keep the history bounded even for a long-lived in-memory database. A
 	// cache older than the retained tail simply performs one safe rebuild.
 	const maxRowUpdateDeltas = 4096
-	if len(t.rowUpdateLog) >= maxRowUpdateDeltas {
-		t.rowUpdateLog = nil
+	if t.rowUpdateLog.len() >= maxRowUpdateDeltas {
+		t.rowUpdateLog.reset()
 		t.rowUpdateBase = t.structVersion - 1
 	}
-	t.rowUpdateLog = append(t.rowUpdateLog, rowUpdateDelta{structVersion: t.structVersion, row: row})
+	t.rowUpdateLog.add(rowUpdateDelta{structVersion: t.structVersion, row: row})
 }
 
 // StructVersion returns the current structural-change counter. See
@@ -626,13 +684,16 @@ func (t *Table) UpdatedRowsSince(version int) (rows []int, ok bool) {
 	if version == t.structVersion {
 		return nil, true
 	}
-	if version < t.rowUpdateBase || len(t.rowUpdateLog) == 0 {
+	log := &t.rowUpdateLog
+	total := log.len()
+	if version < t.rowUpdateBase || total == 0 {
 		return nil, false
 	}
 	want := version + 1
-	start := sort.Search(len(t.rowUpdateLog), func(i int) bool { return t.rowUpdateLog[i].structVersion >= want })
-	seen := make(map[int]struct{}, len(t.rowUpdateLog)-start)
-	for _, delta := range t.rowUpdateLog[start:] {
+	start := log.search(want)
+	seen := make(map[int]struct{}, total-start)
+	for i := start; i < total; i++ {
+		delta := log.at(i)
 		if delta.structVersion < want {
 			continue
 		}

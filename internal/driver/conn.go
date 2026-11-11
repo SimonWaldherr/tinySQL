@@ -204,7 +204,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	// The shadow's catalog is a private deep copy of the live one, so its
 	// contents here are also the live contents at BEGIN.
 	c.txCatalogRev = shadow.Catalog().Revision()
-	c.txCatalog = shadow.SnapshotCatalog()
+	c.txCatalog = shadow.BeginCatalogSnapshot()
 	return &tx{c: c, ctx: ctx}, nil
 }
 

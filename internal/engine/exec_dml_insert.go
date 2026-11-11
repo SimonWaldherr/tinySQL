@@ -789,6 +789,12 @@ type constraintIndexEntry struct {
 	// but this entry has removed carries the value constraintRowTombstone in
 	// rows. A borrowed base always holds row indexes (>= 0) only.
 	base map[any]int
+	// mid, only ever set together with base, is a second read-only layer
+	// between rows and base: the changes of the entries this one descends
+	// from. Like rows it may hold tombstones for keys of base. Lookups go
+	// rows, then mid, then base. It exists so that lending an overlay does not
+	// copy the overlay: see borrow.
+	mid map[any]int
 	// lent is set on an entry whose rows map a borrower now uses as its base.
 	// That map must not change any more, so the entry copies it before its own
 	// next write (own).
@@ -821,21 +827,30 @@ func (e *constraintIndexEntry) get(key any) (int, bool) {
 		}
 		return v, true
 	}
-	if e.base != nil {
-		v, ok := e.base[key]
-		return v, ok
+	return e.lower(key)
+}
+
+// lower is get without e's own changes: what the read-only layers hold for key.
+func (e *constraintIndexEntry) lower(key any) (int, bool) {
+	if e.base == nil {
+		return 0, false
 	}
-	return 0, false
+	if v, ok := e.mid[key]; ok {
+		if v == constraintRowTombstone {
+			return 0, false
+		}
+		return v, true
+	}
+	v, ok := e.base[key]
+	return v, ok
 }
 
 // unset removes key. Over a borrowed base the removal has to be recorded, since
 // the base itself cannot change.
 func (e *constraintIndexEntry) unset(key any) {
-	if e.base != nil {
-		if _, inBase := e.base[key]; inBase {
-			e.rows[key] = constraintRowTombstone
-			return
-		}
+	if _, below := e.lower(key); below {
+		e.rows[key] = constraintRowTombstone
+		return
 	}
 	delete(e.rows, key)
 }
@@ -855,14 +870,33 @@ func (e *constraintIndexEntry) flatRows() map[any]int {
 	if e.base == nil {
 		return maps.Clone(e.rows)
 	}
-	out := make(map[any]int, len(e.base)+len(e.rows))
+	out := make(map[any]int, len(e.base)+len(e.mid)+len(e.rows))
 	maps.Copy(out, e.base)
+	for _, layer := range [2]map[any]int{e.mid, e.rows} {
+		for k, v := range layer {
+			if v == constraintRowTombstone {
+				delete(out, k)
+			} else {
+				out[k] = v
+			}
+		}
+	}
+	return out
+}
+
+// mergedOverlay returns a new map equal to rows applied on top of mid: the one
+// read-only layer that stands for both over e.base.
+func (e *constraintIndexEntry) mergedOverlay() map[any]int {
+	out := make(map[any]int, len(e.mid)+len(e.rows))
+	maps.Copy(out, e.mid)
 	for k, v := range e.rows {
 		if v == constraintRowTombstone {
-			delete(out, k)
-		} else {
-			out[k] = v
+			if _, inBase := e.base[k]; !inBase {
+				delete(out, k)
+				continue
+			}
 		}
+		out[k] = v
 	}
 	return out
 }
@@ -964,7 +998,7 @@ func (e *constraintIndexEntry) exists(key any, excludeRow int) bool {
 func (e *constraintIndexEntry) clone() *constraintIndexEntry {
 	c := *e
 	c.rows = e.flatRows()
-	c.base = nil
+	c.base, c.mid = nil, nil
 	c.lent = false
 	c.freeMulti = slices.Clone(e.freeMulti)
 	if len(e.multi) > 0 {
@@ -1005,21 +1039,35 @@ func (e *constraintIndexEntry) borrow() (*constraintIndexEntry, bool) {
 		e.lent = true
 		c.base = e.rows
 		c.rows = make(map[any]int)
-	case len(e.rows) <= max(constraintOverlayMinDelta, len(e.base)/constraintOverlayDeltaDivisor):
-		c.base = e.base
+	case len(e.rows) <= constraintOverlayCarry:
+		// A handful of changes: carry them over by copying.
 		c.rows = maps.Clone(e.rows)
-	default:
-		c.base = nil
+	case len(e.mid)+len(e.rows) > max(constraintOverlayMinDelta, len(e.base)/constraintOverlayDeltaDivisor):
+		c.base, c.mid = nil, nil
 		c.rows = e.flatRows()
+	case e.mid == nil:
+		// Lend the changes themselves as the borrower's middle layer.
+		e.lent = true
+		c.mid = e.rows
+		c.rows = make(map[any]int)
+	default:
+		c.mid = e.mergedOverlay()
+		c.rows = make(map[any]int)
 	}
 	return &c, true
 }
 
 // An overlay is carried over to the next borrower while it stays small; beyond
 // the larger of constraintOverlayMinDelta and 1/constraintOverlayDeltaDivisor
-// of its base, copying it per borrow would cost about as much as copying the
-// whole map, so it is folded into a flat map instead.
+// of its base, carrying it would cost about as much as copying the whole map,
+// so it is folded into a flat map instead.
+//
+// Carrying is itself layered so that a chain of small transactions does not copy
+// the whole overlay at every borrow: up to constraintOverlayCarry changes are
+// copied, more are moved into the read-only middle layer, which is rebuilt only
+// once per constraintOverlayCarry changes.
 const (
+	constraintOverlayCarry        = 32
 	constraintOverlayMinDelta     = 1024
 	constraintOverlayDeltaDivisor = 32
 )
@@ -1090,6 +1138,14 @@ func constraintIndexValueExists(index *constraintIndexEntry, val any, excludeRow
 // A transaction that updates one row of a table with a hundred thousand rows no
 // longer starts by copying the hash of every key in it.
 func (set *constraintIndexSet) BorrowDerived() (any, bool) {
+	// Refuse the complete set before lending any column. A partial attempt
+	// would mark earlier entries as lent even though their borrowers are
+	// discarded, forcing those lenders to copy their maps on the next write.
+	for _, entry := range set.cols {
+		if len(entry.multi) > 0 {
+			return nil, false
+		}
+	}
 	borrowed := &constraintIndexSet{cols: make(map[int]*constraintIndexEntry, len(set.cols))}
 	for colIdx, entry := range set.cols {
 		b, ok := entry.borrow()

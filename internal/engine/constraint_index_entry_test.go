@@ -253,3 +253,93 @@ func TestConstraintIndexEntryBorrowFlattensLargeOverlay(t *testing.T) {
 		t.Fatal("lender changed")
 	}
 }
+
+// A long line of borrowers, each the "next transaction" of the one before, is
+// what a busy table produces. It walks the overlay through every way borrow
+// carries changes forward: copied while few, lent as the middle layer, merged
+// into a new middle layer, folded flat. Earlier generations stay alive for a
+// while and keep changing, as a lender that was not replaced would.
+func TestConstraintIndexEntryBorrowChainMatchesModel(t *testing.T) {
+	for seed := int64(1); seed <= 8; seed++ {
+		rng := rand.New(rand.NewSource(seed))
+		const keys = 4000
+		type member struct {
+			entry *constraintIndexEntry
+			model uniqueModel
+		}
+		mutate := func(m member, ops int) {
+			for ; ops > 0; ops-- {
+				k := rng.Intn(keys)
+				row, held := m.model[k]
+				switch {
+				case !held:
+					next := rng.Intn(100000)
+					m.entry.add(k, next)
+					m.model[k] = next
+				case rng.Intn(3) == 0:
+					next := rng.Intn(100000)
+					m.entry.remove(k, row)
+					m.entry.add(k, next)
+					m.model[k] = next
+				default:
+					m.entry.remove(k, row)
+					delete(m.model, k)
+				}
+			}
+		}
+		check := func(m member, where string) {
+			t.Helper()
+			if got := m.entry.buckets(); !reflect.DeepEqual(got, m.model.buckets()) {
+				t.Fatalf("seed %d %s: entry diverged from its model", seed, where)
+			}
+			for probe := 0; probe < 40; probe++ {
+				k := rng.Intn(keys)
+				row, held := m.model[k]
+				if got, ok := m.entry.get(k); ok != held || (held && got != row) {
+					t.Fatalf("seed %d %s: get(%d) = %d,%v want %d,%v", seed, where, k, got, ok, row, held)
+				}
+			}
+		}
+		head := member{newConstraintIndexEntry(0), uniqueModel{}}
+		mutate(head, 2500)
+		var older []member
+		sawCopied, sawLent, sawMerged, sawFlat := false, false, false, false
+		for gen := 0; gen < 500; gen++ {
+			before := head.entry
+			next, ok := before.borrow()
+			if !ok {
+				t.Fatalf("seed %d gen %d: borrow refused", seed, gen)
+			}
+			switch {
+			case before.base == nil:
+			case next.base == nil:
+				sawFlat = true
+			case len(next.rows) > 0:
+				sawCopied = true
+			case before.mid == nil && len(before.rows) > 0:
+				sawLent = true
+			case before.mid != nil:
+				sawMerged = true
+			}
+			older = append(older, head)
+			if len(older) > 4 {
+				older = older[1:]
+			}
+			head = member{next, head.model.clone()}
+			mutate(head, 1+rng.Intn(60))
+			if rng.Intn(4) == 0 {
+				mutate(older[rng.Intn(len(older))], 1+rng.Intn(20))
+			}
+			if gen%9 == 0 || gen > 490 {
+				check(head, "head")
+				for _, m := range older {
+					check(m, "older generation")
+				}
+			}
+		}
+		if !sawCopied || !sawLent || !sawMerged || !sawFlat {
+			t.Fatalf("seed %d: not every carry path ran (copied=%v lent=%v merged=%v flat=%v)",
+				seed, sawCopied, sawLent, sawMerged, sawFlat)
+		}
+	}
+}

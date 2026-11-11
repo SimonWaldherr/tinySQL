@@ -126,3 +126,79 @@ Tests in `internal/driver/tx_twin_test.go`:
 * `TestSmallTxAllocationIndependentOfTableSize`: a one-row transaction on a
   60,000-row indexed table, and one that changes nothing, allocate less than a
   third of what the row headers alone would cost.
+
+## Follow-up: histories, constraint overlays and BEGIN images
+
+UPDATE history now uses append-only blocks of 64 deltas. A clone shares its
+immutable prefixes with clipped slice capacities and allocates nothing; its
+first append copies the open prefix into a private buffer. Small cloned tails
+reserve geometrically up to 64 entries, while a new block reserves 64 directly.
+A bulk write may grow its first partial block several times; subsequent blocks
+have their full capacity. Searches, the 4,096-delta retention limit, structural
+invalidation and row-twin catch-up retain their existing rules. Old snapshots
+may retain shared blocks until released.
+
+Constraint caches keep at most two read-only layers beneath their current
+changes: a base map and a middle overlay. Small transaction deltas are copied;
+larger ones are lent or merged, then flattened once their combined size passes
+the existing threshold. This avoids copying a growing overlay on every borrow,
+at the cost of another possible map lookup and retaining old keys until folding.
+Multi-row buckets still require a private clone. Borrowing now checks every
+column first, so a refused set cannot mark earlier columns as lent and cause
+unnecessary copies on their next write.
+
+The catalog image used to construct a transaction shadow is also its BEGIN
+comparison image. The driver no longer serializes the same catalog a second
+time. It remains immutable across private DDL/index/RBAC edits, is released on
+promotion, and is not retained by general-purpose deep clones. Ordinary and
+promoted databases continue to return current catalog snapshots.
+
+### Allocation checks (2026-11-11)
+
+The complete transaction comparison is against `629ee1f`, using source overlays
+for the seven changed production files. Both driver test executables contain
+the same fixture: 1,000 rows through `database/sql`, genuine score changes,
+8 or 2,048 committed warm-up updates, then BEGIN/one-row UPDATE/COMMIT per
+operation. Ingestion and warm-up are excluded. Go 1.27.3, darwin/arm64, Apple
+M2 Max, GOMAXPROCS=2; medians of three runs of 16 operations. This is an
+in-memory workload, including driver/query/transaction overhead, without durable
+I/O or fsync.
+
+| Warm-up updates | Bytes/op before → after | Allocs/op before → after |
+| --- | ---: | ---: |
+| 8 | 10,412 → 10,408 | 136 → 125 |
+| 2,048 | 53,372 → 10,304 | 136 → 125 |
+
+Two isolated checks compare the initially uncommitted implementation with this
+follow-up, holding the rest of the tree fixed: history cloning uses an overlay
+of `table.go`, and refused borrowing an overlay of `exec_dml_insert.go`. They
+use three runs of 100 operations. History clones with 1–4,096 retained deltas
+fall from 1,024–2,816 allocated bytes to zero. Writers still allocate private
+buffers; direct clone-plus-append results vary with the tail/block boundary.
+The raw history fixture can grow past 4,096 to stress its storage, whereas a
+Table resets its retained journal before that append.
+
+Refused multi-bucket borrowing falls from 56 B / 2 allocations to zero. With
+eight additional unique 4,096-key columns it falls from about 809 B to zero;
+borrowing followed by writes falls from about 549 KB to zero. The old mixed-set
+cost varies with map iteration order; these are fixture-specific allocation
+volumes, not latency or peak-live-memory claims.
+
+Tests cover clone/append/reset independence under concurrency, block boundaries,
+history rollover, duplicate updates, expired histories, twin catch-up, long
+constraint borrower chains, refusal without lender mutation, catalog isolation
+and concurrent promotion. The root Go/race suites, focused checks after tail
+capacity tuning, SQL-library compatibility, WASM and C/Python/Rust/Swift binding
+tests pass.
+
+```sh
+go test ./internal/storage ./internal/engine ./internal/driver
+go test -race ./internal/storage ./internal/driver \
+  -run 'Test.*(History|Twin|Tx|Catalog|Snapshot)' -count=1
+GOMAXPROCS=2 go test ./internal/driver -run '^$' \
+  -bench '^BenchmarkTxWarmUpdateHistory$' -benchmem -benchtime=16x -count=3
+GOMAXPROCS=2 go test ./internal/storage -run '^$' \
+  -bench '^BenchmarkRowUpdateHistoryClone' -benchmem -benchtime=100x -count=3
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkConstraintBorrowRefusal$' -benchmem -benchtime=100x -count=3
+```

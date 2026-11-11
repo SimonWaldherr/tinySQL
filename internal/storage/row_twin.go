@@ -3,7 +3,6 @@ package storage
 import (
 	"os"
 	"reflect"
-	"sort"
 	"sync/atomic"
 	"unsafe"
 )
@@ -107,13 +106,14 @@ func (t *Table) catchUpRows(buf [][]any, since int) ([][]any, bool) {
 		return nil, false
 	}
 	if since != t.structVersion {
-		log := t.rowUpdateLog
-		if since < t.rowUpdateBase || len(log) == 0 {
+		log := &t.rowUpdateLog
+		total := log.len()
+		if since < t.rowUpdateBase || total == 0 {
 			return nil, false
 		}
 		want := since + 1
-		start := sort.Search(len(log), func(i int) bool { return log[i].structVersion >= want })
-		for _, delta := range log[start:] {
+		for i := log.search(want); i < total; i++ {
+			delta := log.at(i)
 			if delta.structVersion != want || delta.row < 0 || delta.row >= len(t.Rows) {
 				return nil, false
 			}

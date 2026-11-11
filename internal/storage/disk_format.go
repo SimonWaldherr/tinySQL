@@ -280,6 +280,18 @@ func (db *DB) SnapshotCatalog() CatalogSnapshot {
 	return CatalogSnapshot{dc: catalogToDisk(db.Catalog())}
 }
 
+// BeginCatalogSnapshot returns the catalog contents an active transaction
+// snapshot started with, without building the image a second time. Ordinary
+// databases, deep clones and promoted snapshots get their current catalog.
+func (db *DB) BeginCatalogSnapshot() CatalogSnapshot {
+	if db != nil && db.IsShadow() {
+		if begin := db.beginCatalog.Load(); begin != nil {
+			return *begin
+		}
+	}
+	return db.SnapshotCatalog()
+}
+
 // Equal reports whether two snapshots hold the same catalog contents.
 func (s CatalogSnapshot) Equal(other CatalogSnapshot) bool {
 	return reflect.DeepEqual(s.dc, other.dc)

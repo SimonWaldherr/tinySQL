@@ -18,6 +18,9 @@ import "unsafe"
 func (db *DB) DeepClone() *DB {
 	out := NewDB()
 	db.copyRuntimeState(out, true)
+	// DeepClone is a general-purpose copy, not a BEGIN snapshot. Keep its
+	// catalog snapshots current and release the construction image.
+	out.beginCatalog.Store(nil)
 	markShadow(out)
 	for tn, tdb := range db.tenants {
 		for _, t := range tdb.tables {
@@ -103,7 +106,7 @@ func cloneTableMeta(t *Table) *Table {
 	nt.Version = t.Version
 	nt.structVersion = t.structVersion
 	nt.rowUpdateBase = t.rowUpdateBase
-	nt.rowUpdateLog = append([]rowUpdateDelta(nil), t.rowUpdateLog...)
+	nt.rowUpdateLog = t.rowUpdateLog.clone()
 	return nt
 }
 
@@ -186,7 +189,7 @@ func cloneTableCore(t *Table, rows [][]any, copySearchIndexes, borrow bool) *Tab
 	nt.Version = t.Version
 	nt.structVersion = t.structVersion
 	nt.rowUpdateBase = t.rowUpdateBase
-	nt.rowUpdateLog = append([]rowUpdateDelta(nil), t.rowUpdateLog...)
+	nt.rowUpdateLog = t.rowUpdateLog.clone()
 	if borrow {
 		nt.Indexes = borrowSecondaryIndexes(t.Indexes)
 	} else {

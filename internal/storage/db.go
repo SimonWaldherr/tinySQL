@@ -104,6 +104,10 @@ type DB struct {
 	// streamSnapshots) until the shadow takes a private copy of it or the
 	// transaction ends. Protected by streamSnapshotMu.
 	txShared map[*Table]*DB
+	// beginCatalog is the immutable image a transaction shadow's private
+	// catalog was built from. Promotion releases it; ordinary deep clones
+	// do not retain it. See BeginCatalogSnapshot.
+	beginCatalog atomic.Pointer[CatalogSnapshot]
 	// txPrivate lists the private copies this transaction shadow made of
 	// shared tables, so the ones it does not commit can return their twins
 	// (see returnTwins). Guarded by streamSnapshotMu.
@@ -317,9 +321,13 @@ func (db *DB) copyRuntimeState(out *DB, isolateCatalog bool) {
 
 	live := db.Catalog()
 	if isolateCatalog {
-		copied := diskToCatalog(catalogToDisk(live))
+		// Decoding rebuilds private maps and slices from the image, which
+		// also records the catalog contents at construction time.
+		image := catalogToDisk(live)
+		copied := diskToCatalog(image)
 		copied.setRevision(live.Revision())
 		out.setCatalog(copied)
+		out.beginCatalog.Store(&CatalogSnapshot{dc: image})
 	} else {
 		out.setCatalog(live)
 	}
@@ -348,6 +356,7 @@ func markShadow(out *DB) {
 func (db *DB) PromoteShadow() {
 	if db != nil {
 		db.shadow.Store(false)
+		db.beginCatalog.Store(nil)
 	}
 }
 
