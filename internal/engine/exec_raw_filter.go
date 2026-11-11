@@ -260,6 +260,16 @@ func buildRawExprFilter(colIndex map[string]int, e Expr) func([]any) (bool, erro
 	if filter := buildRawTrimComparisonFilter(colIndex, e); filter != nil {
 		return filter
 	}
+	if binary, ok := e.(*Binary); ok && isComparisonOp(binary.Op) {
+		if filter := compileRawNumericComparisonFilter(colIndex, binary); filter != nil {
+			return filter
+		}
+	}
+	if between, ok := e.(*BetweenExpr); ok {
+		if filter := buildRawFilterBetween(colIndex, between); filter != nil {
+			return filter
+		}
+	}
 	if value := compileRawValue(colIndex, e); value != nil {
 		return func(raw []any) (bool, error) {
 			v, err := value(raw)

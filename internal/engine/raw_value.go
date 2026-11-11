@@ -1,5 +1,7 @@
 package engine
 
+import "errors"
+
 // Bind column positions and operators once, while reading literals at execution
 // time so prepared parameters remain fresh. Operations still use the regular
 // evaluator's NULL, overflow, decimal and error rules; nothing is constant-folded.
@@ -15,6 +17,20 @@ func compileRawValue(columns map[string]int, expr Expr) rawValueEvaluator {
 		}
 		if value := compileRawScalar(columns, ex); value != nil {
 			return value
+		}
+	case *Unary:
+		if num := compileRawNumeric(columns, ex); num != nil {
+			return func(raw []any) (any, error) {
+				n, err := num(raw)
+				if err != nil {
+					if errors.Is(err, errNumericFallback) {
+						plan := &simpleSelectPlan{colIndex: columns, rowTextCols: rawRowTextColumns(columns)}
+						return evalRawExpr(plan, raw, ex)
+					}
+					return nil, err
+				}
+				return n.toAny(), nil
+			}
 		}
 	case *IsNull:
 		value := compileRawValue(columns, ex.Expr)
@@ -41,6 +57,25 @@ func compileRawValue(columns map[string]int, expr Expr) rawValueEvaluator {
 	if !arithmetic && !isComparisonOp(binary.Op) {
 		// AND/OR retain the predicate compiler's short-circuit and cost order.
 		return nil
+	}
+	if !arithmetic {
+		if comp := compileRawNumericComparisonValue(columns, binary); comp != nil {
+			return comp
+		}
+	} else {
+		if num := compileRawNumeric(columns, binary); num != nil {
+			return func(raw []any) (any, error) {
+				n, err := num(raw)
+				if err != nil {
+					if errors.Is(err, errNumericFallback) {
+						plan := &simpleSelectPlan{colIndex: columns, rowTextCols: rawRowTextColumns(columns)}
+						return evalRawExpr(plan, raw, binary)
+					}
+					return nil, err
+				}
+				return n.toAny(), nil
+			}
+		}
 	}
 	left := compileRawValue(columns, binary.Left)
 	right := compileRawValue(columns, binary.Right)
