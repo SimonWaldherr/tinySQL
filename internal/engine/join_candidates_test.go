@@ -20,7 +20,10 @@ func TestJoinCandidateLookupMatchesNestedLoops(t *testing.T) {
 		indexed     bool
 	}{
 		{name: "integers", left: func(i int) any { return i % 7 }, right: func(i int) any { return int64(i % 9) }, indexed: true},
+		{name: "native-integers", left: func(i int) any { return i % 7 }, right: func(i int) any { return i % 9 }, indexed: true},
+		{name: "int64-integers", left: func(i int) any { return int64(i % 7) }, right: func(i int) any { return int64(i % 9) }, indexed: true},
 		{name: "exact-large-integers", left: func(i int) any { return int64(1<<53) + int64(i%7) }, right: func(i int) any { return int64(1<<53) + int64(i%9) }, indexed: true},
+		{name: "mixed-large-integers", left: func(i int) any { return int(int64(1<<53) + int64(i%7)) }, right: func(i int) any { return int64(1<<53) + int64(i%9) }, indexed: true},
 		{name: "floats", left: func(i int) any { return float64(i % 7) }, right: func(i int) any { return float64(i % 9) }, indexed: true},
 		{name: "strings", left: func(i int) any { return fmt.Sprint(i % 7) }, right: func(i int) any { return fmt.Sprint(i % 9) }, indexed: true},
 		{name: "booleans", left: func(i int) any { return i%2 == 0 }, right: func(i int) any { return i%3 == 0 }, indexed: true},
@@ -122,5 +125,51 @@ func TestJoinCandidateLookupCancellationAndRowLimit(t *testing.T) {
 	defer func() { maxJoinRows = previous }()
 	if _, err := processInnerJoin(env, left, right, condition); err == nil || !strings.Contains(err.Error(), "row limit") {
 		t.Fatalf("indexed duplicate matches must honor the row limit, got %v", err)
+	}
+}
+
+func TestJoinCandidateLookupPreservesInterleavedBuckets(t *testing.T) {
+	outer := make([]Row, 145)
+	for i := range outer {
+		outer[i] = Row{"l.id": i}
+	}
+	inner := make([]Row, 0, 400)
+	for i := range 140 {
+		inner = append(inner, Row{"r.id": int64(i), "r.position": len(inner)})
+	}
+	// Revisit earlier keys after many other keys were inserted. Include
+	// unmatched and NULL keys for FULL JOIN's unmatched-right traversal.
+	for range 7 {
+		for _, key := range []any{int64(0), int64(1), int64(63), int64(64), int64(127), int64(128), int64(139), int64(999), nil} {
+			inner = append(inner, Row{"r.id": key, "r.position": len(inner)})
+		}
+	}
+	env := ExecEnv{ctx: t.Context()}
+	condition := mustParse("SELECT * FROM l JOIN r ON l.id = r.id").(*Select).Joins[0].On
+	lookup, err := buildJoinCandidateLookup(env, compileJoinEquality(condition), outer, inner)
+	if err != nil || lookup == nil {
+		t.Fatalf("lookup not built: %v", err)
+	}
+	for i, left := range outer {
+		var want []int
+		for position, right := range inner {
+			if rawEqual(left["l.id"], right["r.id"]) {
+				want = append(want, position)
+			}
+		}
+		got, count := lookup.candidates(i, len(inner))
+		if count != len(want) || !reflect.DeepEqual(got, want) {
+			t.Fatalf("key %d: candidates %v, want %v", i, got, want)
+		}
+	}
+	metadata := &storage.Table{Cols: []storage.Column{{Name: "id"}, {Name: "position"}}}
+	got, err := processFullOuterJoin(env, outer, inner, condition, "r", metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := &Binary{Op: "AND", Left: condition, Right: &Literal{Val: true}}
+	want, err := processFullOuterJoin(env, outer, inner, reference, "r", metadata)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("FULL JOIN differed from nested loops: %v", err)
 	}
 }

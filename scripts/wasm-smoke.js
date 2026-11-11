@@ -76,6 +76,21 @@ async function main() {
   success(db.exec('UPDATE ordered_floats SET score = COALESCE(score,1/0)'));
   success(db.exec('UPDATE ordered_floats SET score = CASE WHEN score IS NULL THEN 1/0 ELSE score END'));
   assert.deepEqual(success(db.query('SELECT id,score FROM ordered_floats ORDER BY id')).rows, floatRows);
+  const uniqueScores = [...new Set(floatRows.map(row => row[1]))];
+  assert.deepEqual(success(db.query('SELECT DISTINCT score FROM ordered_floats')).rows,
+    uniqueScores.map(score => [score]));
+  assert.deepEqual(success(db.query('SELECT COUNT(DISTINCT score) FROM ordered_floats')).rows,
+    [[uniqueScores.length]]);
+  assert.deepEqual(success(db.query('SELECT id%2 AS parity,COUNT(DISTINCT score) AS n FROM ordered_floats GROUP BY id%2 ORDER BY parity')).rows,
+    [0, 1].map(parity => [parity, new Set(floatRows.filter(row => row[0] % 2 === parity).map(row => row[1])).size]));
+  success(db.exec('CREATE TABLE join_candidates (id INT, position INT)'));
+  const joinRows = Array.from({ length: 145 }, (_, id) => [id, id]);
+  joinRows.push([0, 145], [63, 146], [64, 147], [127, 148], [128, 149]);
+  success(db.exec(`INSERT INTO join_candidates VALUES ${joinRows.map(([id, position]) => `(${id},${position})`).join(',')}`));
+  const joined = floatRows.flatMap(([id]) => joinRows
+    .filter(row => row[0] === id).map(row => [id, row[1]]));
+  assert.deepEqual(success(db.query('SELECT l.id,r.position FROM ordered_floats l JOIN join_candidates r ON l.id=r.id ORDER BY l.id,r.position')).rows,
+    joined);
   // CTE ordering binds source qualifiers and output aliases before pagination.
   const orderedCTE = success(db.query('WITH c AS (SELECT id,label,active FROM bulk_transfer) SELECT q.id AS id,q.label AS caption FROM c q WHERE q.id>=4900 ORDER BY q.active DESC,id DESC LIMIT 5 OFFSET 2'));
   assert.deepEqual(orderedCTE.columns, ['id', 'caption']);

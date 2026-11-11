@@ -28,9 +28,7 @@ func joinLookupKey(value any) (any, byte) {
 	switch v := value.(type) {
 	case nil:
 		return nil, 0
-	case int:
-		return int64(v), 1
-	case int64:
+	case int, int64:
 		return value, 1
 	case float64:
 		if !math.IsNaN(v) {
@@ -58,6 +56,7 @@ func buildJoinCandidateLookup(env ExecEnv, equality *joinEquality, outer, inner 
 	}
 	keys := make([]any, len(outer)+len(inner))
 	var domain byte
+	var integerKinds byte
 	for side, rows := range [][]Row{outer, inner} {
 		column, other, offset := outerColumn, innerColumn, 0
 		if side == 1 {
@@ -81,7 +80,28 @@ func buildJoinCandidateLookup(env ExecEnv, equality *joinEquality, outer, inner 
 			if kind != 0 {
 				domain = kind
 			}
+			if kind == 1 {
+				if _, ok := value.(int); ok {
+					integerKinds |= 1
+				} else {
+					integerKinds |= 2
+				}
+			}
 			keys[offset+i] = key
+		}
+	}
+	// Homogeneous integer representations can borrow their boxed input keys.
+	// Only mixed int/int64 inputs need normalization for map equality.
+	if integerKinds == 3 {
+		for i, key := range keys {
+			if i&63 == 0 {
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
+			}
+			if value, ok := key.(int); ok {
+				keys[i] = int64(value)
+			}
 		}
 	}
 	positions := make(map[any][]int, len(inner))

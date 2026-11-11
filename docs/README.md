@@ -88,6 +88,8 @@ current behavior and keep performance claims scoped to the workload they measure
   and UPDATE expressions, plus raw ordering without copying sort candidates.
 - [CASE and COALESCE execution](conditional-expression-performance.md) — bound
   conditional values, lazy branches, NULL compatibility and measured tradeoffs.
+- [Numeric DISTINCT and general JOINs](distinct-join-performance.md) — float
+  deduplication, mixed-type counts and reuse of integer join keys.
 - [Query optimizer research](query-optimizer-research.md) — PostgreSQL, DuckDB
   and SQLite techniques assessed against tinySQL, with adaptive large-page sorts.
 - [CTE alignment](cte-performance.md), [CTE and indexed SELECT](cte-select-performance.md),

@@ -190,6 +190,7 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 	seen := make(map[string]struct{})
 	var seenScalar map[any]struct{}
 	var seenText map[string]struct{}
+	var seenFloat map[uint64]struct{}
 	vals := make([]any, len(plan.projs))
 	// key is reused across rows; seen[string(key)] is a zero-allocation lookup,
 	// so a string is only materialized for a genuinely new row — the same
@@ -233,10 +234,12 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 			return nil, true, err
 		}
 		var scalar any
-		var scalarOK, isText bool
+		var scalarOK, isText, isFloat bool
 		var text string
+		var real float64
 		if len(vals) == 1 {
 			text, isText = vals[0].(string)
+			real, isFloat = vals[0].(float64)
 			scalar, scalarOK = scalarDistinctKey(vals[0])
 		}
 		if isText {
@@ -247,6 +250,15 @@ func executeSimpleSelectDistinctFastPath(env ExecEnv, plan *simpleSelectPlan) (*
 				seenText = make(map[string]struct{})
 			}
 			seenText[text] = struct{}{}
+		} else if isFloat {
+			key := distinctFloatKey(real)
+			if _, dup := seenFloat[key]; dup {
+				continue
+			}
+			if seenFloat == nil {
+				seenFloat = make(map[uint64]struct{})
+			}
+			seenFloat[key] = struct{}{}
 		} else if scalarOK {
 			if _, dup := seenScalar[scalar]; dup {
 				continue

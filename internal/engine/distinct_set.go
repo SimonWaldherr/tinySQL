@@ -1,6 +1,9 @@
 package engine
 
-import "strconv"
+import (
+	"math"
+	"strconv"
+)
 
 // scalarDistinctKey preserves writeFmtKeyPart's type boundaries without
 // formatting integers and booleans. Other values keep the canonical encoding.
@@ -13,12 +16,23 @@ func scalarDistinctKey(v any) (any, bool) {
 	}
 }
 
+// distinctFloatKey has the same equivalence classes as formatting with 'g',
+// -1, 64: finite values and signed zeros retain their bits, while every NaN
+// formats as "NaN" regardless of its sign or payload.
+func distinctFloatKey(value float64) uint64 {
+	if math.IsNaN(value) {
+		return 0x7ff8000000000000
+	}
+	return math.Float64bits(value)
+}
+
 // COUNT(DISTINCT) historically deduplicates by valueText, unlike SELECT
-// DISTINCT's typed keys. Integer-only inputs can use exact integer keys without
-// formatting every row. The first other non-NULL type migrates those keys to
-// text, preserving equivalences such as int(1), int64(1), 1.0 and "1".
+// DISTINCT's typed keys. Homogeneous integer or float inputs avoid formatting
+// every row. Integers migrate to text on a type change. Float-first inputs keep
+// their numeric keys and check text equivalence only for new values.
 type distinctCountSet struct {
 	integers map[int64]struct{}
+	floats   map[uint64]struct{}
 	seen     map[string]struct{}
 	buf      []byte
 }
@@ -26,6 +40,21 @@ type distinctCountSet struct {
 func (s *distinctCountSet) add(v any) bool {
 	if v == nil {
 		return false
+	}
+	if s.floats != nil {
+		if value, ok := v.(float64); ok {
+			key := distinctFloatKey(value)
+			if _, exists := s.floats[key]; exists {
+				return false
+			}
+			s.floats[key] = struct{}{}
+			if s.seen == nil {
+				return true
+			}
+			s.buf = strconv.AppendFloat(s.buf[:0], value, 'g', -1, 64)
+			_, exists := s.seen[string(s.buf)]
+			return !exists
+		}
 	}
 	if s.seen == nil {
 		var integer int64
@@ -38,7 +67,7 @@ func (s *distinctCountSet) add(v any) bool {
 		default:
 			integerValue = false
 		}
-		if integerValue {
+		if integerValue && s.floats == nil {
 			if _, exists := s.integers[integer]; exists {
 				return false
 			}
@@ -46,6 +75,12 @@ func (s *distinctCountSet) add(v any) bool {
 				s.integers = make(map[int64]struct{})
 			}
 			s.integers[integer] = struct{}{}
+			return true
+		}
+		if value, ok := v.(float64); ok && s.integers == nil {
+			key := distinctFloatKey(value)
+			s.floats = make(map[uint64]struct{})
+			s.floats[key] = struct{}{}
 			return true
 		}
 		s.seen = make(map[string]struct{}, len(s.integers)+1)
@@ -59,7 +94,7 @@ func (s *distinctCountSet) add(v any) bool {
 			return false
 		}
 		s.seen[text] = struct{}{}
-		return true
+		return !s.containsFloatText(text)
 	}
 	s.buf = s.buf[:0]
 	switch x := v.(type) {
@@ -77,6 +112,25 @@ func (s *distinctCountSet) add(v any) bool {
 	if _, exists := s.seen[string(s.buf)]; exists {
 		return false
 	}
-	s.seen[string(s.buf)] = struct{}{}
-	return true
+	text := string(s.buf)
+	s.seen[text] = struct{}{}
+	return !s.containsFloatText(text)
+}
+
+// Only canonical float text can equal a formatted numeric key. Parsing alone
+// would merge "1.00" with 1 or round large integer text to a nearby float.
+func (s *distinctCountSet) containsFloatText(text string) bool {
+	if s.floats == nil {
+		return false
+	}
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return false
+	}
+	_, exists := s.floats[distinctFloatKey(value)]
+	if !exists {
+		return false
+	}
+	s.buf = strconv.AppendFloat(s.buf[:0], value, 'g', -1, 64)
+	return string(s.buf) == text
 }
