@@ -203,21 +203,12 @@ func compare(a, b any) (int, error) {
 }
 
 func compareBigRat(ax *big.Rat, b any) (int, error) {
+	if ax == nil {
+		return 0, fmt.Errorf("cannot compare nil decimal")
+	}
 	// Try to convert b to big.Rat
 	if bx, ok := storage.DecimalFromAny(b); ok {
 		return compareDecimalRats(ax, bx), nil
-	}
-	// If b is numeric (int/float), convert
-	switch bx := b.(type) {
-	case int:
-		rb := new(big.Rat).SetInt64(int64(bx))
-		return ax.Cmp(rb), nil
-	case int64:
-		rb := new(big.Rat).SetInt64(bx)
-		return ax.Cmp(rb), nil
-	case float64:
-		rb := new(big.Rat).SetFloat64(bx)
-		return ax.Cmp(rb), nil
 	}
 	return 0, fmt.Errorf("incomparable decimal and %T", b)
 }

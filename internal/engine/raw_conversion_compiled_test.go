@@ -27,6 +27,8 @@ func TestCompiledRawConversionsMatchEvaluator(t *testing.T) {
 		"TRY_CONVERT(FLOAT,v)", "CONVERT(BOOL,v)", "CONVERT(VARCHAR(3),v)", "CONVERT(CHAR(5),v)",
 		"CONVERT(DATE,v,104)", "TRY_CONVERT(DATE,v,104)", "CONVERT(TIME,v,108)",
 		"CAST(CONVERT(FLOAT,v) AS TEXT)", "CONVERT(TEXT,CAST(v AS INT))",
+		"TRY_CONVERT(INT,1/0)", "CAST(COALESCE(v,'7') AS TEXT)",
+		"TRY_CONVERT(INT,NULLIF(TRIM(v),'bad'))",
 	} {
 		expr := mustParse("SELECT " + expression).(*Select).Projs[0].Expr
 		compiled := compileRawConversion(columns, expr)
@@ -51,7 +53,7 @@ func TestCompiledRawConversionsMatchEvaluator(t *testing.T) {
 	// particular, TRY_CONVERT must not hide declaration or expression errors.
 	for _, expression := range []string{
 		"CONVERT(unknown,v)", "CONVERT(VARCHAR(8001),v)", "CONVERT(INT,v,130)",
-		"CONVERT(INT,v,NULL)", "TRY_CONVERT(INT,1/0)", "CONVERT(DATE,v,v)",
+		"CONVERT(INT,v,NULL)", "CONVERT(DATE,v,v)",
 		"CAST(NOW() AS TEXT)",
 	} {
 		expr := mustParse("SELECT " + expression).(*Select).Projs[0].Expr

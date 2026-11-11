@@ -5,11 +5,12 @@ import (
 	"math/big"
 )
 
-// DecimalFromAny attempts to convert a value to *big.Rat.
+// DecimalFromAny attempts to convert a value to a non-nil *big.Rat. Nil
+// rational pointers and nonfinite floats are not representable decimals.
 func DecimalFromAny(v any) (*big.Rat, bool) {
 	switch t := v.(type) {
 	case *big.Rat:
-		return t, true
+		return t, t != nil
 	case big.Rat:
 		return &t, true
 	case string:
@@ -27,7 +28,7 @@ func DecimalFromAny(v any) (*big.Rat, bool) {
 	case float64:
 		// Convert float64 to rational approximation
 		r := new(big.Rat).SetFloat64(t)
-		return r, true
+		return r, r != nil
 	default:
 		return nil, false
 	}
@@ -55,14 +56,13 @@ func DecimalToString(r *big.Rat) string {
 	return r.RatString()
 }
 
-// AsBigRat returns the value as *big.Rat if it is already a rational type
-// (either *big.Rat or big.Rat). Unlike DecimalFromAny this does not coerce
-// ints/floats/strings and is suitable for preserving existing numeric
-// semantics in the engine.
+// AsBigRat returns a non-nil rational value if it is already *big.Rat or
+// big.Rat. Unlike DecimalFromAny it does not coerce ints/floats/strings and is
+// suitable for preserving existing numeric semantics in the engine.
 func AsBigRat(v any) (*big.Rat, bool) {
 	switch t := v.(type) {
 	case *big.Rat:
-		return t, true
+		return t, t != nil
 	case big.Rat:
 		return &t, true
 	default:

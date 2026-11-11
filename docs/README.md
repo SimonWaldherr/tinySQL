@@ -86,8 +86,8 @@ current behavior and keep performance claims scoped to the workload they measure
   allocation and execution-path improvements; it links to focused records below.
 - [Standard SQL execution](standard-query-performance.md) — bound SELECT, WHERE
   and UPDATE expressions, plus raw ordering without copying sort candidates.
-- [CASE and COALESCE execution](conditional-expression-performance.md) — bound
-  conditional values, lazy branches, NULL compatibility and measured tradeoffs.
+- [Conditional, NULL and text execution](conditional-expression-performance.md)
+  — CASE, ISNULL, NULLIF, COALESCE, computed BETWEEN, TRIM and measured tradeoffs.
 - [Numeric DISTINCT and general JOINs](distinct-join-performance.md) — float
   deduplication, mixed-type counts and reuse of integer join keys.
 - [Query optimizer research](query-optimizer-research.md) — PostgreSQL, DuckDB

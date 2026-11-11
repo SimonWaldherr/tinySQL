@@ -323,7 +323,7 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 	if candidateCount >= 64 {
 		for i, set := range plan.sets {
 			switch set.expr.(type) {
-			case *Binary, *CaseExpr, *FuncCall:
+			case *Binary, *CaseExpr, *FuncCall, *BetweenExpr, *IsNull:
 			default:
 				continue
 			}

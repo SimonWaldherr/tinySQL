@@ -7,8 +7,13 @@ func compileRawValue(columns map[string]int, expr Expr) rawValueEvaluator {
 	switch ex := expr.(type) {
 	case *CaseExpr:
 		return compileRawCase(columns, ex)
+	case *BetweenExpr:
+		return compileRawBetween(columns, ex)
 	case *FuncCall:
 		if value := compileRawCoalesce(columns, ex); value != nil {
+			return value
+		}
+		if value := compileRawScalar(columns, ex); value != nil {
 			return value
 		}
 	case *IsNull:

@@ -44,6 +44,16 @@ async function main() {
     FROM conditional_values`)).rows, [[9, 3, 1]]);
   assert.deepEqual(success(db.query('SELECT IFNULL(v,fallback,9), NVL(v,fallback,9) FROM conditional_values')).rows,
     [[7, 7], [0, 0], [2, 2], [9, 9]]);
+  assert.deepEqual(success(db.query(`SELECT ISNULL(v),NULLIF(v,0),
+    COALESCE(v,IF(ISNULL(fallback),9,fallback)),COALESCE(v,0) BETWEEN 0 AND 1
+    FROM conditional_values`)).rows,
+    [[true, null, 7, true], [false, null, 0, true], [false, 2, 2, false], [true, null, 9, true]]);
+  assert.deepEqual(success(db.query(`SELECT TRIM('x α🙂 x',' x'),LTRIM('xxα🙂xx','x'),
+    RTRIM('xxα🙂xx','x'),LENGTH(TRIM('x α🙂 x',' x')),LENGTH(X'00FF'),
+    COALESCE(NULL,LENGTH(LOWER('Ä🙂'))),TRIM(NULL,1/0)`)).rows,
+    [['α🙂', 'α🙂xx', 'xxα🙂', 2, 2, 2, null]]);
+  assert.ok(db.query('SELECT NULLIF(NULL,1/0)').error);
+  assert.ok(db.query('SELECT COALESCE(NULL,1) BETWEEN NULL AND 1/0').error);
   // Cross multiple result-transfer blocks, including the small/large boundary.
   success(db.exec('CREATE TABLE bulk_transfer (id INT, label TEXT, active BOOL)'));
   const bulkExpected = Array.from({ length: 5003 }, (_, id) => [id, `é漢🙂<&_${id}`, id % 2 === 0]);
@@ -75,6 +85,7 @@ async function main() {
   }
   success(db.exec('UPDATE ordered_floats SET score = COALESCE(score,1/0)'));
   success(db.exec('UPDATE ordered_floats SET score = CASE WHEN score IS NULL THEN 1/0 ELSE score END'));
+  success(db.exec('UPDATE ordered_floats SET score = COALESCE(NULLIF(score,-1),LENGTH(TRIM(NULL)))'));
   assert.deepEqual(success(db.query('SELECT id,score FROM ordered_floats ORDER BY id')).rows, floatRows);
   const uniqueScores = [...new Set(floatRows.map(row => row[1]))];
   assert.deepEqual(success(db.query('SELECT DISTINCT score FROM ordered_floats')).rows,

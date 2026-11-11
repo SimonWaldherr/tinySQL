@@ -33,7 +33,7 @@ func compileRawConversion(columns map[string]int, expr Expr) rawValueEvaluator {
 			return nil
 		}
 		target = strings.ToUpper(target)
-		value := compileRawConversionInput(columns, call.Args[0])
+		value := compileRawValue(columns, call.Args[0])
 		if value == nil {
 			return nil
 		}
@@ -66,7 +66,7 @@ func compileRawConversion(columns map[string]int, expr Expr) rawValueEvaluator {
 			return nil
 		}
 	}
-	value := compileRawConversionInput(columns, call.Args[1])
+	value := compileRawValue(columns, call.Args[1])
 	if value == nil {
 		return nil
 	}

@@ -415,29 +415,7 @@ func evalLength(env ExecEnv, args []Expr, row Row) (any, error) {
 		return nil, err
 	}
 
-	if val == nil {
-		return nil, nil
-	}
-
-	// BLOB values are raw bytes, not text. valueText has no fast case for
-	// []byte and falls back to fmt, whose %v form for a plain byte slice is
-	// its decimal byte list (e.g. "[110 111 99]") — that string's character
-	// count is not the blob's size. Report the real byte count directly.
-	// (json.RawMessage/jsontext.Value, used for GEOMETRY/JSON columns, is a
-	// distinct named type that renders as its JSON text via valueText, so
-	// LENGTH already returns a sensible character count for it.)
-	if b, ok := val.([]byte); ok {
-		return len(b), nil
-	}
-
-	str := valueText(val)
-
-	// stringCharCount takes the same ASCII fast path stringPrefix/LPAD/RPAD
-	// use: LENGTH/CHAR_LENGTH runs on every row of a scan, and
-	// utf8.RuneCountInString unconditionally walks the whole string even
-	// though len(str) already gives the exact same answer for plain ASCII
-	// text (the overwhelmingly common case).
-	return stringCharCount(str), nil
+	return stringLengthValue(val), nil
 }
 
 // stringRunes returns str as characters rather than UTF-8 bytes. SQL string
