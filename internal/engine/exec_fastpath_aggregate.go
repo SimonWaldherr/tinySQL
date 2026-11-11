@@ -266,6 +266,10 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 	if rawPlan.rowIDs != nil {
 		rowCount = len(rawPlan.rowIDs)
 	}
+	var singleState *simpleAggregateState
+	if len(plan.groupCols) == 0 {
+		singleState = groups.state(nil, nil)
+	}
 	needsFilter := rawPlan.where != nil && !rawPlan.filterFullyCovered
 	for i := 0; i < rowCount; i++ {
 		rowID := i
@@ -298,9 +302,17 @@ func executeSimpleSingleGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, r
 			continue
 		}
 
-		state, err := simpleAggregateGroupState(groupsStateArgs{groups: &groups, plan: plan, rawPlan: rawPlan, raw: raw, values: groupValues, cache: groupCache})
-		if err != nil {
-			return nil, true, err
+		var state *simpleAggregateState
+		if singleState != nil {
+			state = singleState
+		} else if len(plan.groupExprs) == 0 {
+			state = groups.state(raw, plan.groupCols)
+		} else {
+			var err error
+			state, err = simpleAggregateGroupState(groupsStateArgs{groups: &groups, plan: plan, rawPlan: rawPlan, raw: raw, values: groupValues, cache: groupCache})
+			if err != nil {
+				return nil, true, err
+			}
 		}
 		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
 			return nil, true, err
@@ -355,9 +367,15 @@ func executeSimpleMultiGroupAggregate(env ExecEnv, plan *simpleAggregatePlan, ra
 			continue
 		}
 
-		state, err := simpleAggregateGroupState(groupsStateArgs{groups: &groups, plan: plan, rawPlan: rawPlan, raw: raw, values: groupValues, cache: groupCache})
-		if err != nil {
-			return nil, true, err
+		var state *simpleAggregateState
+		if len(plan.groupExprs) == 0 {
+			state = groups.state(raw, plan.groupCols)
+		} else {
+			var err error
+			state, err = simpleAggregateGroupState(groupsStateArgs{groups: &groups, plan: plan, rawPlan: rawPlan, raw: raw, values: groupValues, cache: groupCache})
+			if err != nil {
+				return nil, true, err
+			}
 		}
 		if err := accumulateSimpleAggregateState(env, rawPlan, raw, state, plan.projs); err != nil {
 			return nil, true, err

@@ -293,6 +293,15 @@ func compareInt64(ax int64, b any) (int, error) {
 }
 
 func compareFloat(ax float64, b any) (int, error) {
+	if bf, ok := b.(float64); ok {
+		if ax < bf {
+			return -1, nil
+		}
+		if ax > bf {
+			return 1, nil
+		}
+		return 0, nil
+	}
 	if f, ok := numeric(b); ok {
 		if ax < f {
 			return -1, nil

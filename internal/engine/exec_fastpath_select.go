@@ -1030,18 +1030,70 @@ func evalRawOrderKey(plan *simpleSelectPlan, raw []any, expr Expr, value rawValu
 }
 
 func sortFullOrderedRawPositions(plan *simpleSelectPlan, rows []orderedRawRow, perm []int32) {
-	slices.SortFunc(perm, func(i, j int32) int {
-		if cmp := compareOrderedRawRows(plan, &rows[i], &rows[j]); cmp != 0 {
-			return cmp
-		}
-		if i < j {
-			return -1
-		}
-		if i > j {
-			return 1
-		}
-		return 0
-	})
+	switch len(plan.orderBy) {
+	case 1:
+		desc := plan.orderBy[0].Desc
+		nulls := plan.orderBy[0].Nulls
+		slices.SortFunc(perm, func(i, j int32) int {
+			a, b := &rows[i], &rows[j]
+			if cmp := compareOrderedValueNulls(a.key, b.key, desc, nulls); cmp != 0 {
+				return cmp
+			}
+			if a.idx < b.idx {
+				return -1
+			}
+			if a.idx > b.idx {
+				return 1
+			}
+			return 0
+		})
+	case 2:
+		d0, n0 := plan.orderBy[0].Desc, plan.orderBy[0].Nulls
+		d1, n1 := plan.orderBy[1].Desc, plan.orderBy[1].Nulls
+		slices.SortFunc(perm, func(i, j int32) int {
+			a, b := &rows[i], &rows[j]
+			if cmp := compareOrderedValueNulls(a.keys[0], b.keys[0], d0, n0); cmp != 0 {
+				return cmp
+			}
+			if cmp := compareOrderedValueNulls(a.keys[1], b.keys[1], d1, n1); cmp != 0 {
+				return cmp
+			}
+			if a.idx < b.idx {
+				return -1
+			}
+			if a.idx > b.idx {
+				return 1
+			}
+			return 0
+		})
+	case 3:
+		d0, n0 := plan.orderBy[0].Desc, plan.orderBy[0].Nulls
+		d1, n1 := plan.orderBy[1].Desc, plan.orderBy[1].Nulls
+		d2, n2 := plan.orderBy[2].Desc, plan.orderBy[2].Nulls
+		slices.SortFunc(perm, func(i, j int32) int {
+			a, b := &rows[i], &rows[j]
+			if cmp := compareOrderedValueNulls(a.keys[0], b.keys[0], d0, n0); cmp != 0 {
+				return cmp
+			}
+			if cmp := compareOrderedValueNulls(a.keys[1], b.keys[1], d1, n1); cmp != 0 {
+				return cmp
+			}
+			if cmp := compareOrderedValueNulls(a.keys[2], b.keys[2], d2, n2); cmp != 0 {
+				return cmp
+			}
+			if a.idx < b.idx {
+				return -1
+			}
+			if a.idx > b.idx {
+				return 1
+			}
+			return 0
+		})
+	default:
+		slices.SortFunc(perm, func(i, j int32) int {
+			return compareOrderedRawRows(plan, &rows[i], &rows[j])
+		})
+	}
 }
 
 // rawKeyArenaChunkRows sizes keyArena chunks in rows' worth of keys. Chunking
@@ -1178,16 +1230,144 @@ func compareOrderedRawRows(plan *simpleSelectPlan, a, b *orderedRawRow) int {
 }
 
 func compareOrderedValue(a, b any, desc bool) int {
-	// Text dimension keys dominate multi-column sorts. Compare them once,
-	// without the generic SQL comparison/error path on every sort comparison.
-	// Mixed types and NULL retain the existing ordering rules below.
-	if left, ok := a.(string); ok {
+	// Common scalar types dominate ordering. Compare them directly without
+	// entering the generic SQL comparison/error path on every comparison.
+	// Mixed types, NULL, and NaN retain the existing ordering rules below.
+	switch left := a.(type) {
+	case string:
 		if right, ok := b.(string); ok {
-			cmp := strings.Compare(left, right)
+			var cmp int
+			if left < right {
+				cmp = -1
+			} else if left > right {
+				cmp = 1
+			}
 			if desc {
 				return -cmp
 			}
 			return cmp
+		}
+	case int:
+		switch right := b.(type) {
+		case int:
+			var cmp int
+			if left < right {
+				cmp = -1
+			} else if left > right {
+				cmp = 1
+			}
+			if desc {
+				return -cmp
+			}
+			return cmp
+		case int64:
+			li := int64(left)
+			var cmp int
+			if li < right {
+				cmp = -1
+			} else if li > right {
+				cmp = 1
+			}
+			if desc {
+				return -cmp
+			}
+			return cmp
+		case float64:
+			if !math.IsNaN(right) {
+				lf := float64(left)
+				var cmp int
+				if lf < right {
+					cmp = -1
+				} else if lf > right {
+					cmp = 1
+				}
+				if desc {
+					return -cmp
+				}
+				return cmp
+			}
+		}
+	case int64:
+		switch right := b.(type) {
+		case int64:
+			var cmp int
+			if left < right {
+				cmp = -1
+			} else if left > right {
+				cmp = 1
+			}
+			if desc {
+				return -cmp
+			}
+			return cmp
+		case int:
+			ri := int64(right)
+			var cmp int
+			if left < ri {
+				cmp = -1
+			} else if left > ri {
+				cmp = 1
+			}
+			if desc {
+				return -cmp
+			}
+			return cmp
+		case float64:
+			if !math.IsNaN(right) {
+				lf := float64(left)
+				var cmp int
+				if lf < right {
+					cmp = -1
+				} else if lf > right {
+					cmp = 1
+				}
+				if desc {
+					return -cmp
+				}
+				return cmp
+			}
+		}
+	case float64:
+		if !math.IsNaN(left) {
+			switch right := b.(type) {
+			case float64:
+				if !math.IsNaN(right) {
+					var cmp int
+					if left < right {
+						cmp = -1
+					} else if left > right {
+						cmp = 1
+					}
+					if desc {
+						return -cmp
+					}
+					return cmp
+				}
+			case int:
+				rf := float64(right)
+				var cmp int
+				if left < rf {
+					cmp = -1
+				} else if left > rf {
+					cmp = 1
+				}
+				if desc {
+					return -cmp
+				}
+				return cmp
+			case int64:
+				rf := float64(right)
+				var cmp int
+				if left < rf {
+					cmp = -1
+				} else if left > rf {
+					cmp = 1
+				}
+				if desc {
+					return -cmp
+				}
+				return cmp
+			}
 		}
 	}
 	cmp := compareForOrder(a, b, desc)
