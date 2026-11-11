@@ -95,6 +95,10 @@ Backends whose tables live in an evictable pool (`ModeIndex`, `ModeHybrid`,
 
 ## What is still proportional to table size
 
+> Warm transactions can now avoid the first two costs below by reusing
+> [transaction twins](transaction-twin-performance.md). Cold tables and excluded
+> cases still require copying.
+
 * The first write to a table copies its row-header slice (24 bytes per row, one
   `memmove`). For 100,000 rows that is 2.4 MB and now most of the remaining
   cost of a single-row write transaction.

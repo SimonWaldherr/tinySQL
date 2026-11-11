@@ -14,22 +14,15 @@ package storage
 // O(log n) expected-case regardless of whether keys arrive sorted, reverse
 // sorted or random.
 //
-// Threading: like the []IndexEntry slice it replaces, SkipList has no internal
-// locking. SecondaryIndex/Table mutations are already serialized by the
-// caller (the engine holds storage.DB's mu for the duration of a write
-// statement; see internal/storage/db.go), and nothing in this package's
-// existing secondary-index code (insertSecondaryIndexRowID,
-// removeSecondaryIndexRowID, etc.) takes its own lock either. Adding one here
-// would be redundant and would not match the established convention.
-//
-// This file intentionally has zero wiring into SecondaryIndex -- it is a
-// standalone, independently testable data structure. A later stage swaps
-// SecondaryIndex's live operations over to it.
+// Threading: SkipList has no internal locking. Table mutations require the
+// database content write lock; SecondaryIndex.mu guards representation changes.
+// Direct SkipList callers must serialize reads and mutations themselves.
 
 import (
 	"bytes"
 	"math/rand"
 	"sort"
+	"sync/atomic"
 )
 
 const (
@@ -62,6 +55,65 @@ type SkipList struct {
 	level  int // number of levels currently in use, always >= 1
 	length int // number of distinct keys
 	rng    *rand.Rand
+	// journal lists the mutations applied since startJournal, so that a second
+	// list that was equal at that point can be brought up to date instead of
+	// being rebuilt (see index_twin.go). journaling is false when no journal
+	// is wanted or the journal outgrew skipListJournalMax and was abandoned.
+	journal    []skipListOp
+	journaling bool
+	// mutations detects Insert/Remove activity when validating returned twins.
+	mutations uint64
+	// sharers counts the other indexes that reference this list read-only (see
+	// SecondaryIndex.borrow). It only ever errs high: an index that is dropped
+	// without copying the list never gives its share back.
+	sharers atomic.Int32
+}
+
+// skipListOp is one journalled mutation. key aliases a node's key, which is
+// never written after the node is created.
+type skipListOp struct {
+	key    []byte
+	rowID  int
+	remove bool
+}
+
+// skipListJournalMax bounds a journal. A writer that changes more entries than
+// this simply loses the twin, which then costs one ordinary copy.
+const skipListJournalMax = 4096
+
+func (s *SkipList) startJournal() {
+	s.journal = nil
+	s.journaling = true
+}
+
+func (s *SkipList) stopJournal() {
+	s.journal = nil
+	s.journaling = false
+}
+
+func (s *SkipList) record(key []byte, rowID int, remove bool) {
+	if len(s.journal) >= skipListJournalMax {
+		s.stopJournal()
+		return
+	}
+	s.journal = append(s.journal, skipListOp{key: key, rowID: rowID, remove: remove})
+}
+
+// replayJournalOnto applies every mutation journalled on s to dst, which must
+// have been equal to s when the journal was started. It reports false, leaving
+// dst untouched, when s has no complete journal.
+func (s *SkipList) replayJournalOnto(dst *SkipList) bool {
+	if !s.journaling || dst == s {
+		return false
+	}
+	for _, op := range s.journal {
+		if op.remove {
+			dst.Remove(op.key, op.rowID)
+		} else {
+			dst.Insert(op.key, op.rowID)
+		}
+	}
+	return true
 }
 
 // NewSkipList returns an empty skip list ready for use.
@@ -148,6 +200,10 @@ func (s *SkipList) Insert(key []byte, rowID int) {
 	next := x.forward[0]
 	if next != nil && bytes.Equal(next.key, key) {
 		next.rowIDs = insertRowIDSorted(next.rowIDs, rowID)
+		s.mutations++
+		if s.journaling {
+			s.record(next.key, rowID, false)
+		}
 		return
 	}
 
@@ -169,6 +225,10 @@ func (s *SkipList) Insert(key []byte, rowID int) {
 		update[i].forward[i] = node
 	}
 	s.length++
+	s.mutations++
+	if s.journaling {
+		s.record(node.key, rowID, false)
+	}
 }
 
 // Remove removes rowID from key's RowIDs. If RowIDs becomes empty the whole
@@ -193,6 +253,10 @@ func (s *SkipList) Remove(key []byte, rowID int) (removed bool) {
 	rowIDs, ok := removeRowIDSorted(target.rowIDs, rowID)
 	if !ok {
 		return false
+	}
+	s.mutations++
+	if s.journaling {
+		s.record(target.key, rowID, true)
 	}
 	if len(rowIDs) > 0 {
 		target.rowIDs = rowIDs

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // IndexEntry is one canonical composite key and the table row positions that
@@ -44,6 +45,12 @@ type SecondaryIndex struct {
 	// replaces it with a private copy (hydrateForWrite), so a copy of a table
 	// costs nothing until one of the two sides actually changes the index.
 	shared bool
+	// twin is a second skip list kept one journal replay away from fast, and
+	// origin names the list a transaction's copy of this index started from.
+	// See index_twin.go.
+	twin     *skipListTwin
+	origin   *indexOrigin
+	returned atomic.Pointer[returnedList]
 }
 
 // hydrate builds the mutable structure from persisted Entries.
@@ -78,8 +85,18 @@ func (idx *SecondaryIndex) hydrateForWrite() *SkipList {
 		}
 		idx.fast = fast
 	} else if idx.shared {
-		idx.fast = idx.fast.Clone()
+		base := idx.fast
+		// Every other index that referenced the list has since taken its own
+		// copy: it is private again and needs none.
+		if base.sharers.Load() > 0 {
+			idx.fast = base.Clone()
+			base.sharers.Add(-1)
+		}
 		idx.shared = false
+		if o := idx.origin; o != nil && o.base == base && o.own == nil && idx.fast != base {
+			idx.fast.startJournal()
+			o.own = idx.fast
+		}
 	}
 	return idx.fast
 }
@@ -141,13 +158,25 @@ func (idx *SecondaryIndex) borrow() *SecondaryIndex {
 		}
 		return out
 	}
+	if list := idx.takeTwin(); list != nil {
+		list.startJournal()
+		return &SecondaryIndex{
+			Name:    idx.Name,
+			Columns: append([]string(nil), idx.Columns...),
+			Unique:  idx.Unique,
+			fast:    list,
+			origin:  &indexOrigin{base: idx.fast, own: list, lender: idx, baseMutations: idx.fast.mutations},
+		}
+	}
 	idx.shared = true
+	idx.fast.sharers.Add(1)
 	return &SecondaryIndex{
 		Name:    idx.Name,
 		Columns: append([]string(nil), idx.Columns...),
 		Unique:  idx.Unique,
 		fast:    idx.fast,
 		shared:  true,
+		origin:  &indexOrigin{base: idx.fast},
 	}
 }
 

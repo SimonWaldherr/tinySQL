@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -117,6 +118,12 @@ type Table struct {
 	// per-table one.
 	derivedMu sync.Mutex
 	derived   any
+	// twin is a spare row-header array kept equal to Rows so the next
+	// transaction that writes this table need not copy Rows; twinOrigin is set
+	// on a transaction's private copy and names the table it replaces. See
+	// row_twin.go.
+	twin       atomic.Pointer[rowTwin]
+	twinOrigin *rowTwinOrigin
 }
 
 type rowUpdateDelta struct {

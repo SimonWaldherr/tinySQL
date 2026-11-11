@@ -138,10 +138,17 @@ func (db *DB) releaseSharedTables() {
 	db.streamSnapshotMu.Lock()
 	remaining := db.txShared
 	db.txShared = nil
+	private := db.txPrivate
+	db.txPrivate = nil
 	for t := range remaining {
 		db.unpinLocked(t)
 	}
 	db.streamSnapshotMu.Unlock()
+	// Copies the transaction made but did not commit hand their unused twins
+	// back; a committed copy has no origin left and is skipped.
+	for _, t := range private {
+		db.returnTwins(t)
+	}
 	for t, src := range remaining {
 		src.unpinTxTable(t)
 	}

@@ -7,6 +7,8 @@
 // once left a promoted clone without its write-ahead log.
 package storage
 
+import "unsafe"
+
 // DeepClone creates a full copy of the database (MVCC-light snapshot).
 // Note: This is not copy-on-write; it creates a full copy (simple but O(n)).
 //
@@ -146,8 +148,24 @@ func cloneTableForStreamDML(t *Table) *Table {
 // row copy, but with the indexes lent rather than duplicated (see
 // cloneTableCore), so the write does not pay for copying structures it may
 // never change.
+//
+// The row headers come from t's twin when it has one (see row_twin.go), which
+// makes the copy independent of the table's size.
 func cloneTableForSharedTx(t *Table) *Table {
-	return cloneTableCore(t, cloneRowsSharedFor(t, len(t.Rows)/16+16), true, true)
+	rows := t.takeRowTwin()
+	if rows == nil {
+		rows = cloneRowsSharedFor(t, len(t.Rows)/16+16)
+	}
+	nt := cloneTableCore(t, rows, true, true)
+	nt.twinOrigin = &rowTwinOrigin{
+		source:        t,
+		version:       t.Version,
+		structVersion: t.structVersion,
+		rowCount:      len(t.Rows),
+		sourceBacking: unsafe.SliceData(t.Rows),
+		backing:       unsafe.SliceData(rows),
+	}
+	return nt
 }
 
 func cloneTableWithRows(t *Table, rows [][]any, copySearchIndexes bool) *Table {

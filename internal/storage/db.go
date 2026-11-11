@@ -104,6 +104,10 @@ type DB struct {
 	// streamSnapshots) until the shadow takes a private copy of it or the
 	// transaction ends. Protected by streamSnapshotMu.
 	txShared map[*Table]*DB
+	// txPrivate lists the private copies this transaction shadow made of
+	// shared tables, so the ones it does not commit can return their twins
+	// (see returnTwins). Guarded by streamSnapshotMu.
+	txPrivate []*Table
 
 	// MVCC coordinator
 	mvcc *MVCCManager

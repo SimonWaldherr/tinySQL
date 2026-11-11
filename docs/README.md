@@ -95,6 +95,9 @@ current behavior and keep performance claims scoped to the workload they measure
 - [CTE alignment](cte-performance.md), [CTE and indexed SELECT](cte-select-performance.md),
   [ORDER BY and aggregates](order-aggregate-performance.md), and
   [windows, DISTINCT, and LIMIT](window-distinct-limit-performance.md).
+- [Transaction twins](transaction-twin-performance.md) — a transaction's first
+  write reuses the row array and index lists of the table the last commit
+  replaced instead of copying the table.
 - [Transaction snapshots](transaction-snapshot-performance.md) — `BEGIN` shares
   live tables and copies on first write instead of copying the database.
 - [INSERT and UPDATE](insert-update-performance.md),

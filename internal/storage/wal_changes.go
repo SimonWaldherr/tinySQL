@@ -102,7 +102,8 @@ func CollectWALChanges(prev, next *DB) []WALChange {
 // ApplyWALChanges applies a set of table-level changes to the database. It is
 // used by the SQL driver to commit a transaction by merging the transaction's
 // delta into the latest shared database instead of replacing the whole DB with
-// an older snapshot.
+// an older snapshot. The caller must hold LockContentForWrite across conflict
+// checking and application, including recycling the replaced table's buffers.
 func (db *DB) ApplyWALChanges(changes []WALChange) error {
 	for _, ch := range changes {
 		if ch.Drop {
@@ -121,7 +122,11 @@ func (db *DB) ApplyWALChanges(changes []WALChange) error {
 			continue
 		}
 		db.mu.Lock()
-		db.getTenant(ch.Tenant).tables[strings.ToLower(ch.Name)] = ch.Table
+		tables := db.getTenant(ch.Tenant).tables
+		key := strings.ToLower(ch.Name)
+		replaced := tables[key]
+		tables[key] = ch.Table
+		db.adoptTwins(replaced, ch.Table)
 		db.mu.Unlock()
 	}
 	return nil
