@@ -7,12 +7,13 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     name: Build for ${{ matrix.goos }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -47,19 +48,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ${{ github.workspace }}/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.mod', '**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+          cache-dependency-path: '**/go.sum'
 
       - name: Build CLI and shared lib
         env:
@@ -72,7 +64,7 @@ jobs:
           EXT=${{ matrix.ext }}
           ART=artifacts
           PKGDIR=$ART/pkg
-          mkdir -p $PKGDIR
+          mkdir -p "$PKGDIR"
 
           # Build CLI binary (cmd/tinysql)
           echo "Building CLI: tinysql for $GOOS-$GOARCH"
@@ -87,41 +79,36 @@ jobs:
           # c-shared requires a native C toolchain; skip when target OS or
           # architecture differs from the runner. The CLI above remains fully
           # cross-compiled and is the supported artifact on every matrix row.
-          runner_arch=$(uname -m)
-          runner_goos=$(uname -s | tr '[:upper:]' '[:lower:]')
+          runner_goos=$(go env GOHOSTOS)
+          runner_arch=$(go env GOHOSTARCH)
           native_ok=false
-          if [ "$runner_goos" = "$GOOS" ] && [ "$runner_arch" = "x86_64" ] && [ "$GOARCH" = "amd64" ]; then native_ok=true; fi
-          if [ "$runner_goos" = "$GOOS" ] && [ "$runner_arch" = "aarch64" ] && [ "$GOARCH" = "arm64" ]; then native_ok=true; fi
+          if [ "$runner_goos" = "$GOOS" ] && [ "$runner_arch" = "$GOARCH" ]; then native_ok=true; fi
           if [ "$native_ok" = true ]; then
             echo "Building c-shared library"
             CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -buildmode=c-shared \
               -ldflags "-X github.com/SimonWaldherr/tinySQL/internal/engine.BuildVersion=${GITHUB_REF_NAME:-dev}" \
-              -o $PKGDIR/libtinysql.$EXT ./bindings/c || true
+              -o "$PKGDIR/libtinysql.$EXT" ./bindings/c
             CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -buildmode=c-archive \
               -ldflags "-X github.com/SimonWaldherr/tinySQL/internal/engine.BuildVersion=${GITHUB_REF_NAME:-dev}" \
-              -o $PKGDIR/libtinysql.a ./bindings/c || true
+              -o "$PKGDIR/libtinysql.a" ./bindings/c
             # Ship the documented ABI header instead of cgo's generated one.
-            rm -f $PKGDIR/libtinysql.h
-            cp bindings/c/include/tinysql.h $PKGDIR/tinysql.h
+            rm -f "$PKGDIR/libtinysql.h"
+            cp bindings/c/include/tinysql.h "$PKGDIR/tinysql.h"
           else
-            echo "Skipping c-shared build for $GOOS-$GOARCH on runner $runner_arch (no cross C toolchain)"
+            echo "Skipping C ABI build for $GOOS-$GOARCH on $runner_goos/$runner_arch (no cross C toolchain)"
           fi
-
-          # If the header was emitted next to the shared lib, ensure it's inside pkg
-          if [ -f libtinysql.h ]; then mv -f libtinysql.h $PKGDIR/ 2>/dev/null || true; fi
-          if [ -f libtinysql.h ] && [ -f $PKGDIR/libtinysql.$EXT ]; then mv -f libtinysql.h $PKGDIR/ 2>/dev/null || true; fi
 
           # Package artifacts into tar.gz
           TARFILE=$ART/tinysql-$GOOS-$GOARCH-${GITHUB_REF_NAME:-untagged}.tar.gz
-          pushd $PKGDIR >/dev/null
-          tar -czf ../$(basename $TARFILE) .
+          pushd "$PKGDIR" >/dev/null
+          COPYFILE_DISABLE=1 tar -czf "../$(basename "$TARFILE")" .
           popd >/dev/null
 
           # Compute SHA256 (portable)
           FILE=$TARFILE
           if command -v sha256sum >/dev/null 2>&1; then sha256sum "$FILE" > "$FILE.sha256"; else shasum -a 256 "$FILE" > "$FILE.sha256"; fi
 
-          ls -lah artifacts || true
+          ls -lah artifacts
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -139,6 +126,9 @@ jobs:
     name: Publish GitHub release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     # A workflow_dispatch run validates artifacts but never publishes one.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:

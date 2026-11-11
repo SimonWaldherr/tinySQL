@@ -1,5 +1,9 @@
 # Development Guide
 
+Go **1.27.3** remains the minimum supported version. The `toolchain` directive
+in `go.mod` selects **Go 1.27.4**, the security patch used by CI and release
+builds; their Go setup reads that directive.
+
 ## Tests
 
 ```bash
@@ -8,8 +12,8 @@ mkdir -p bin
 go test -coverprofile=bin/coverage.out ./...
 ```
 
-Go 1.26's `testing/synctest` provides virtual time for concurrency tests; keep
-new timing-sensitive tests deterministic instead of adding real sleeps.
+Use `testing/synctest` for virtual time in concurrency tests; keep new
+timing-sensitive tests deterministic instead of adding real sleeps.
 
 For SQL behavior changes, follow the [SQL compatibility contract](api-stability.md#sql-behavior)
 and update [the executable contracts](../internal/engine/testdata/sql_semantics.json).
@@ -40,18 +44,25 @@ matrix on GitHub. To run it with a local Docker daemon:
 act workflow_dispatch -W .github/workflows/local-act.yml
 ```
 
+Separate Actions jobs check Chromium, TinyGo, C/Python/Rust bindings, and
+amd64/arm64 vector correctness. Vector benchmarks run only when the CI workflow
+is dispatched manually; use focused local benchmarks when comparing a change.
+
 | Target | Purpose |
 |---|---|
 | `make reference` | Regenerate HTML and browser JSON from `docs/reference/functions.sql`; freshness tests enforce both outputs. |
+| `make docs-check` | Check local documentation links and generated function-reference freshness without rewriting files. |
+| `make test-pages-tooling` | Check incremental builds, staging, dataset preservation and Git worktree safeguards in temporary directories. |
 | `make clean` | Remove build output and legacy root artifacts; preserve databases, WALs and Git worktrees. |
 | `make build` | Build `cmd/tinysql` into `bin/tinysql`. |
 | `make build-all` | Build the CLI plus the common command demos into `bin/`. |
 | `make build-query-files-wasm` | Build the browser playground WASM artifacts. |
 | `make build-wasm-browser` / `make build-wasm-node` | Build the browser or Node WASM API bundles. |
-| `make build-gh-pages-demo` | Incrementally build and validate the static files for the GitHub Pages demo. |
-| `make update-gh-pages` | Reuse a clean `gh-pages` worktree, sync only changed assets, and commit only if the generated demo changed. |
-| `make push-gh-pages` | Run `update-gh-pages` and push `gh-pages` (only that branch). |
-| `make test` / `make test-all` | Root tests plus the standalone query-file demo modules. |
+| `make build-gh-pages-demo` | Incrementally build and validate the static files for a local GitHub Pages preview. |
+| `make check-gh-pages-demo` | Validate the existing playground build and its asset manifest. |
+| `make update-gh-pages` | Reuse a clean `gh-pages` worktree, sync changed assets, and commit changes for branch-based publication. |
+| `make push-gh-pages` | Run `update-gh-pages` and push `gh-pages` for branch-based publication. |
+| `make test` / `make test-all` | Root tests with race detection and coverage, plus the query-file, browser-playground, and server modules. |
 | `make test-unit` | Short unit tests. |
 | `make test-jsonv2` | Storage/engine persistence tests against Go's experimental JSON v2 — a compatibility gate, not a production default. |
 | `make test-semantics` | Shared SQL contracts under UTC, Europe/Berlin and Pacific/Kiritimati; included in `make ci`. |
@@ -60,7 +71,7 @@ act workflow_dispatch -W .github/workflows/local-act.yml
 | `make test-query-files-browser` | Real Chromium import, snapshot recovery and workspace-switching tests; requires the browser test dependencies described in the module README. |
 | `make wasm-check` | Compile the standard-Go browser, Node, and query-files WebAssembly targets without retaining artifacts. |
 | `make tinygo-wasm` | Build and execute the Node WASM smoke test using the pinned TinyGo Docker image. |
-| `make ci` | The complete standard-Go GitHub Actions matrix: formatting, module verification, native/WASM builds, vet, tests, race detection, and coverage. |
+| `make ci` | Standard-Go validation: formatting, documentation, module verification, native/WASM builds, vet, tests, race detection, and coverage. |
 | `make build-c` | Build the C ABI (`libtinysql.a`, shared library, `tinysql.h`) into `bindings/c/build`. |
 | `make test-c` / `make test-python` / `make test-rust` | Test the C ABI (race detector plus a C program), the Python package, or the Rust crate. |
 | `make test-bindings` | All three binding suites. |
@@ -76,15 +87,15 @@ act workflow_dispatch -W .github/workflows/local-act.yml
 | `make vet` | `go vet ./...`. |
 | `make lint` | `golangci-lint`; must be installed locally. |
 | `make verify` | Mutating local check: fmt, vet, lint, tests. Runs `make fmt`, so it may rewrite tracked Go files. |
-| `make verify-ci` | Quick non-mutating CI-style check: fmt-check, vet, build-check, tests. |
-| `make clean` | Remove binaries, WASM artifacts, coverage files, WAL leftovers. |
+| `make verify-ci` | Non-mutating local gate: formatting, vet, host builds, and `test-all` including root race detection and coverage. |
 | `make run-repl` / `make run-server` / `make run-demo` | Build and start the corresponding demo. |
 | `make info` | Print build version, Go version, configured paths. |
 
-`verify-ci` builds all host Go packages plus the `query_files` CLI. Run
-`make build-wasm-browser` or `make build-wasm-node` separately when changing
-those targets. Push `main` separately after committing source
-changes.
+`verify-ci` builds all host Go packages plus the `query_files` CLI. `make ci`
+adds the build-tag, SQL compatibility, experimental JSON v2, and nested-module
+test matrix, and compiles all three standard-Go WASM targets. Run
+`make wasm-smoke` to execute the shared SQL contracts under Node, and
+`make test-query-files-browser` when changing browser behavior.
 
 ## Benchmarking
 
@@ -141,6 +152,30 @@ make test GO_TEST_FLAGS="-run TestGeo -count=1"
 make update-gh-pages GH_PAGES_COMMIT_MESSAGE="Update playground"
 make update-gh-pages GH_PAGES_WORKTREE=/tmp/tinysql-gh-pages
 ```
+
+## GitHub Pages
+
+The [Pages workflow](../.github/workflows/pages.yml) builds and validates the
+playground and SQL function reference on pushes to `main` and pull requests.
+It publishes an artifact through GitHub's Pages actions on `main`, on manual
+runs from the default branch, and after a successful Bavaria data refresh.
+Pull requests run the build checks without deploying.
+
+Enable this workflow once under **Settings → Pages → Source → GitHub Actions**;
+see [GitHub's publishing-source instructions](https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site).
+This repository setting is separate from the workflow files.
+
+The monthly [Bavaria workflow](../.github/workflows/bavaria-mbtiles.yml) keeps its
+generated map snapshot on `gh-pages`. The Pages build includes that snapshot
+when available, preserving same-origin map access. Its successful completion
+starts a new Pages run explicitly: a branch push using `GITHUB_TOKEN` alone
+does not trigger a Pages build.
+
+Use `make build-gh-pages-demo` for a local build and `make check-gh-pages-demo`
+to validate existing output. The compatible `make update-gh-pages` and
+`make push-gh-pages` targets remain available for repositories configured to
+publish from a branch. With the Actions source, commit source changes to `main`
+to publish the current application.
 
 ## Releases
 

@@ -23,30 +23,26 @@ on:
 permissions:
   contents: write # to publish the release asset
 
+concurrency:
+  group: bavaria-demo-data
+  cancel-in-progress: false
+
 env:
   RELEASE_TAG: bavaria-demo-latest
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ${{ github.workspace }}/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.mod', '**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+          cache-dependency-path: go.sum
 
       # osmium-tool: apt (Ubuntu's universe repo carries a recent enough
       # build). tippecanoe: no Ubuntu package, so build the small, fast-to-
@@ -93,9 +89,9 @@ jobs:
         run: |
           set -euo pipefail
           pages_dir="$(mktemp -d)"
-          trap 'rm -rf "$pages_dir"' EXIT
-          git fetch origin gh-pages:gh-pages
-          git worktree add "$pages_dir" gh-pages
+          trap 'git worktree remove --force "$pages_dir"' EXIT
+          git fetch --no-tags origin refs/heads/gh-pages
+          git worktree add --detach "$pages_dir" FETCH_HEAD
           cp build/bavaria/artifacts/snapshot.b64 "$pages_dir/bavaria-snapshot.b64"
           git -C "$pages_dir" add bavaria-snapshot.b64
           if git -C "$pages_dir" diff --cached --quiet; then
@@ -105,4 +101,4 @@ jobs:
           git -C "$pages_dir" config user.name "github-actions[bot]"
           git -C "$pages_dir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C "$pages_dir" commit -m "Update Bavaria demo snapshot"
-          git -C "$pages_dir" push origin gh-pages
+          git -C "$pages_dir" push origin HEAD:refs/heads/gh-pages

@@ -43,9 +43,13 @@ from `cmd/query_files_wasm` and runs tinySQL as WebAssembly with no backend:
 
 ```bash
 make build-gh-pages-demo
-make update-gh-pages
-make push-gh-pages
 ```
+
+This builds and validates a local preview. `make check-gh-pages-demo` checks
+existing output. The [Pages workflow](../.github/workflows/pages.yml) publishes
+the playground and SQL function reference from `main`; pull requests run build
+checks. See the [publication setup and compatible branch targets](./development-guide.md#github-pages)
+in the development guide.
 
 To embed tinySQL as WASM in your own frontend instead of using the demo, see
 the [Developer Integration Guide](./developer-integration.md).

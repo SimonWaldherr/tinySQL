@@ -61,7 +61,7 @@ see [language bindings](docs/language-bindings.md).
 
 | Area | Capabilities and guides |
 | --- | --- |
-| SQL | Joins, recursive CTEs, UNION, windows, views, triggers, and procedures. [Function reference](docs/reference/functions.html), [SQL examples](demos/sql/showcase.sql). |
+| SQL | Joins, recursive CTEs, UNION, windows, views, triggers, and procedures. [Function reference](https://simonwaldherr.github.io/tinySQL/docs/reference/functions.html) ([SQL source](docs/reference/functions.sql)), [SQL examples](demos/sql/showcase.sql). |
 | Retrieval | Exact flat or approximate IVF/HNSW vector search, BM25, hybrid ranking, and retrieval pre-filters. [RAG guide](docs/rag-guide.md). |
 | Storage | In-memory, WAL, JSON, disk, indexed, and SQLite-backed modes; backups and read-only snapshots. [Storage guide](docs/storage-guide.md), [analytical snapshots](docs/analytical-snapshots.md). |
 | Maps and files | Document/tabular/geospatial imports, geometry, tiles, and routing. [Geospatial guide](docs/geospatial-standards.md), [routing](docs/osm-routing.md), [file queries](cmd/query_files/README.md). |
@@ -79,6 +79,7 @@ Workload-specific measurements cover [SQL execution](docs/standard-query-perform
 ```bash
 go test ./...
 go vet ./...
+make docs-check
 make test-bindings   # C ABI, Python and Rust
 ```
 

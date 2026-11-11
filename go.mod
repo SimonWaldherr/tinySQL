@@ -2,6 +2,8 @@ module github.com/SimonWaldherr/tinySQL
 
 go 1.27.3
 
+toolchain go1.27.4
+
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect

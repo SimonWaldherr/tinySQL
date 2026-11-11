@@ -31,6 +31,7 @@ WASM_BROWSER_SCRIPT := ./$(CMD_DIR)/wasm_browser/build.sh
 WASM_NODE_SCRIPT := ./$(CMD_DIR)/wasm_node/build.sh
 # TinyGo 0.42 adds support for the Go 1.27 toolchain used by this module.
 TINYGO_IMAGE ?= tinygo/tinygo:0.42.0
+TINYGO_STACK_SIZE ?= 1MB
 TINYGO_PATH := /usr/local/tinygo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 TINYGO_DOCKER_USER := $(shell id -u):$(shell id -g)
 QUERY_FILES_DIR := ./$(CMD_DIR)/query_files
@@ -39,7 +40,8 @@ QUERY_FILES_WASM_SCRIPT := $(QUERY_FILES_WASM_DIR)/build.sh
 GH_PAGES_BRANCH ?= gh-pages
 GH_PAGES_WORKTREE ?= .gh-pages-worktree
 GH_PAGES_COMMIT_MESSAGE ?= Update gh-pages demo
-GH_PAGES_DEMO_FILES := index.html app.js wasm-client.js wasm-worker.js workspace-storage.js query_files.wasm query_files.wasm.gz wasm_exec.js tiles-demo.html tiles-demo.js tiles-demo-data.js demo.mbtiles tiles-demo-bavaria.html tiles-demo-bavaria.js
+GH_PAGES_SCRIPT := ./scripts/gh-pages.sh
+GH_PAGES_REMOTE ?= origin
 GO_MOD_FILES := $(shell git ls-files -- 'go.mod' ':(glob)**/go.mod' | LC_ALL=C sort)
 
 # Color output
@@ -152,6 +154,7 @@ tinygo-wasm:
 		--user "$(TINYGO_DOCKER_USER)" \
 		--env HOME=/tmp \
 		--env XDG_CACHE_HOME=/tmp/.cache \
+		--env TINYGO_STACK_SIZE="$(TINYGO_STACK_SIZE)" \
 		--env PATH="$(TINYGO_PATH)" \
 		--volume "$(CURDIR):/src" \
 		--workdir /src/cmd/wasm_node \
@@ -183,80 +186,17 @@ build-gh-pages-demo:
 	@$(MAKE) --no-print-directory check-gh-pages-demo
 	@echo "$(GREEN)✓ gh-pages demo artifacts ready$(NC)"
 
-## check-gh-pages-demo: Validate the deployable static gh-pages assets
+## check-gh-pages-demo: Validate all static assets listed in pages-assets.txt
 check-gh-pages-demo:
-	@for file in $(GH_PAGES_DEMO_FILES); do \
-		if [ ! -s "$(QUERY_FILES_WASM_DIR)/$$file" ]; then \
-			echo "$(RED)missing or empty gh-pages asset: $$file$(NC)"; \
-			exit 1; \
-		fi; \
-	done
-	@if command -v gzip >/dev/null 2>&1; then gzip -t "$(QUERY_FILES_WASM_DIR)/query_files.wasm.gz"; fi
-	@if command -v node >/dev/null 2>&1; then \
-		node --check "$(QUERY_FILES_WASM_DIR)/app.js"; \
-		node --check "$(QUERY_FILES_WASM_DIR)/wasm-client.js"; \
-		node --check "$(QUERY_FILES_WASM_DIR)/wasm-worker.js"; \
-		node --check "$(QUERY_FILES_WASM_DIR)/workspace-storage.js"; \
-		node --check "$(QUERY_FILES_WASM_DIR)/tiles-demo.js"; \
-		node --check "$(QUERY_FILES_WASM_DIR)/tiles-demo-data.js"; \
-	else echo "$(YELLOW)node not installed; skipping JavaScript syntax check$(NC)"; fi
-	@if command -v tidy >/dev/null 2>&1; then \
-		validate_html() { \
-			output="$$(mktemp /tmp/tinysql-html.XXXXXX)" || return 1; \
-			tidy -q -e "$$1" >"$$output" 2>&1 || true; \
-			if grep -qi 'Error:' "$$output"; then cat "$$output"; rm -f "$$output"; return 1; fi; \
-			rm -f "$$output"; \
-		}; \
-		validate_html "$(QUERY_FILES_WASM_DIR)/index.html"; \
-		validate_html "$(QUERY_FILES_WASM_DIR)/tiles-demo.html"; \
-	elif command -v xmllint >/dev/null 2>&1; then \
-		echo "$(YELLOW)HTML Tidy not installed; using xmllint's legacy HTML parser for a basic parse check$(NC)"; \
-		xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/index.html" 2>/dev/null; \
-		xmllint --html --noout "$(QUERY_FILES_WASM_DIR)/tiles-demo.html" 2>/dev/null; \
-	else echo "$(YELLOW)HTML validator not installed; skipping HTML validation$(NC)"; fi
+	@GH_PAGES_SOURCE_DIR="$(abspath $(QUERY_FILES_WASM_DIR))" $(GH_PAGES_SCRIPT) check
 
 ## update-gh-pages: Build demo, safely sync changed assets into gh-pages, and commit them
 update-gh-pages: build-gh-pages-demo
-	@set -e; \
-	worktree="$(GH_PAGES_WORKTREE)"; \
-	branch="$(GH_PAGES_BRANCH)"; \
-	echo "$(GREEN)Synchronizing $$branch from $(QUERY_FILES_WASM_DIR)...$(NC)"; \
-	if [ -e "$$worktree" ]; then \
-		if ! git -C "$$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
-			echo "$(RED)$$worktree exists but is not a git worktree$(NC)"; exit 1; \
-		fi; \
-		if [ "$$(git -C "$$worktree" branch --show-current)" != "$$branch" ]; then \
-			echo "$(RED)$$worktree is not on branch $$branch$(NC)"; exit 1; \
-		fi; \
-		if [ -n "$$(git -C "$$worktree" status --porcelain)" ]; then \
-			echo "$(RED)$$worktree has uncommitted changes; refusing to overwrite them$(NC)"; exit 1; \
-		fi; \
-	else \
-		git worktree add "$$worktree" "$$branch"; \
-	fi; \
-	changed=0; \
-	for file in $(GH_PAGES_DEMO_FILES); do \
-		source="$(QUERY_FILES_WASM_DIR)/$$file"; destination="$$worktree/$$file"; \
-		if [ -f "$$source" ]; then \
-			if [ ! -f "$$destination" ] || ! cmp -s "$$source" "$$destination"; then cp "$$source" "$$destination"; changed=1; fi; \
-		elif [ -e "$$destination" ]; then \
-			rm -f "$$destination"; changed=1; \
-		fi; \
-	done; \
-	if [ ! -f "$$worktree/.nojekyll" ]; then touch "$$worktree/.nojekyll"; changed=1; fi; \
-	cd "$$worktree"; \
-	git add -A -- .nojekyll $(GH_PAGES_DEMO_FILES); \
-	if git diff --cached --quiet; then \
-		echo "$(YELLOW)$$branch already up to date$(NC)"; \
-	elif [ "$$changed" -eq 1 ]; then \
-		git commit -m "$(GH_PAGES_COMMIT_MESSAGE)"; \
-	else \
-		echo "$(YELLOW)No generated asset changes to commit$(NC)"; \
-	fi
+	@GH_PAGES_SOURCE_DIR="$(abspath $(QUERY_FILES_WASM_DIR))" GH_PAGES_REMOTE="$(GH_PAGES_REMOTE)" $(GH_PAGES_SCRIPT) update "$(GH_PAGES_WORKTREE)" "$(GH_PAGES_BRANCH)" "$(GH_PAGES_COMMIT_MESSAGE)"
 
 ## push-gh-pages: Update and push the gh-pages demo branch
 push-gh-pages: update-gh-pages
-	@git push origin "$(GH_PAGES_BRANCH)"
+	@git push "$(GH_PAGES_REMOTE)" "$(GH_PAGES_BRANCH)"
 
 ## run-wasm-browser: Build and serve browser WASM app on localhost
 run-wasm-browser:
@@ -282,6 +222,20 @@ test: test-all
 reference:
 	$(GO) run ./cmd/wasm_browser/tools/gen_reference.go
 	cp demos/sql/showcase.sql example_showcase.sql
+
+.PHONY: docs-check
+## docs-check: Check local documentation links and generated SQL references
+docs-check:
+	python3 scripts/test-doc-links.py
+	python3 scripts/check-doc-links.py
+	$(GO) test ./cmd/wasm_browser/internal/referencegen -count=1
+
+.PHONY: test-pages-tooling
+## test-pages-tooling: Check Pages synchronization and incremental WASM builds
+test-pages-tooling:
+	bash scripts/test-gh-pages.sh
+	bash scripts/test-query-files-build.sh
+	python3 scripts/test-stage-pages-reference.py
 
 ## test-all: Run all tests with coverage
 test-all:
@@ -318,7 +272,8 @@ test-semantics:
 ## test-ci: Run the complete non-TinyGo test matrix used by continuous integration
 test-ci:
 	@echo "$(GREEN)Running CI test matrix...$(NC)"
-	$(GO) test ./... -count=1
+	@mkdir -p "$(dir $(COVERPROFILE))"
+	$(GO) test -count=1 -coverprofile=$(COVERPROFILE) ./...
 	$(GO) test -tags=tinysql_minimal ./... -count=1
 	$(MAKE) --no-print-directory test-sql-compat GO_TEST_FLAGS=-count=1
 	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS=-count=1
@@ -330,8 +285,6 @@ test-ci:
 	$(MAKE) --no-print-directory test-query-files GO_TEST_FLAGS='-race -count=1'
 	$(MAKE) --no-print-directory test-query-files-wasm GO_TEST_FLAGS='-race -count=1'
 	$(MAKE) --no-print-directory test-server GO_TEST_FLAGS='-race -count=1'
-	@mkdir -p "$(dir $(COVERPROFILE))"
-	$(GO) test -coverprofile=$(COVERPROFILE) ./...
 	$(GO) tool cover -func=$(COVERPROFILE)
 
 ## test-sql-compat: Test GORM, sqlx and Squirrel against tinySQL
@@ -532,7 +485,7 @@ verify-ci: fmt-check vet build-check test-all
 	@echo "$(GREEN)✓ CI verification passed$(NC)"
 
 ## ci: Run the complete standard-Go CI matrix
-ci: fmt-check modules-tidy-check modules-verify build-check wasm-check vet test-semantics test-ci bench-stream-guard
+ci: fmt-check docs-check modules-tidy-check modules-verify build-check wasm-check vet test-semantics test-ci bench-stream-guard
 	@echo "$(GREEN)✓ Standard-Go CI verification passed$(NC)"
 
 ## clean: Remove build artifacts
@@ -543,7 +496,7 @@ clean:
 	rm -f -- "$(COVERPROFILE)"
 	rm -f cmd/wasm_browser/web/tinySQL.wasm cmd/wasm_browser/web/wasm_exec.js
 	rm -f cmd/wasm_node/tinySQL.wasm cmd/wasm_node/wasm_exec.js
-	rm -f cmd/query_files_wasm/query_files.wasm cmd/query_files_wasm/query_files.wasm.gz cmd/query_files_wasm/wasm_exec.js
+	$(QUERY_FILES_WASM_SCRIPT) --clean
 	@echo "$(GREEN)✓ Clean complete$(NC)"
 
 ## run-repl: Run the REPL

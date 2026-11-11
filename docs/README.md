@@ -13,11 +13,13 @@ current behavior and keep performance claims scoped to the workload they measure
   a DSN, back up data, and serve read-only artifacts.
 - [CLI guide](cli-guide.md) — find the command-line tools and browser playground.
 - [Go API stability](api-stability.md) — public-surface and streaming guarantees.
+- [SQL function reference](reference/functions.html) — built-ins and runnable
+  examples, generated from the canonical SQL source.
 
 ## Build and change tinySQL
 
-- [Development guide](development-guide.md) — tests, Make targets, hooks, and
-  releases.
+- [Development guide](development-guide.md) — tests, Make targets, documentation
+  checks, hooks, and releases.
 - [Repository structure](repository-structure.md) — where packages and commands
   live.
 - [Architecture](architecture.md) and [architecture diagrams](architecture-diagrams.md)

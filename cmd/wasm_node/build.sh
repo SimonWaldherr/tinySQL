@@ -28,6 +28,8 @@ Usage (WASM_PROFILE=minimal by default; set full for optional features):
                                        Build and run custom query
   ./build.sh --skip-build --run        Run demo without rebuilding
   WASM_COMPILER=tinygo ./build.sh      Build with TinyGo for a smaller artifact
+  WASM_COMPILER=tinygo TINYGO_STACK_SIZE=2MB ./build.sh
+                                       Override the 1MB TinyGo stack default
 EOF
 }
 
@@ -142,7 +144,8 @@ build_wasm() {
                 exit 1
             fi
             cp "$(tinygo env TINYGOROOT)/targets/wasm_exec.js" wasm_exec.js
-            tinygo build -tags="$WASM_TAGS" -target=wasm -no-debug -o "$WASM_OUT" .
+            # Recursive SQL execution exceeds TinyGo's 64 KiB default stack.
+            tinygo build -tags="$WASM_TAGS" -target=wasm -stack-size="${TINYGO_STACK_SIZE:-1MB}" -no-debug -o "$WASM_OUT" .
             ;;
         *)
             echo "unsupported WASM_COMPILER=$WASM_COMPILER (expected go or tinygo)" >&2

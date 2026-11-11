@@ -1,0 +1,84 @@
+name: GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  # GITHUB_TOKEN pushes to gh-pages do not trigger a Pages build.
+  workflow_run:
+    workflows: ["Bavaria MBTiles Demo (Dingolfing-Landau)"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'production' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cmd/query_files_wasm/go.sum
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Check documentation and build the site
+        run: |
+          make docs-check test-pages-tooling build-gh-pages-demo
+          scripts/gh-pages.sh stage "$RUNNER_TEMP/pages"
+      - name: Preserve the same-origin Bavaria snapshot
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin refs/heads/gh-pages > "$RUNNER_TEMP/pages-ref"; then
+            git fetch --no-tags --depth=1 origin refs/heads/gh-pages
+            if git cat-file -e FETCH_HEAD:bavaria-snapshot.b64; then
+              git show FETCH_HEAD:bavaria-snapshot.b64 > "$RUNNER_TEMP/pages/bavaria-snapshot.b64"
+              test -s "$RUNNER_TEMP/pages/bavaria-snapshot.b64"
+            else
+              echo "No Bavaria snapshot yet; the monthly workflow can add it."
+            fi
+          else
+            status=$?
+            # ls-remote returns 2 for an absent branch; connection failures
+            # must fail the build rather than deploy a site without its data.
+            if [ "$status" -ne 2 ]; then exit "$status"; fi
+            echo "No gh-pages data branch yet."
+          fi
+      - name: Stage and validate the SQL reference
+        run: python3 scripts/stage-pages-reference.py "$RUNNER_TEMP/pages"
+      - name: Upload the checked site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/pages
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

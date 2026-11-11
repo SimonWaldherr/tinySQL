@@ -34,6 +34,11 @@ The script copies the TinyGo-matched `wasm_exec.js`; do not mix it with the
 standard Go runtime shim. Benchmark application queries before switching a
 production deployment, since artifact size and query throughput can trade off.
 
+The Node bundle uses a `1MB` TinyGo stack so recursive SQL queries fit beyond
+the target's 64 KiB default. Set `TINYGO_STACK_SIZE=2MB` when a workload needs
+more; TinyGo requires a size unit. The same variable configures
+`make tinygo-wasm`.
+
 The repository's reproducible Docker smoke test uses the pinned TinyGo image:
 
 ```bash

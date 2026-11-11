@@ -26,16 +26,18 @@ The build produces the WASM module, its optional gzip companion, the Go runtime
 loader, worker RPC files, and IndexedDB workspace support. Browsers fall back
 to the uncompressed module when streaming decompression is unavailable.
 
-To update GitHub Pages from the repository root:
+To build and validate the GitHub Pages preview from the repository root:
 
 ```bash
 make build-gh-pages-demo
-make update-gh-pages
-make push-gh-pages
 ```
 
-The update target reuses a clean gh-pages worktree and refuses to overwrite a
-dirty one.
+`make check-gh-pages-demo` validates existing output and its asset manifest.
+The [Pages workflow](../../.github/workflows/pages.yml) publishes from `main`
+and validates pull requests. Its package also includes the SQL function
+reference and, when available, the Bavaria snapshot from `gh-pages`.
+See the [development guide](../../docs/development-guide.md#github-pages) for
+the one-time Pages setup and the compatible branch-publication targets.
 
 ## What the playground does
 
