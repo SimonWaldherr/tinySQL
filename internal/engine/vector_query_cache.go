@@ -181,13 +181,19 @@ func vecAnalyticsEnabled() bool {
 
 func vecQueryKey(tenant string, table *storage.Table, colName string, a vecSearchArgs) vecQueryCacheKey {
 	h := sha256.New()
-	var bits [8]byte
-	for _, v := range a.queryVec {
-		binary.LittleEndian.PutUint64(bits[:], mathFloat64bits(v))
-		_, _ = h.Write(bits[:])
+	// Keep the byte stream identical, but feed complete batches rather than
+	// calling the hash writer separately for every vector component.
+	var bits [32 * 8]byte
+	for remaining := a.queryVec; len(remaining) != 0; {
+		n := min(len(remaining), len(bits)/8)
+		for i, v := range remaining[:n] {
+			binary.LittleEndian.PutUint64(bits[i*8:], mathFloat64bits(v))
+		}
+		_, _ = h.Write(bits[:n*8])
+		remaining = remaining[n:]
 	}
 	var query [32]byte
-	copy(query[:], h.Sum(nil))
+	h.Sum(query[:0])
 	return vecQueryCacheKey{tenant: tenant, table: table.Name, source: table, column: colName, version: table.Version, metric: a.metric, index: a.indexMode, k: a.k, query: query}
 }
 

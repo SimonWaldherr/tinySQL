@@ -78,3 +78,76 @@ increased dense-query allocation to about 3.67 MB/op.
 Reproduce with `-bench '^BenchmarkSelect(Sparse|Dense)LargeLimit$'`. Differential
 coverage includes early/late dense matches, sparse/empty matches, limits around
 the 64-row boundary, LIMIT 0 and OFFSET against derived-table execution.
+
+## Aggregate consumers and bounded recursive alignment (2026-11-11)
+
+Single-source CTE consumers can now aggregate immutable materialized rows
+without first allocating a qualified map for every input row. The consumer
+binds source names once, then uses the existing row WHERE and aggregate
+evaluators for COUNT/SUM/AVG/MIN/MAX with direct or literal arguments and
+direct GROUP BY columns. Filtering still completes before aggregation; sorting
+and pagination retain their original output names and order.
+
+Binding copies changed AST nodes and retains parameter pointers. Eligibility
+is checked with the original names before resolving qualifiers, preserving
+empty-result metadata and evaluation order for previously general aggregates.
+A required-key pass precedes value evaluation so sparse maps retain qualified
+diagnostics without replaying host Stringer or JSON callbacks after an error.
+Direct borrowing is limited to callback-free storage values: built-in scalars,
+BLOBs, vectors, times and decimals. Custom or nested composite source values
+and callback-capable literals/parameters retain the general executor, whose
+qualified row maps snapshot values before host callbacks can change later rows.
+Computed arguments, HAVING, DISTINCT, windows, joins, dotted source columns
+and other unsupported forms retain their existing paths. Producer results
+remain materialized once; consumer limits and filters do not enter producers.
+
+Bounded recursive UNION ALL now limits row alignment to the remaining compound
+LIMIT/OFFSET work budget. The recursive SELECT and its column-count validation
+still complete first, including errors in rows later discarded. This removes
+unneeded alignment maps; recursive SELECT results themselves remain materialized.
+UNION DISTINCT and unbounded recursion retain their existing behavior.
+
+Allocation checks use the working tree immediately before these CTE changes as
+the baseline, with source overlays for `exec_select.go` and `exec_cte.go`.
+Earlier uncommitted WHERE/text/ordering changes are held constant. Both
+executables contain identical fixtures. Go 1.27.3, darwin/arm64, Apple M2 Max,
+GOMAXPROCS=2; three runs of three operations, with parsing and fixture setup
+outside the measured region. Consumer fixtures use 20,000 pre-materialized
+rows; the complete query includes producing its CTE.
+
+| Fixture | Allocated bytes/op before → after | Allocations/op before → after |
+| --- | ---: | ---: |
+| COUNT(*) consumer | ~6.89 MB → ~1.2 KB | ~40,024 → 19 |
+| SUM/AVG/MIN/MAX consumer | ~13.45 MB → ~2.7 KB | ~80,037 → ~45 |
+| Filtered grouped consumer | ~13.55 MB → ~107 KB | 80,179 → 184 |
+| Complete producer + grouped consumer | ~20.45 MB → ~7.01 MB | ~120,228 → ~40,232 |
+| Recursive fan-out, LIMIT 8 OFFSET 2 | ~28.14 MB → ~21.26 MB | 160,092 → 120,110 |
+| Unbounded fan-out, control | ~42.15 MB → ~42.15 MB | 240,092 → 240,092 |
+
+These measure allocation volume, not peak live memory. COUNT still scans its
+materialized input. Grouping, input values and aggregate results may allocate.
+The recursive reduction saves 39,982 allocations from discarded row maps in
+this fixture, without avoiding the producer's work.
+
+Exploratory alternating timing runs showed lower times for the optimized
+paths, but the unchanged expression-aggregate control ranged from about
+3.8 to 6.1 ms across combined and isolated rounds. These records therefore make
+no latency-speedup claim. Unsupported expression arguments are rejected before
+allocating a CTE binding or formatting projection names.
+
+Differential checks compare complete Row maps, column metadata and errors
+against the qualified-source pipeline. Coverage includes empty/NULL/mixed
+inputs, exact decimals, aliases, hidden/unknown names, fresh parameters,
+callback order, sparse maps, pagination, cancellation, concurrent statement
+reuse, source ownership, sibling reuse and recursive errors past the work
+limit. Root-suite validation, targeted race checks, SQL-library compatibility,
+go vet and full/minimal browser/Node WASM checks completed. The final root run
+hit temporary ENOSPC errors in five persistence tests; all five passed on retry
+after temporary benchmark binaries were removed. Other root tests passed.
+
+```sh
+go test ./internal/engine -run 'Test.*(CTEAggregate|CTEBounded)' -count=1
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^Benchmark(CTEAggregateConsumer|CTEAggregateQuery|RecursiveCTEBoundedFanout)$' \
+  -benchmem -benchtime=3x -count=3
+```

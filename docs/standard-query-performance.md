@@ -117,3 +117,167 @@ make test-sql-compat
 bash scripts/check-wasm.sh
 go vet ./...
 ```
+
+## Computed ordering and trim-length consumers (2026-11-11)
+
+Computed raw ORDER BY terms now bind eligible arithmetic, conditional, NULL and
+text expressions once per execution. Keys still evaluate only after a source
+row passes its filter, in the original term order. Unsupported expressions
+retain their interpreter individually, including the execution's statement
+clock. Direct-column keys and specialized float/vector/full-text scorers retain
+their previous paths. Sorting algorithms, key ownership, scan-order ties and
+pagination are unchanged.
+
+LENGTH/LEN/CHAR_LENGTH over TRIM/LTRIM/RTRIM also consume trimmed text without
+boxing an intermediate string. The shared trim operands retain input coercion
+before cutset evaluation, NULL short circuiting, fresh parameters and the
+distinction between omitted and explicit empty cutsets. BLOB input to TRIM is
+still coerced to text before counting characters; direct LENGTH(BLOB) retains
+its byte count. Ordinary TRIM reuses unchanged string boxes, including explicit
+empty cutsets.
+
+The following allocation checks compare against `e3099a5` using a source
+overlay for `builtin_string.go`, `raw_scalar.go` and
+`exec_fastpath_select.go`. Both executables contain identical fixtures. Go
+1.27.3, darwin/arm64, Apple M2 Max, GOMAXPROCS=2; medians of three runs with
+three operations per fixture, excluding parsing and input loading. Trim-length
+queries aggregate 50,000 rows; ordering fixtures scan 20,000 rows.
+
+| Workload | Bytes/op before → after | Allocs/op before → after |
+| --- | ---: | ---: |
+| SUM(LENGTH(TRIM(body,cut))), changed short text | 802,392 → 2,386 | 50,030 → 30 |
+| Same query, unchanged text | 2,386 → 2,386 | 30 → 30 |
+| Same query, explicit empty cutset | 802,386 → 2,386 | 50,030 → 30 |
+| Same query, 300-character result | 1,202,386 → 402,386 | 100,030 → 50,030 |
+| Arithmetic ORDER BY, LIMIT 20 | 330,152 → 330,328 | 40,092 → 40,097 |
+| CASE ORDER BY, LIMIT 20 | 9,864 → 10,088 | 54 → 61 |
+| Direct-column ORDER BY, control | 9,037 → 9,037 | 51 → 51 |
+
+Trimming that changes short strings saves about 800 KB and 50,000 temporary
+objects per query. Long length results still box their numeric values, and
+input coercions can still allocate. Computed ordering adds a few binding
+allocations per query; it does not remove arithmetic-result boxing.
+
+A longer alternating timing comparison was stopped after unrelated machine
+load exceeded 380 and unchanged controls varied severalfold. These records
+therefore make no timing-speedup claim. Allocation counts were confirmed with
+the short fixed-operation runs above and a zero-allocation per-row regression
+test. They do not establish a reduction in peak live memory.
+
+Differential tests cover NULLs, typed nils, BLOBs, Unicode/invalid UTF-8,
+coercion order, cutset parameters, full/Top-N/deep ordering, mixed keys, errors
+after filtering, clocks, concurrent schema reuse and source ownership. The full
+Go suite, targeted race checks, SQL-package compatibility, go vet and all four
+WASM profiles pass. Public WASM checks combine computed ordering with trimmed
+lengths and also verify their aggregate result.
+
+```sh
+go test ./internal/engine -run '^Test(BoundTrimLength|RawOrderValues)' -count=1
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^Benchmark(TrimLength|RawOrderValues)$' -benchmem -benchtime=3x -count=3
+```
+
+## WHERE text comparisons and IN-list setup (2026-11-11)
+
+Raw WHERE comparisons now consume TRIM/LTRIM/RTRIM text directly, including
+reversed operands and comparisons between two trims. This avoids boxing a
+temporary string for each changed value. Both operands still evaluate in
+written order before NULL excludes a row. Non-string counterparts retain the
+existing comparison rules, including decimal-left text conversion. Parameters
+remain fresh, and unsupported operands fall back to the existing evaluator.
+The filter stays in the expression tier so cheap AND/OR guards keep their
+previous order. NOT and IS NULL retain SQL UNKNOWN through their existing
+value evaluators.
+
+Literal IN-list setup now allocates only the typed sets actually required by
+its values. Membership checks, exact integer comparisons, integer/float
+matching, singleton comparisons and NULL/NOT IN behavior are unchanged.
+
+These measurements compare the working tree immediately before these WHERE
+changes with the resulting tree, using an overlay of `exec_raw_filter.go`.
+Earlier trim-length and ordering improvements above are held constant. Both
+executables contain identical benchmark fixtures. Go 1.27.3, darwin/arm64,
+Apple M2 Max, GOMAXPROCS=2. Queries count 50,000 rows; parsing and input loading
+are outside the measured region.
+
+Timing samples run in before/after/after/before order, three 200 ms samples
+per workload in each round. The table shows the medians of all six samples.
+The machine load had fallen from the earlier overloaded session; the plain
+comparison control differs by 0.6%. These are local measurements, not a
+guarantee for other queries or systems.
+
+| WHERE predicate | Time/op before → after | Bytes/op before → after | Allocs/op before → after |
+| --- | ---: | ---: | ---: |
+| TRIM(body,cut) = 'α🙂' | 1.959 → 1.089 ms | ~802,393 → ~2,282 | 50,029 → 27 |
+| 'α🙂' = TRIM(body,cut) | 1.952 → 1.063 ms | 802,395 → 2,281 | 50,029 → 27 |
+| TRIM(body,cut) = TRIM(other,cut) | 3.403 → 1.872 ms | ~1,602,550 → ~2,379 | ~100,033 → 29 |
+| TRIM(body,cut) = 'missing' | 1.950 → 1.017 ms | ~802,383 → 2,273 | 50,028 → 26 |
+| body = 'missing', control | 0.268 → 0.269 ms | 2,128 → 2,128 | 22 → 22 |
+
+The trim fixtures use changed short text. Unchanged string inputs already
+reuse their original boxes, and non-string input coercion can still allocate.
+The new string comparison callbacks have a zero-allocation regression check.
+
+Separate IN setup checks use three runs of 1,000 operations each. Text-only
+lists fall from 480 B / 6 allocations to 336 B / 3 allocations; integer and
+float lists from 560 B / 7 to 464 B / 5; NULL-only and empty lists from
+272 B / 5 to 80 B / 1. Mixed-domain and singleton controls are unchanged.
+These are per-filter construction costs, not per-row savings.
+
+Differential tests cover all comparison operators, Unicode and invalid UTF-8,
+typed nils, mixed types, exact integer boundaries, live parameters, coercion
+side effects, short rows and error order. Query checks cover materialized,
+streamed and columnar scans, SQL UNKNOWN, cheap guards, UPDATE, DELETE and
+index consistency. The root Go suite, targeted race checks, SQL-library
+compatibility, go vet and full/minimal browser/Node WASM checks pass.
+
+```sh
+go test ./internal/engine -run '^Test(RawTrimComparison|InFilterDomains)' -count=1
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkWhereTrimComparisons$' -benchmem -benchtime=200ms -count=3
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkInFilterSetup$' -benchmem -benchtime=1000x -count=3
+```
+
+## UNION alignment and INTERSECT membership (2026-11-11)
+
+Compound SELECT terms now normalize their positional source/target column
+keys once before alignment. UNION, UNION ALL, EXCEPT and INTERSECT retain the
+left-most names, missing-value NULLs, duplicate-target overwrite order and
+fresh output maps. The same-name no-op still borrows the existing term rows.
+
+INTERSECT consumes each private right-hand membership key on its first left
+match, eliminating the separate seen set. Its result buffer is bounded by
+the smaller of the left count and distinct right count. All left signatures
+still evaluate after membership is exhausted, preserving callback order and
+cancellation. Numeric/NULL set equality, first-left occurrence order, term
+evaluation and compound ORDER BY/LIMIT boundaries are unchanged.
+
+Allocation checks compare the working tree before this follow-up with the
+result, overlaying only `exec_setops.go`; earlier changes remain fixed. Go
+1.27.3, darwin/arm64, Apple M2 Max, GOMAXPROCS=2; medians of three runs of three
+operations. Parsing and source loading are excluded. Aliased compound queries
+read two 20,000-row terms with four columns; INTERSECT has 20,000 left rows.
+
+| Fixture | Bytes/op before → after | Allocs/op before → after |
+| --- | ---: | ---: |
+| Align 20,000 rows, four mixed-case aliases | 9,123,877 → 6,884,117 | 200,001 → 40,011 |
+| Same alignment, lowercase aliases | ~6,883,882 → ~6,884,005 | 40,001 → 40,003 |
+| Complete aliased UNION | 39,938,829 → 37,699,064 | 460,097 → 300,107 |
+| Complete aliased UNION ALL | 38,259,976 → 36,020,221 | 440,026 → 280,036 |
+| INTERSECT, 10 right rows | 1,038,141 → 621 | 90 → 15 |
+| INTERSECT, 1,000 right rows | 1,102,618 → 68,048 | 2,072 → 1,007 |
+
+Lowercase alignment pays two small key slices per term; mixed-case aliases
+avoid per-cell normalization allocations. These short runs measure allocation
+volume, not latency or peak live memory. Differential tests cover Unicode and
+invalid UTF-8 aliases, duplicate names, sparse rows, mixed values, ownership,
+concurrent alignment and cancellation after membership is exhausted. Native
+and WASM checks cover mixed UNION/UNION ALL chains and INTERSECT.
+
+```sh
+go test ./internal/engine -run 'Test.*(Union|SetOperation|Intersect)' -count=1
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^Benchmark(UnionAlignmentBoundKeys|UnionAliasedQuery|IntersectMembershipSubset)$' \
+  -benchmem -benchtime=3x -count=3
+```

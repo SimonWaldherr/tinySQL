@@ -13,6 +13,14 @@ func compileRawScalar(columns map[string]int, call *FuncCall) rawValueEvaluator 
 		if len(call.Args) != 1 {
 			return nil
 		}
+		if call.Name == "LENGTH" || call.Name == "LEN" || call.Name == "CHAR_LENGTH" {
+			if trim, ok := call.Args[0].(*FuncCall); ok {
+				switch trim.Name {
+				case "TRIM", "LTRIM", "RTRIM":
+					return compileRawTrimLength(columns, trim)
+				}
+			}
+		}
 		value := compileRawValue(columns, call.Args[0])
 		if value == nil {
 			return nil
@@ -90,7 +98,46 @@ func compileRawScalar(columns map[string]int, call *FuncCall) rawValueEvaluator 
 }
 
 func compileRawTrim(columns map[string]int, call *FuncCall) rawValueEvaluator {
-	if len(call.Args) < 1 || len(call.Args) > 2 {
+	trim := bindRawTrim(columns, call)
+	if trim == nil {
+		return nil
+	}
+	return func(raw []any) (any, error) {
+		original, text, err := trim.evaluate(raw)
+		if err != nil || original == nil {
+			return nil, err
+		}
+		if str, ok := original.(string); ok && len(str) == len(text) {
+			return original, nil
+		}
+		return text, nil
+	}
+}
+
+// A length consumer needs the trimmed text, without boxing an intermediate
+// string. Ordinary TRIM still returns the original box for unchanged strings.
+func compileRawTrimLength(columns map[string]int, call *FuncCall) rawValueEvaluator {
+	trim := bindRawTrim(columns, call)
+	if trim == nil {
+		return nil
+	}
+	return func(raw []any) (any, error) {
+		original, text, err := trim.evaluate(raw)
+		if err != nil || original == nil {
+			return nil, err
+		}
+		return stringCharCount(text), nil
+	}
+}
+
+type rawTrimOperands struct {
+	value, cut rawValueEvaluator
+	name       string
+	side       trimSide
+}
+
+func bindRawTrim(columns map[string]int, call *FuncCall) *rawTrimOperands {
+	if call.Over != nil || call.Filter != nil || len(call.Args) < 1 || len(call.Args) > 2 {
 		return nil
 	}
 	value := compileRawValue(columns, call.Args[0])
@@ -110,30 +157,33 @@ func compileRawTrim(columns map[string]int, call *FuncCall) rawValueEvaluator {
 	} else if call.Name == "RTRIM" {
 		side = trimRight
 	}
-	name := call.Name
-	return func(raw []any) (any, error) {
-		v, err := value(raw)
-		if err != nil || v == nil {
-			return nil, err
-		}
-		text := valueText(v)
-		cutset := ""
-		if cut != nil {
-			c, err := cut(raw)
-			if err != nil || c == nil {
-				return nil, err
-			}
-			var ok bool
-			cutset, ok = c.(string)
-			if !ok {
-				return nil, fmt.Errorf("%s cutset must be a string", name)
-			}
-			if cutset == "" {
-				return text, nil
-			}
-		}
-		return trimStringValue(v, text, cutset, side)
+	return &rawTrimOperands{value: value, cut: cut, name: call.Name, side: side}
+}
+
+// A nil original represents SQL NULL. Text conversion precedes cutset
+// evaluation, even when that cutset is NULL or raises an error.
+func (trim *rawTrimOperands) evaluate(raw []any) (original any, text string, err error) {
+	value, err := trim.value(raw)
+	if err != nil || value == nil {
+		return nil, "", err
 	}
+	text = valueText(value)
+	cutset := ""
+	if trim.cut != nil {
+		cut, err := trim.cut(raw)
+		if err != nil || cut == nil {
+			return nil, "", err
+		}
+		var ok bool
+		cutset, ok = cut.(string)
+		if !ok {
+			return nil, "", fmt.Errorf("%s cutset must be a string", trim.name)
+		}
+		if cutset == "" {
+			return value, text, nil
+		}
+	}
+	return value, trimText(text, cutset, trim.side), nil
 }
 
 func compileRawBetween(columns map[string]int, expr *BetweenExpr) rawValueEvaluator {

@@ -146,6 +146,16 @@ func alignSetOperationRowsWithContext(ctx context.Context, rows []Row, sourceCol
 	}
 
 	aligned := make([]Row, len(rows))
+	if len(rows) == 0 {
+		return aligned, nil
+	}
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
+	}
+	// Output names are fixed for the whole term. Normalize them once rather
+	// than allocating the same lower-case aliases for every copied cell.
+	sourceKeys := setOperationColumnKeys(sourceCols)
+	targetKeys := setOperationColumnKeys(targetCols)
 	for rowIdx, row := range rows {
 		if rowIdx&(setOperationContextBatchRows-1) == 0 {
 			if err := checkCtx(ctx); err != nil {
@@ -153,9 +163,8 @@ func alignSetOperationRowsWithContext(ctx context.Context, rows []Row, sourceCol
 			}
 		}
 		out := make(Row, len(targetCols))
-		for colIdx, sourceCol := range sourceCols {
-			value, _ := getVal(row, sourceCol)
-			putVal(out, targetCols[colIdx], value)
+		for colIdx, sourceKey := range sourceKeys {
+			out[targetKeys[colIdx]] = row[sourceKey]
 		}
 		aligned[rowIdx] = out
 	}
@@ -237,9 +246,9 @@ func intersectRowsWithContext(ctx context.Context, leftRows, rightRows []Row, co
 		rightSet[string(buf)] = struct{}{}
 	}
 
-	// Keep only left rows that are also in the right set
-	result := make([]Row, 0, len(leftRows))
-	seen := make(map[string]struct{}, len(leftRows))
+	// Consume each right-hand key on its first left match. This also removes
+	// duplicate left rows, without retaining a second membership set.
+	result := make([]Row, 0, min(len(leftRows), len(rightSet)))
 	for i, l := range leftRows {
 		if i&(setOperationContextBatchRows-1) == 0 {
 			if err := checkCtx(ctx); err != nil {
@@ -250,10 +259,7 @@ func intersectRowsWithContext(ctx context.Context, leftRows, rightRows []Row, co
 		if _, found := rightSet[string(buf)]; !found {
 			continue
 		}
-		if _, found := seen[string(buf)]; found {
-			continue
-		}
-		seen[string(buf)] = struct{}{}
+		delete(rightSet, string(buf))
 		result = append(result, l)
 	}
 	return result, nil

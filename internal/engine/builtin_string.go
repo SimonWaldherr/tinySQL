@@ -206,36 +206,37 @@ func evalTrimCommon(env ExecEnv, name string, side trimSide, args []Expr, row Ro
 }
 
 func trimStringValue(val any, str, cutset string, side trimSide) (any, error) {
-	var trimmed string
+	trimmed := trimText(str, cutset, side)
+	// Reuse an unchanged string's interface box on the ordinary scalar path.
+	if _, ok := val.(string); ok && len(trimmed) == len(str) {
+		return val, nil
+	}
+	return trimmed, nil
+}
+
+func trimText(str, cutset string, side trimSide) string {
 	if cutset == "" {
 		// Inspect only the requested edge. An ASCII check of the entire
 		// string would make trimming a short prefix/suffix scale with the
 		// untouched text. Decode Unicode only if the edge reaches it.
 		switch side {
 		case trimLeft:
-			trimmed = trimLeftSpace(str)
+			return trimLeftSpace(str)
 		case trimRight:
-			trimmed = trimRightSpace(str)
+			return trimRightSpace(str)
 		default:
-			trimmed = strings.TrimSpace(str)
+			return strings.TrimSpace(str)
 		}
 	} else {
 		switch side {
 		case trimLeft:
-			trimmed = strings.TrimLeft(str, cutset)
+			return strings.TrimLeft(str, cutset)
 		case trimRight:
-			trimmed = strings.TrimRight(str, cutset)
+			return strings.TrimRight(str, cutset)
 		default:
-			trimmed = strings.Trim(str, cutset)
+			return strings.Trim(str, cutset)
 		}
 	}
-	// Nothing trimmed from a string argument: hand back the argument's
-	// interface value instead of re-boxing the identical string — one heap
-	// allocation per row saved on the common no-op trim.
-	if _, ok := val.(string); ok && len(trimmed) == len(str) {
-		return val, nil
-	}
-	return trimmed, nil
 }
 
 // asciiIsSpace matches unicode.IsSpace for ASCII bytes.

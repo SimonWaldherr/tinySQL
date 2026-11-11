@@ -80,8 +80,13 @@ func executeSelect(env ExecEnv, s *Select) (result *ResultSet, err error) {
 		if rs, ok, err := executeSimpleSelectFastPath(cteEnv, s); ok || err != nil {
 			return rs, err
 		}
-	} else if rs, ok, err := executeSimpleCTESelectFastPath(cteEnv, s); ok || err != nil {
-		return rs, err
+	} else {
+		if rs, ok, err := executeCTEAggregateFastPath(cteEnv, s); ok || err != nil {
+			return rs, err
+		}
+		if rs, ok, err := executeSimpleCTESelectFastPath(cteEnv, s); ok || err != nil {
+			return rs, err
+		}
 	}
 
 	if s.Having != nil && len(s.GroupBy) == 0 && !anyAggInSelect(s.Projs) && !isAggregate(s.Having) {

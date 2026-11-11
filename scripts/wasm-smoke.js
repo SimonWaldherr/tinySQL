@@ -34,6 +34,29 @@ async function main() {
     COUNT(DISTINCT (id+1)%5) AS kinds, MIN(CAST(id AS FLOAT)+0.5) AS smallest,
     MAX((id+1)*2) AS largest FROM items`)).rows, [[40200, 201, 5, 0.5, 400]]);
   assert.deepEqual(success(db.query('SELECT id FROM items WHERE id = -1')).rows, []);
+  assert.deepEqual(success(db.query(`SELECT id,LENGTH(TRIM(label,'item_')) AS score
+    FROM items WHERE id<20 ORDER BY score DESC,id DESC LIMIT 5`)).rows,
+    [19, 18, 17, 16, 15].map(id => [id, 2]));
+  assert.deepEqual(success(db.query("SELECT SUM(LENGTH(TRIM(label,'item_'))) FROM items")).rows, [[490]]);
+  for (const predicate of ["TRIM(label,'item_')='1'", "'1'=TRIM(label,'item_')"]) {
+    assert.deepEqual(success(db.query(`SELECT id FROM items WHERE ${predicate}`)).rows, [[1]]);
+  }
+  assert.deepEqual(success(db.query("SELECT COUNT(*) FROM items WHERE TRIM(label,'item_')=TRIM(label,'item_')")).rows, [[200]]);
+  assert.deepEqual(success(db.query("SELECT id FROM items WHERE label IN ('item_1','item_2',NULL)")).rows, [[1], [2]]);
+  assert.deepEqual(success(db.query("SELECT id FROM items WHERE label NOT IN ('item_1','item_2',NULL)")).rows, []);
+  assert.deepEqual(success(db.query(`WITH c AS (SELECT id,active FROM items)
+    SELECT c.active AS active,COUNT(*) AS n,SUM(c.id) AS total FROM c
+    GROUP BY c.active ORDER BY active`)).rows, [[false, 100, 10000], [true, 100, 9900]]);
+  assert.deepEqual(success(db.query(`WITH RECURSIVE c(n) AS (
+    SELECT -1 UNION ALL SELECT i.id FROM (SELECT n FROM c WHERE n=-1) seed
+    JOIN items i ON 1=1 LIMIT 3 OFFSET 2) SELECT SUM(n),COUNT(*) FROM c`)).rows, [[6, 3]]);
+  const compound = success(db.query(`SELECT 1 AS MixedID,'α🙂' AS Label
+    UNION SELECT 1 AS OtherID,'α🙂' AS OtherLabel
+    UNION ALL SELECT 2 AS LastID,'β' AS LastLabel ORDER BY OtherID`));
+  assert.deepEqual(compound.columns, ['MixedID', 'Label']);
+  assert.deepEqual(compound.rows, [[1, 'α🙂'], [2, 'β']]);
+  assert.deepEqual(success(db.query(`SELECT 1 AS X UNION ALL SELECT 1 AS Y
+    UNION ALL SELECT 2 AS Z INTERSECT SELECT 1.0 AS R ORDER BY R`)).rows, [[1]]);
   success(db.exec('CREATE TABLE conditional_values (v INT, fallback INT)'));
   success(db.exec('INSERT INTO conditional_values VALUES (NULL,7),(0,9),(2,NULL),(NULL,NULL)'));
   assert.deepEqual(success(db.query(`SELECT CASE WHEN v IS NULL THEN COALESCE(fallback,9)
@@ -118,6 +141,14 @@ async function main() {
   success(db.exec("INSERT INTO ranked_vectors VALUES (3,'[1,0]'),(1,'[1,0]'),(2,'[0,1]'),(4,NULL)"));
   assert.deepEqual(success(db.query("SELECT id,VEC_EUCLIDEAN_DISTANCE(embedding,'[1,0]') AS distance FROM ranked_vectors WHERE id BETWEEN 1 AND 3 ORDER BY distance LIMIT 2")).rows, [[3, 0], [1, 0]]);
   assert.ok(db.query("SELECT VEC_L2_DISTANCE(embedding,'[1,0]',99) AS distance FROM ranked_vectors WHERE id=1 ORDER BY distance LIMIT 1").error);
+  assert.deepEqual(success(db.query("SELECT id FROM VEC_SEARCH('ranked_vectors','embedding','[1,0]',100000,'l2','ivf')")).rows,
+    [[3], [1], [2]]);
+  for (const index of ['flat', 'hnsw']) {
+    assert.deepEqual(success(db.query(`SELECT id,_vec_distance,_vec_rank FROM VEC_SEARCH_FILTERED(
+      'ranked_vectors','embedding','[1,0]',100000,
+      '{"metric":"l2","index":"${index}","pre_filter":{"id_column":"id","allowed_row_ids":[1,3]}}')`)).rows,
+      [[3, 0, 1], [1, 0, 2]]);
+  }
   // Mutating an index run must visit every original candidate exactly once.
   success(db.exec('CREATE TABLE indexed_edits (id INT PRIMARY KEY, category TEXT, code INT, amount INT)'));
   success(db.exec("INSERT INTO indexed_edits VALUES (3,'a',10,7),(1,'b',10,8),(2,'a',10,9)"));

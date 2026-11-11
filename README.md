@@ -4,17 +4,11 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/SimonWaldherr/tinySQL.svg)](https://pkg.go.dev/github.com/SimonWaldherr/tinySQL)
 [![DOI](https://zenodo.org/badge/1065449861.svg)](https://doi.org/10.5281/zenodo.17216339)
 
-tinySQL brings an embeddable SQL engine to Go: useful for local tools, tests,
-browser applications, and learning how databases work. Run it in-process, take
-it to WebAssembly, or explore its parser, executor, and storage backends.
+An embedded SQL engine for Go, with persistent storage, vector/full-text search,
+WebAssembly builds, and C, Python, Rust, and Swift bindings.
 
 [Browser playground](https://simonwaldherr.github.io/tinySQL/) ·
-[Map demo](https://simonwaldherr.github.io/tinySQL/tiles-demo.html) ·
-[Video](https://youtu.be/W28-aBk3BL0) ·
 [Documentation](docs/README.md)
-
-> tinySQL is not a drop-in replacement for PostgreSQL, MySQL, or a clustered
-> database. Review the [limitations](#limitations) for critical workloads.
 
 ## Get started
 
@@ -24,7 +18,7 @@ Requires Go **1.27.3+**:
 go get github.com/SimonWaldherr/tinySQL@latest
 ```
 
-Create an in-memory database, insert data, and query it with a bound parameter:
+Create an in-memory database and query it with a bound parameter:
 
 ```go
 package main
@@ -60,30 +54,25 @@ func main() {
 ```
 
 For `database/sql`, transactions, streaming, and the query builder, see
-[developer integration](docs/developer-integration.md). Rust, Python, Swift,
-and C are supported through the [language bindings](docs/language-bindings.md).
+[Go integration](docs/developer-integration.md); for C, Python, Rust, and Swift,
+see [language bindings](docs/language-bindings.md).
 
 ## Explore
 
-- **SQL and data:** joins, CTEs, windows, views, triggers, procedures, and
-  imports from common document, tabular, and geospatial formats. Browse the
-  [function reference](docs/reference/functions.html) and [SQL showcase](demos/sql/showcase.sql).
-- **Search and maps:** full-text, vector, and hybrid retrieval; geometry,
-  routing, and tiles. See the [RAG](docs/rag-guide.md),
-  [geospatial](docs/geospatial-standards.md), and [routing](docs/osm-routing.md) guides.
-- **Tools and services:** try the [CLI](docs/cli-guide.md),
-  [file query tools](cmd/query_files/README.md),
-  [server](cmd/server/README.md), or [browser build](cmd/query_files_wasm/README.md).
-  The [command index](cmd/README.md) lists the rest.
-- **Storage:** choose in-memory, WAL, JSON, disk, indexed, or SQLite-backed
-  storage. The [storage guide](docs/storage-guide.md) covers configuration,
-  persistence, backups, and trade-offs. For column-oriented data exports, see
-  [analytical snapshots](docs/analytical-snapshots.md).
+| Area | Capabilities and guides |
+| --- | --- |
+| SQL | Joins, recursive CTEs, UNION, windows, views, triggers, and procedures. [Function reference](docs/reference/functions.html), [SQL examples](demos/sql/showcase.sql). |
+| Retrieval | Exact flat or approximate IVF/HNSW vector search, BM25, hybrid ranking, and retrieval pre-filters. [RAG guide](docs/rag-guide.md). |
+| Storage | In-memory, WAL, JSON, disk, indexed, and SQLite-backed modes; backups and read-only snapshots. [Storage guide](docs/storage-guide.md), [analytical snapshots](docs/analytical-snapshots.md). |
+| Maps and files | Document/tabular/geospatial imports, geometry, tiles, and routing. [Geospatial guide](docs/geospatial-standards.md), [routing](docs/osm-routing.md), [file queries](cmd/query_files/README.md). |
+| Applications | [CLI](docs/cli-guide.md), [HTTP/gRPC server](cmd/server/README.md), [browser workspace](cmd/query_files_wasm/README.md), and [command index](cmd/README.md). |
 
-SQLite, GeoPackage, and MBTiles support requires the `sqliteimport` build tag;
-Shapefile support requires `shapefile`. For smaller WASM builds,
-`tinysql_minimal` omits optional features; see
-[browser build guide](cmd/wasm_browser/README.md) for details.
+SQLite, GeoPackage, and MBTiles need the `sqliteimport` build tag; Shapefile
+needs `shapefile`. The `tinysql_minimal` tag omits optional features for smaller
+WASM builds; see the [browser build guide](cmd/wasm_browser/README.md).
+
+Workload-specific measurements cover [SQL execution](docs/standard-query-performance.md),
+[CTEs](docs/cte-select-performance.md), and [vector/RAG retrieval](docs/rag-serving-performance.md).
 
 ## Develop
 
@@ -93,18 +82,18 @@ go vet ./...
 make test-bindings   # C ABI, Python and Rust
 ```
 
-See the [development guide](docs/development-guide.md) for tests, benchmarks,
-and build targets; the [architecture guide](docs/architecture.md) for internals;
-and [API stability](docs/api-stability.md) for compatibility guarantees.
+[Development](docs/development-guide.md) covers builds, tests, and benchmarks;
+[architecture](docs/architecture.md) and [API stability](docs/api-stability.md)
+describe internals and compatibility guarantees.
 
 ## Limitations
 
-- tinySQL is embedded and single-process. The server offers asynchronous
-  primary/replica reads, not sharding, automatic failover, multi-primary
-  writes, or distributed transactions.
-- Composite primary/foreign keys, CHECK, target-bearing ON CONFLICT DO UPDATE,
+- Use one writer process per database. [Server replicas](docs/cluster.md) are
+  asynchronous; sharding, automatic failover, multi-primary writes, and
+  distributed transactions are not supported.
+- Composite PRIMARY/UNIQUE/FOREIGN KEY, CHECK, target-bearing ON CONFLICT DO UPDATE,
   SAVEPOINT, ATTACH/DETACH, VACUUM, partial indexes, generated columns, and
-  persistent ANN index files are not available.
+  data-modifying CTE bodies are not supported.
 - Secondary indexes accelerate equality/prefix seeks and numeric ranges. Use
   GEO_SEARCH for indexed point-column bbox/radius queries; ordinary
   WHERE GEO_DWITHIN(...) predicates are not planner-accelerated.

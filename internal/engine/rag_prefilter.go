@@ -932,11 +932,7 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 		return topKFromHeap(&h, k), nil
 	}
 
-	type workerResult struct {
-		heapRows vecScoredHeap
-		err      error
-	}
-	results := make([]workerResult, workers)
+	results := make([]vecSearchWorkerResult, workers)
 	chunk := (len(allowed) + workers - 1) / workers
 	var wg sync.WaitGroup
 	for worker := 0; worker < workers; worker++ {
@@ -949,7 +945,7 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 		run := func() {
 			defer wg.Done()
 			h, err := ragVecTopKAllowedRange(ctx, allowed, start, end, queryLen, k, cache, distFn, needNorm, rowCount)
-			results[worker] = workerResult{heapRows: h, err: err}
+			results[worker] = vecSearchWorkerResult{heapRows: h, err: err}
 		}
 		// Use the caller as one worker instead of parking it for the whole scan.
 		if worker == workers-1 {
@@ -960,20 +956,13 @@ func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cach
 	}
 	wg.Wait()
 
-	merged := newScoredHeap(k, -1)
-	for i := range results {
-		if results[i].err != nil {
-			return nil, results[i].err
-		}
-		for _, row := range results[i].heapRows {
-			pushTopK(merged, row.rowIdx, row.distance, k)
-		}
-	}
-	return topKFromHeap(merged, k), nil
+	return mergeVecSearchResults(results, k, len(allowed))
 }
 
 func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool, rowCount int) (vecScoredHeap, error) {
-	heapRows := make(vecScoredHeap, 0, k)
+	// Each allowed position contributes at most one candidate. A large k
+	// must not reserve more space than this worker can actually fill.
+	heapRows := *newScoredHeap(k, end-start)
 	if segment, ok := cache.contiguousSegment(); ok {
 		for i := start; i < end; i++ {
 			if i&1023 == 0 {

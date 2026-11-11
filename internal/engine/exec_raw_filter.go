@@ -257,6 +257,9 @@ func buildRawExprFilter(colIndex map[string]int, e Expr) func([]any) (bool, erro
 	if filter := buildRawConversionFilter(colIndex, e); filter != nil {
 		return filter
 	}
+	if filter := buildRawTrimComparisonFilter(colIndex, e); filter != nil {
+		return filter
+	}
 	if value := compileRawValue(colIndex, e); value != nil {
 		return func(raw []any) (bool, error) {
 			v, err := value(raw)
@@ -1288,27 +1291,49 @@ func buildInFilter(colIdx int, litVals []any, negate bool) func([]any) (bool, er
 		return buildColLiteralFilter(colIdx, op, litVals[0])
 	}
 	hasNull := false
-	integers := make(map[int64]struct{})
-	floats := make(map[float64]struct{})
+	// Absent domains need no set; their nil-map lookups simply do not match.
+	var integers map[int64]struct{}
+	var floats map[float64]struct{}
 	// Floats compare to integer operands after conversion; integer-to-integer
 	// comparisons must still retain all 64 bits of precision.
-	numeric := make(map[float64]struct{})
-	texts := make(map[string]struct{})
+	var numeric map[float64]struct{}
+	var texts map[string]struct{}
 	var other []any
 	for _, v := range litVals {
 		switch x := v.(type) {
 		case nil:
 			hasNull = true
 		case int:
+			if integers == nil {
+				integers = make(map[int64]struct{})
+			}
+			if numeric == nil {
+				numeric = make(map[float64]struct{})
+			}
 			integers[int64(x)] = struct{}{}
 			numeric[float64(x)] = struct{}{}
 		case int64:
+			if integers == nil {
+				integers = make(map[int64]struct{})
+			}
+			if numeric == nil {
+				numeric = make(map[float64]struct{})
+			}
 			integers[x] = struct{}{}
 			numeric[float64(x)] = struct{}{}
 		case float64:
+			if floats == nil {
+				floats = make(map[float64]struct{})
+			}
+			if numeric == nil {
+				numeric = make(map[float64]struct{})
+			}
 			floats[x] = struct{}{}
 			numeric[x] = struct{}{}
 		case string:
+			if texts == nil {
+				texts = make(map[string]struct{})
+			}
 			texts[x] = struct{}{}
 		default:
 			other = append(other, v)

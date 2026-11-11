@@ -835,6 +835,17 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 		}
 	}
 
+	// Keep bindings local to this execution. Unsupported expressions (including
+	// statement-clock calls) still evaluate against the execution's raw plan.
+	// Direct columns and the specialized float scorers above need no callbacks.
+	var orderValues []rawValueEvaluator
+	if plan.orderCols == nil {
+		orderValues = make([]rawValueEvaluator, len(plan.orderExprs))
+		for i, expr := range plan.orderExprs {
+			orderValues[i] = compileRawValue(plan.colIndex, expr)
+		}
+	}
+
 	var scanPhase *queryPhase
 	if env.profile != nil {
 		detail := "collect raw ordering keys"
@@ -928,7 +939,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 				item = orderedRawRow{raw: raw, keys: keys}
 			}
 		case len(plan.orderExprs) == 1:
-			key, err := evalRawExpr(plan, raw, plan.orderExprs[0])
+			key, err := evalRawOrderKey(plan, raw, plan.orderExprs[0], orderValues[0])
 			if err != nil {
 				return nil, true, err
 			}
@@ -939,7 +950,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 				keyArena, keys = reserveKeySlots(keyArena, len(plan.orderExprs))
 			}
 			for i, expr := range plan.orderExprs {
-				v, err := evalRawExpr(plan, raw, expr)
+				v, err := evalRawOrderKey(plan, raw, expr, orderValues[i])
 				if err != nil {
 					return nil, true, err
 				}
@@ -1009,6 +1020,13 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 	}
 	projectPhase.finish(int64(len(outRows)))
 	return &ResultSet{Cols: plan.outputCols, Rows: outRows}, true, nil
+}
+
+func evalRawOrderKey(plan *simpleSelectPlan, raw []any, expr Expr, value rawValueEvaluator) (any, error) {
+	if value != nil {
+		return value(raw)
+	}
+	return evalRawExpr(plan, raw, expr)
 }
 
 func sortFullOrderedRawPositions(plan *simpleSelectPlan, rows []orderedRawRow, perm []int32) {

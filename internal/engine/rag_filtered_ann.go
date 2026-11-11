@@ -123,15 +123,13 @@ func (idx *vecHNSWIndex) searchFiltered(ctx context.Context, query []float64, qu
 	if err != nil {
 		return nil, err
 	}
-	result := newScoredHeap(k, len(candidates))
-	for _, sr := range candidates {
-		pushTopK(result, sr.rowIdx, sr.distance, k)
+	if len(candidates) >= k {
+		// Filter-local graphs have no delta rows. The traversal already sorts
+		// candidates nearest first; copy the prefix out of pooled scratch.
+		return append([]vecScoredRow(nil), candidates[:k]...), nil
 	}
-	if result.Len() < k {
-		distFn := buildVecDistanceFunc(idx.metric, query, queryNorm)
-		return ragVecTopKAllowed(ctx, allowed.rows, len(query), k, cache, distFn, vecDistanceFuncNeedsNorm(idx.metric))
-	}
-	return topKFromHeap(result, k), nil
+	distFn := buildVecDistanceFunc(idx.metric, query, queryNorm)
+	return ragVecTopKAllowed(ctx, allowed.rows, len(query), k, cache, distFn, vecDistanceFuncNeedsNorm(idx.metric))
 }
 
 func purgeRAGFilteredANNCachesFor(tenant, table string) {

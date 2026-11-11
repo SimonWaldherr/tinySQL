@@ -150,3 +150,130 @@ go test ./internal/engine -run '^$' \
 
 The benchmark harness was added with this change; copy its file to the baseline
 checkout to reproduce the comparison.
+
+## Filtered vector selection and query keys (2026-11-11)
+
+Filtered HNSW now copies the requested prefix of its already sorted candidate
+list instead of rebuilding and sorting another top-k heap. The copy owns its
+storage after pooled traversal scratch is released. When fewer than k candidates
+exist, the same exact authorized-row fallback runs directly, without building
+a heap that would immediately be discarded. Graph traversal, search breadth,
+distance arithmetic and tie ordering are unchanged.
+
+Exact filtered scans reserve each worker's heap for at most its allowed input
+positions; the parallel merge reserves at most the whole allowed set. Requested
+k remains unchanged. Invalid rows and dimensions can reduce the final count
+further. This also permits very large k without a correspondingly large
+reservation when the authorized set is small. Public filters still resolve
+stable IDs and metadata restrictions before ranking.
+
+The opt-in result cache hashes query components in batches of 32 rather than
+one hash-writer call per component. The SHA-256 byte stream remains the exact
+little-endian IEEE-754 bits in their original order, including signed zero and
+NaN payloads. The final digest writes into its existing fixed buffer, removing
+one 32-byte allocation per key. Disabled result caching still skips hashing.
+
+Allocation measurements compare the working tree immediately before these
+vector changes with the resulting tree, using source overlays for
+`rag_filtered_ann.go`, `rag_prefilter.go` and `vector_query_cache.go`. Earlier
+uncommitted CTE/WHERE/text changes remain fixed. Both executables contain the
+same fixtures. Go 1.27.3, darwin/arm64, Apple M2 Max, GOMAXPROCS=2; medians of
+three runs of three operations. Fixture setup and ANN graph construction are
+outside the timed region. The HNSW fixture has 1,280 source rows, 960 allowed
+positions and 64-dimensional embeddings, using cosine distance.
+
+| Workload | Bytes/op before → after |
+| --- | ---: |
+| Exact filtered scan, 8 allowed positions, k=20 | 357 → 165 |
+| Same subset, k=100000 | 1,605,669 → 165 |
+| Exact filtered scan, 4,096 allowed positions, k=100000 | ~4,817,834 → ~131,653 |
+| Same 4,096 positions, k=20 control | ~1,738 → ~1,738 |
+| Filtered HNSW, k=20 | 320 → 320 |
+| Filtered HNSW, k=1000 with insufficient graph candidates | 32,816 → 16,432 |
+| Query key, 32/768/1,536 components | 32 → 0 |
+
+Successful HNSW prefix selection still allocates the same owned result slice;
+its improvement is removing repeated heap work. The insufficient-candidate
+fixture drops from three allocations to two. Key hashing drops from one to
+zero allocations. Parallel startup can vary small setup costs. These figures
+measure allocation volume, not peak live memory or complete RAG request cost.
+
+A separate warm timing check uses before/after/after/before rounds, with three
+200 ms samples per workload in each round. Medians of all six samples:
+
+| Workload | Time/op before → after |
+| --- | ---: |
+| Filtered HNSW, k=20 | 3.204 → 2.744 µs |
+| Filtered HNSW, k=400 | 61.845 → 40.306 µs |
+| Query key, 32 components | 287.75 → 171.65 ns |
+| Query key, 1,536 components | 10.588 → 5.276 µs |
+| Exact filtered scan, 4,096 positions, k=20 control | 35.346 → 33.384 µs |
+
+The unchanged control differs by 5.6%, and some sample ranges are wide. Treat
+these as local observations rather than a precise production speedup estimate.
+In particular, neither table measures index construction, complete SQL/RAG
+execution, client transfer or recall differences; the candidate algorithm and
+search breadth are retained.
+
+Differential tests compare filtered ANN selection with the former heap path
+across all four metrics, tied distances, invalid/zero/NaN vectors and varied k.
+Other checks cover sparse authorization, oversized k, serial/parallel scans,
+segmented/updated caches, cancellation, output ownership, public RAG queries
+and index invalidation after UPDATE. Hash tests compare the complete key with
+SHA-256 of the original bit stream at batch boundaries and exercise concurrent
+readers. The root Go suite, targeted vector/RAG race checks, SQL-library
+compatibility, go vet and all four browser/Node WASM profiles pass. WASM also
+checks large-k filtered queries and physical-order tie ranking.
+
+```sh
+go test ./internal/engine \
+  -run '^Test(FilteredANNSelection|FilteredVectorHeap|VecQueryKey)' -count=1
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^Benchmark(FilteredANNSelection|FilteredVectorHeapCapacity|VecQueryKeyBatches)$' \
+  -benchmem -benchtime=3x -count=3
+```
+
+## Parallel heap reuse and IVF bounds (2026-11-11)
+
+Parallel exact vector scans, including authorized-row scans, now consume one
+request-owned worker heap as the merge heap when its reserved capacity can
+hold the final top-k. This avoids allocating another k-entry buffer and
+reinserting that worker's entries. Large k retains a new bounded buffer when
+the worker capacity is insufficient. Worker errors retain their original
+priority, and the final result owns its storage. Distance calculations, NaN
+exclusion, tied-row order and cancellation checks are unchanged.
+
+IVF also bounds its initial result heap by the cached source row count. The
+requested k and probe budget remain intact, including continuation through
+additional lists when the initial probes yield too few results. Large k can
+therefore return every valid row without reserving space for nonexistent hits.
+
+Allocation checks use the working tree before this follow-up as baseline,
+overlaying `vector_search.go`, `rag_prefilter.go` and `vector_index.go`; earlier
+vector improvements remain fixed. Go 1.27.3, darwin/arm64, Apple M2 Max,
+GOMAXPROCS=2; medians of three runs of three operations. Parsing, corpus/cache
+construction and IVF training are excluded. The exact fixture has 8,192
+three-dimensional source rows; its filtered case allows 4,096 positions.
+
+| Fixture | Bytes/op before → after |
+| --- | ---: |
+| Parallel exact scan, k=400 | ~20,330 → ~13,605 |
+| Parallel filtered scan, k=400 | 20,165 → 13,637 |
+| Exact scan, k=10000 control | 262,693 → 262,693 |
+| Filtered scan, k=10000 control | 131,653 → 131,653 |
+| IVF over 48 source rows, k=100000 | 1,605,733 → 869 |
+| Same IVF fixture, k=20 control | 421 → 421 |
+
+The filtered k=400 case drops from seven allocations to six. Small parallel
+startup costs vary across runs. These are allocation-volume measurements,
+not end-to-end latency or peak-memory claims. Regression tests compare the
+merge with an independent result heap and exhaustive scoring for all metrics,
+covering ties, infinities, nonpositive k, large k, worker error priority and
+IVF requests up to math.MaxInt. WASM exercises oversized explicit IVF queries.
+
+```sh
+go test ./internal/engine -run 'TestVector(Merge|ParallelMerge|IVFOversized)' -count=1
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkVector(ParallelHeapMerge|IVFHeapCapacity)$' \
+  -benchmem -benchtime=3x -count=3
+```

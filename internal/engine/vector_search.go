@@ -941,11 +941,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 		return topKFromHeap(&h, k), nil
 	}
 
-	type workerResult struct {
-		heapRows vecScoredHeap
-		err      error
-	}
-	results := make([]workerResult, workers)
+	results := make([]vecSearchWorkerResult, workers)
 	var wg sync.WaitGroup
 	chunk := (len(rows) + workers - 1) / workers
 
@@ -972,7 +968,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 				}
 			}()
 			h, err := vecSearchTopKRange(ctx, rows, start, end, queryLen, k, cache, distFn, needNorm)
-			results[worker] = workerResult{heapRows: h, err: err}
+			results[worker] = vecSearchWorkerResult{heapRows: h, err: err}
 		}
 		// Use the caller as one worker instead of parking it for the whole scan.
 		if worker == workers-1 {
@@ -983,17 +979,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 	}
 	wg.Wait()
 
-	merged := newScoredHeap(k, len(rows))
-	for i := range results {
-		if results[i].err != nil {
-			return nil, results[i].err
-		}
-		// Heap entries are already the local top-k; merging needs no local sort.
-		for _, sr := range results[i].heapRows {
-			pushTopK(merged, sr.rowIdx, sr.distance, k)
-		}
-	}
-	return topKFromHeap(merged, k), nil
+	return mergeVecSearchResults(results, k, len(rows))
 }
 
 func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {

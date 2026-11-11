@@ -246,18 +246,21 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 		if alignment == nil || !slices.Equal(alignment.columns, nextRs.Cols) {
 			alignment = newRecursiveCTEAlignment(accRs.Cols, nextRs.Cols, cte.Name)
 		}
-		alignedRows := alignment.align(nextRs.Rows)
-		if union.Type == UnionAll {
-			if maxRows >= 0 {
-				remaining := maxRows - len(accRows)
-				if remaining <= 0 {
-					frontier = nil
-					break
-				}
-				if len(alignedRows) > remaining {
-					alignedRows = alignedRows[:remaining]
-				}
+		nextRows := nextRs.Rows
+		if union.Type == UnionAll && maxRows >= 0 {
+			remaining := maxRows - len(accRows)
+			if remaining <= 0 {
+				frontier = nil
+				break
 			}
+			// The recursive SELECT has already evaluated all rows and checked
+			// their schema. Avoid copying rows outside the compound work limit.
+			if len(nextRows) > remaining {
+				nextRows = nextRows[:remaining]
+			}
+		}
+		alignedRows := alignment.align(nextRows)
+		if union.Type == UnionAll {
 			accRows = append(accRows, alignedRows...)
 			frontier = alignedRows
 			if maxRows >= 0 && len(accRows) >= maxRows {

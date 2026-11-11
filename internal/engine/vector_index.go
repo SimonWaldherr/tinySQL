@@ -538,7 +538,7 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 	}
 
 	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
-	resultHeap := newScoredHeap(k, -1)
+	resultHeap := newScoredHeap(k, cache.rowCount())
 	for probed := 0; len(centroidHeap) > 0; probed++ {
 		// Past the probe budget, keep going only while short of k.
 		if probed >= probes && resultHeap.Len() >= k {
