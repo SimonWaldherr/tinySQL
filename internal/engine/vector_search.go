@@ -350,9 +350,8 @@ func (c vecSearchColumnCacheEntry) resolveRow(row int, needNorm bool) (vec []flo
 // cache build.  The common read-only RAG corpus has exactly this shape: one
 // segment spanning every row and no UPDATE overrides.  A flat vector scan can
 // then index its row directly, avoiding an overrides-map lookup and a binary
-// segment lookup for every embedding.  Appended and updated tables retain the
-// general resolveRow path below, so this is purely a faster representation of
-// the same immutable cache contents.
+// segment lookup for every embedding. Random-access ANN resolvers use this
+// layout; flat scans can also walk several adjacent segments directly.
 func (c vecSearchColumnCacheEntry) contiguousSegment() (vecColumnSegment, bool) {
 	if len(c.overrides) != 0 || len(c.segments) != 1 {
 		return vecColumnSegment{}, false
@@ -365,6 +364,25 @@ func (c vecSearchColumnCacheEntry) contiguousSegment() (vecColumnSegment, bool) 
 		return vecColumnSegment{}, false
 	}
 	return segment, true
+}
+
+// directScanSegments admits complete, adjacent segments without UPDATE
+// overrides. Validate the layout once so a sequential scan can walk each
+// segment instead of resolving its row through a binary search on every visit.
+// Incomplete or overlapping layouts keep resolveRow's lookup semantics.
+func (c vecSearchColumnCacheEntry) directScanSegments(start, end int) bool {
+	if start < 0 || end > c.rows || len(c.overrides) != 0 {
+		return false
+	}
+	next := 0
+	for _, segment := range c.segments {
+		if segment.start != next || len(segment.valid) != len(segment.vectors) ||
+			(c.normsReady && len(segment.norms) != len(segment.vectors)) || len(segment.vectors) > c.rows-next {
+			return false
+		}
+		next += len(segment.vectors)
+	}
+	return next == c.rows
 }
 
 type vecColumnBuildCall struct{ done chan struct{} }
@@ -989,33 +1007,38 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 
 func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {
 	scoredRows := newScoredHeap(k, end-start)
-	if segment, ok := cache.contiguousSegment(); ok {
-		for i := start; i < end; i++ {
-			if i&1023 == 0 {
-				if err := checkCtx(ctx); err != nil {
-					return nil, err
+	if cache.directScanSegments(start, end) {
+		for _, segment := range cache.segments {
+			from := max(start, segment.start)
+			to := min(end, segment.start+len(segment.vectors))
+			for i := from; i < to; i++ {
+				if i&1023 == 0 {
+					if err := checkCtx(ctx); err != nil {
+						return nil, err
+					}
 				}
-			}
-			if !segment.valid[i] {
-				continue
-			}
-			vec := segment.vectors[i]
-			if len(vec) != queryLen {
-				continue
-			}
-			var norm float64
-			if needNorm {
-				if cache.normsReady {
-					norm = segment.norms[i]
-				} else {
-					norm = vectorL2Norm(vec)
+				local := i - segment.start
+				if !segment.valid[local] {
+					continue
 				}
+				vec := segment.vectors[local]
+				if len(vec) != queryLen {
+					continue
+				}
+				var norm float64
+				if needNorm {
+					if cache.normsReady {
+						norm = segment.norms[local]
+					} else {
+						norm = vectorL2Norm(vec)
+					}
+				}
+				dist, ok := distFn(vec, norm)
+				if !ok {
+					continue
+				}
+				pushTopK(scoredRows, i, dist, k)
 			}
-			dist, ok := distFn(vec, norm)
-			if !ok {
-				continue
-			}
-			pushTopK(scoredRows, i, dist, k)
 		}
 		return *scoredRows, nil
 	}

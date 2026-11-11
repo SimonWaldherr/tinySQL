@@ -130,6 +130,36 @@ func clonePersistentVecIndex(index *storage.VectorIndex) *storage.VectorIndex {
 	return &clone
 }
 
+// An older append-only prefix remains loadable: hydrate it and replay the
+// bounded tail through the same deterministic insertion path. Publish in
+// batches rather than copying the full topology after every single INSERT.
+func persistExtendedVecHNSWIndex(table *storage.Table, colIdx int, metric string, idx *vecHNSWIndex) {
+	if table == nil || idx == nil {
+		return
+	}
+	idx.mu.RLock()
+	rows, version, structural, dims := len(idx.levels), idx.version, idx.structVersion, idx.dims
+	idx.mu.RUnlock()
+
+	table.DerivedLock()
+	stored := table.VectorIndexes[vecPersistentHNSWKey(colIdx, metric)]
+	deferSnapshot := stored != nil && stored.Format == vecPersistentFormat && stored.Kind == vecIndexHNSW &&
+		stored.Column == colIdx && stored.Metric == metric && stored.Dims == dims &&
+		stored.Version <= version && stored.StructVersion == structural && stored.BuiltRows > 0 &&
+		stored.BuiltRows <= rows && len(stored.Levels) == stored.BuiltRows && len(stored.Neighbors) == stored.BuiltRows &&
+		(stored.Version != version || stored.BuiltRows == rows) &&
+		stored.Entry >= 0 && stored.Entry < stored.BuiltRows && stored.MaxLevel >= 0 &&
+		rows-stored.BuiltRows < vecPersistentAppendLimit(stored.BuiltRows)
+	table.DerivedUnlock()
+	if !deferSnapshot {
+		persistVecHNSWIndex(table, colIdx, metric, idx)
+	}
+}
+
+func vecPersistentAppendLimit(rows int) int {
+	return min(1024, max(32, rows/16))
+}
+
 // persistVecHNSWIndex publishes a deep, validated snapshot of idx to the
 // table.  A storage Sync/Close will subsequently flush the table even if its
 // SQL rows did not change, via Table.VectorIndexesPersistenceState.

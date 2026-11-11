@@ -277,3 +277,73 @@ GOMAXPROCS=2 go test ./internal/engine -run '^$' \
   -bench '^BenchmarkVector(ParallelHeapMerge|IVFHeapCapacity)$' \
   -benchmem -benchtime=3x -count=3
 ```
+
+## Large filtered graphs and incremental ingestion
+
+Selective filtered ANN graphs now size their levels, adjacency headers and
+vector-header cache to the allowed row set. The compact layout applies when
+that set covers at most a quarter of the source corpus. Sorted local IDs map
+back to physical rows, preserving physical-ID level seeds, topology, distance
+bits and tie order. Broad or noncanonical row sets retain the previous layout;
+an insufficient ANN frontier still falls back to exact allowed-row scoring.
+
+The compact view borrows immutable vector payloads rather than duplicating
+embeddings. It can keep a packed column segment resident while cached. New
+publications remove obsolete versions of the same source-table object, and
+superseded in-flight builds are returned privately without being cached.
+
+Append-only HNSW maintenance now publishes a persistent topology image after
+`min(1024, max(32, stored_rows/16))` new indexed rows. Refresh remains lazy:
+the next HNSW query or `VEC_WARM` first makes the runtime index current.
+Initial builds, incompatible snapshots and the first valid graph entry publish
+immediately. The existing file format already supports older append-only
+prefixes: reopening validates and clones that prefix, then inserts the missing
+tail through the same deterministic path. The unpublished indexed tail is
+bounded after a successful refresh; later writes without a refresh can add
+more rows. UPDATE-delta graphs keep their
+existing persistence rules. Rows retain their ordinary storage/WAL durability.
+
+Exact scans over adjacent append-only column segments now validate their
+layout once and walk each segment directly. UPDATE overrides, gaps, overlaps
+or malformed layouts retain the general resolver. Absolute cancellation check
+positions, result ownership and metric semantics remain unchanged.
+
+Allocation measurements compare `b29f4ad` with the same benchmark fixtures in
+separate before/after processes: Go 1.27.3, Apple M2 Max, `GOMAXPROCS=2`, medians
+of three fixed-count runs. These measure allocated bytes, not peak RSS:
+
+| Workload | B/op before → after | Allocs/op before → after |
+| --- | ---: | ---: |
+| Filtered graph build, 4,096 allowed positions in a million-row address space | 35,387,802 → 1,685,677 | 8,806 → 8,803 |
+| One-row append/refresh, starting from 10,000 vectors | 2,944,049 → 18,775 | 32 → 26 |
+
+The graph-build fixture materializes only the selected 16-dimensional vectors
+as sparse cache overrides. It isolates corpus-sized graph bookkeeping rather
+than database loading or payload memory. The 4,096-row subset exercises the
+production filtered-ANN size range. Warm search uses a separate contiguous
+million-row header fixture with the same selected payloads.
+
+The append benchmark includes column-cache extension, graph insertion and
+publication. Its 1,100 operations cross the publication threshold, so the
+measurement includes full topology snapshots rather than only a short burst
+that defers them. Context-sensitive wall-clock results varied with host load;
+the allocation reductions were consistent. Single-segment and UPDATE-override
+scan controls retain their one 320-byte heap allocation.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkFilteredANNSelectiveBuild$' -benchtime=3x -count=3 -benchmem
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkFilteredANNSelectiveSearch$' -benchtime=1000x -count=3 -benchmem
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkVecHNSWIncrementalInsert_10k$' -benchtime=1100x -count=3 -benchmem
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkVecSegmentedFlatScan$' -benchtime=50x -count=3 -benchmem
+```
+
+Regression coverage compares compact graphs and all four metrics with the
+physical-ID implementation, including ties, invalid vectors, exact fallback,
+ACL mutations and concurrent cold queries. Persistence tests cover immutable
+prior snapshots, threshold crossings, actual close/reopen, hydration and
+current warm-up results. Segmented scans are compared bit-for-bit with the
+resolver path across partial ranges, invalid data and cancellation points.

@@ -601,6 +601,12 @@ The local graph is invalidated with the source table and is not persisted, so
 use it for repeatedly queried, high-cardinality scopes rather than one-off ACL
 expressions.
 
+Selective scopes covering at most a quarter of the source rows use compact
+local graph IDs and vector headers. Physical row order still determines ties
+and graph levels. Vector payloads share the immutable column-cache segments;
+a live filtered graph can therefore keep those segments resident. Publishing
+a new source-table generation retires its older filtered graph entries.
+
 Go package users can generate the same options payload without hand-building
 JSON. `RAGPreFilterJSON` rejects an empty boundary, while an explicit empty
 `AllowedRowIDs` slice is preserved as a deny-all ACL:
@@ -802,6 +808,15 @@ Warm exactly the path used in serving:
 SELECT *
 FROM VEC_WARM('rag_chunks', 'embedding', 'cosine', 'ivf');
 ```
+
+The next HNSW query or `VEC_WARM` incorporates append-only rows into the runtime
+graph. Its persisted topology is refreshed after 32–1,024 new indexed rows,
+depending on the existing graph size, to avoid copying the complete graph
+after each INSERT/query pair. After a completed refresh, at most 1,023 indexed
+rows remain unpublished; subsequent writes without a refresh can add more.
+SQL rows follow their normal durability path. After reopening, warm-up loads
+the validated graph prefix and inserts the missing tail. `VEC_WARM` reports
+the current runtime graph.
 
 Embedding updates do not force a full column-cache or HNSW-topology rebuild:
 tinySQL keeps immutable vector segments and applies per-row overrides. ANN

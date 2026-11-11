@@ -90,6 +90,10 @@ type vecHNSWIndex struct {
 	maxLevel      int
 	levels        []int
 	neighbors     [][][]int
+	// Selective filter-local graphs use dense node IDs and a compact view of
+	// their allowed vectors. Global and persisted graphs keep physical row IDs.
+	filteredRows  []int
+	filteredCache *vecSearchColumnCacheEntry
 	// deltaRows are UPDATE-only vectors whose old graph placement may no
 	// longer make them reachable with good recall. Search scores this bounded
 	// set exactly and merges it into the ANN top-k. A full rebuild clears it.
@@ -728,7 +732,7 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 			// exactly. Persisting only its stale topology would lose that merge
 			// after reopen, so persistence resumes after the next compact rebuild.
 			if err == nil && !hasDeltas {
-				persistVecHNSWIndex(table, colIdx, metric, idx)
+				persistExtendedVecHNSWIndex(table, colIdx, metric, idx)
 			}
 
 			vecHNSWCacheMu.Lock()
@@ -978,7 +982,12 @@ func extendVecHNSWIndex(ctx context.Context, idx *vecHNSWIndex, cache vecSearchC
 // layer whose result is thinned by the neighbor-selection heuristic
 // (selectHNSWNeighbors) before the node is linked in both directions.
 func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEntry, visited *vecVisitedSet, scratch *vecHNSWScratch) {
-	level := hnswLevel(rowIdx)
+	levelRow := rowIdx
+	if idx.filteredCache != nil {
+		// Preserve the original graph's deterministic levels and topology.
+		levelRow = idx.filteredRows[rowIdx]
+	}
+	level := hnswLevel(levelRow)
 	idx.levels[rowIdx] = level
 	idx.neighbors[rowIdx] = make([][]int, level+1)
 	rows := newVecRowResolver(&cache, metricNeedsNorms(idx.metric))

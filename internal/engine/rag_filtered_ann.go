@@ -68,7 +68,15 @@ func getRAGFilteredANNIndex(ctx context.Context, tenant string, table *storage.T
 
 	ragFilteredANNCache.Lock()
 	delete(ragFilteredANNCache.builds, key)
-	if call.err == nil && call.idx != nil {
+	if call.err == nil && call.idx != nil && table.Version == key.version {
+		// Compact graphs borrow immutable vector payloads. Retire older
+		// generations before publishing so a busy ACL cache cannot pin many
+		// obsolete packed columns after updates or rebuilds.
+		for stale := range ragFilteredANNCache.entries {
+			if stale.tenant == key.tenant && stale.table == key.table && stale.version != key.version {
+				delete(ragFilteredANNCache.entries, stale)
+			}
+		}
 		if len(ragFilteredANNCache.entries) >= maxRAGFilteredANNCaches {
 			for stale := range ragFilteredANNCache.entries {
 				delete(ragFilteredANNCache.entries, stale)
@@ -83,12 +91,22 @@ func getRAGFilteredANNIndex(ctx context.Context, tenant string, table *storage.T
 }
 
 func buildRAGFilteredANNIndex(ctx context.Context, table *storage.Table, metric string, dims int, cache vecSearchColumnCacheEntry, filter *ragRowFilter) (*vecHNSWIndex, error) {
-	idx := &vecHNSWIndex{
-		table: table, version: table.Version, structVersion: table.StructVersion(),
-		metric: metric, dims: dims, entry: -1, maxLevel: -1,
-		levels: make([]int, cache.rowCount()), neighbors: make([][][]int, cache.rowCount()),
+	version, structVersion := table.Version, table.StructVersion()
+	local, rowIDs, err := compactRAGFilterCache(ctx, cache, filter.rows, metricNeedsNorms(metric))
+	if err != nil {
+		return nil, err
 	}
-	visited := acquireVisited(cache.rowCount())
+	buildCache := cache
+	if local != nil {
+		buildCache = *local
+	}
+	idx := &vecHNSWIndex{
+		table: table, version: version, structVersion: structVersion,
+		metric: metric, dims: dims, entry: -1, maxLevel: -1,
+		levels: make([]int, buildCache.rowCount()), neighbors: make([][][]int, buildCache.rowCount()),
+		filteredRows: rowIDs, filteredCache: local,
+	}
+	visited := acquireVisited(buildCache.rowCount())
 	defer releaseVisited(visited)
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
@@ -98,11 +116,57 @@ func buildRAGFilteredANNIndex(ctx context.Context, table *storage.Table, metric 
 				return nil, err
 			}
 		}
-		if validCacheRow(cache, rowIdx, dims) {
-			idx.insertHNSWNode(rowIdx, cache, visited, scratch)
+		if local != nil {
+			rowIdx = pos
+		}
+		if validCacheRow(buildCache, rowIdx, dims) {
+			idx.insertHNSWNode(rowIdx, buildCache, visited, scratch)
 		}
 	}
 	return idx, nil
+}
+
+// A selective graph should scale with the allowed set, not with its source
+// corpus. This view copies vector headers and cached norms, never payloads.
+// For broad filters the extra headers would cost more than they save, so keep
+// the original physical-ID layout. Sorted IDs preserve every distance tie.
+func compactRAGFilterCache(ctx context.Context, cache vecSearchColumnCacheEntry, rows []int, needNorm bool) (*vecSearchColumnCacheEntry, []int, error) {
+	if len(rows) > cache.rowCount()/4 {
+		return nil, nil, nil
+	}
+	previous := -1
+	for pos, row := range rows {
+		if pos&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, nil, err
+			}
+		}
+		if row <= previous || row >= cache.rowCount() {
+			return nil, nil, nil
+		}
+		previous = row
+	}
+	segment := vecColumnSegment{vectors: make([][]float64, len(rows)), valid: make([]bool, len(rows))}
+	if needNorm {
+		segment.norms = make([]float64, len(rows))
+	}
+	for pos, row := range rows {
+		if pos&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, nil, err
+			}
+		}
+		vec, norm, valid := cache.resolveRow(row, needNorm)
+		segment.vectors[pos], segment.valid[pos] = vec, valid
+		if needNorm {
+			segment.norms[pos] = norm
+		}
+	}
+	local := &vecSearchColumnCacheEntry{
+		table: cache.table, version: cache.version, structVersion: cache.structVersion,
+		rows: len(rows), segments: []vecColumnSegment{segment}, normsReady: needNorm,
+	}
+	return local, append([]int(nil), rows...), nil
 }
 
 // searchFiltered traverses a graph containing only allowed rows. The exact
@@ -114,11 +178,15 @@ func (idx *vecHNSWIndex) searchFiltered(ctx context.Context, query []float64, qu
 	if idx.entry < 0 || k <= 0 {
 		return nil, nil
 	}
-	visited := acquireVisited(cache.rowCount())
+	searchCache := cache
+	if idx.filteredCache != nil {
+		searchCache = *idx.filteredCache
+	}
+	visited := acquireVisited(searchCache.rowCount())
 	defer releaseVisited(visited)
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
-	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
+	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&searchCache, metricNeedsNorms(idx.metric)))
 	candidates, err := idx.searchCandidates(ctx, &scorer, chooseHNSWEfSearch(k), visited, scratch)
 	if err != nil {
 		return nil, err
@@ -126,7 +194,13 @@ func (idx *vecHNSWIndex) searchFiltered(ctx context.Context, query []float64, qu
 	if len(candidates) >= k {
 		// Filter-local graphs have no delta rows. The traversal already sorts
 		// candidates nearest first; copy the prefix out of pooled scratch.
-		return append([]vecScoredRow(nil), candidates[:k]...), nil
+		result := append([]vecScoredRow(nil), candidates[:k]...)
+		if idx.filteredCache != nil {
+			for i := range result {
+				result[i].rowIdx = idx.filteredRows[result[i].rowIdx]
+			}
+		}
+		return result, nil
 	}
 	distFn := buildVecDistanceFunc(idx.metric, query, queryNorm)
 	return ragVecTopKAllowed(ctx, allowed.rows, len(query), k, cache, distFn, vecDistanceFuncNeedsNorm(idx.metric))
