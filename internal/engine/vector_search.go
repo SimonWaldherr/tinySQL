@@ -29,6 +29,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"runtime"
 	"strings"
@@ -246,6 +247,7 @@ type vecSearchColumnCacheEntry struct {
 	version       int
 	structVersion int
 	rows          int
+	shape         *vecColumnShapeCache
 	segments      []vecColumnSegment
 	// overrides hold UPDATE-only row deltas. They keep large immutable base
 	// segments reusable instead of recopying an entire embedding column.
@@ -482,11 +484,10 @@ func evictOverCap[K comparable, V any](m map[K]V, maxEntries int) {
 func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
 	key := vecSearchColumnCacheKey{source: table, tenant: tenant, table: table.Name, colIdx: colIdx}
 
-	// Lock-free fast path: entries are immutable once published (verified:
-	// buildVecColumnCache/extendVecColumnCache/mergeVecColumnSegments always
-	// allocate fresh segments/overrides rather than mutating a published
-	// entry in place), so a snapshot read without vecSearchColumnCacheMu is
-	// always safe — see publishVecSearchColumnCacheSnapshotLocked.
+	// Published segments and overrides are immutable. Appends share them;
+	// refresh takes a private map before changing row values. Lock-free
+	// snapshot reads can therefore reuse the data safely. Lazy warm statistics
+	// synchronize through their own shared state rather than the cache lock.
 	if snap := vecSearchColumnCacheSnapshot.Load(); snap != nil {
 		if cached, ok := (*snap)[key]; ok && cached.table == table && cached.version == table.Version && (!includeNorms || cached.normsReady) {
 			return cached
@@ -546,23 +547,15 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 
 func refreshVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table, colIdx int, includeNorms bool, rows []int) vecSearchColumnCacheEntry {
 	entry := extendVecColumnCache(cached, table, colIdx, includeNorms)
-	// entry.overrides (just built above) already carries every existing
-	// override with a correct norm under the same includeNorms/normsReady
-	// gate this function's own new-row loop below uses — re-deriving a
-	// second, separate map from cached.overrides here duplicated that same
-	// vectorL2Norm recompute a second time in one call.
-	//
-	// entry.overrides is safe to grow in place whenever cached.overrides was
-	// non-empty: extendVecColumnCache always allocates a fresh, exclusively-
-	// owned map in that case (never returns cached.overrides itself), and
-	// entry is still a local value here, unpublished to any cache any
-	// concurrent reader could observe. Only when cached.overrides was empty
-	// does extendVecColumnCache pass that same (possibly shared, possibly
-	// nil) map straight through — a fresh map is needed there instead of
-	// risking a mutation a reader still holding the old cached entry could
-	// see.
+	if entry.shape == cached.shape {
+		entry.shape = new(vecColumnShapeCache)
+	}
+	// Append-only views share immutable overrides. A norm upgrade already
+	// created a private map; otherwise take a copy before changing row values.
 	if len(cached.overrides) == 0 {
 		entry.overrides = make(map[int]vecColumnOverride, len(rows))
+	} else if !includeNorms || cached.normsReady {
+		entry.overrides = maps.Clone(cached.overrides)
 	}
 	for _, row := range rows {
 		if row < 0 || row >= len(table.Rows) {
@@ -619,6 +612,7 @@ func buildVecColumnCache(table *storage.Table, colIdx int, includeNorms bool) ve
 		version:       table.Version,
 		structVersion: table.StructVersion(),
 		rows:          len(table.Rows),
+		shape:         new(vecColumnShapeCache),
 		segments:      []vecColumnSegment{segment},
 		normsReady:    includeNorms,
 	}
@@ -680,6 +674,10 @@ func canExtendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Ta
 // norms are requested for a previously non-cosine cache, it computes norms
 // from the existing packed vectors but still never recopies vector data.
 func extendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
+	shape := cached.shape
+	if shape == nil || cached.rows != len(table.Rows) || cached.structVersion != table.StructVersion() {
+		shape = new(vecColumnShapeCache)
+	}
 	segments := append([]vecColumnSegment(nil), cached.segments...)
 	if includeNorms && !cached.normsReady {
 		for i := range segments {
@@ -696,18 +694,13 @@ func extendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 		segments = append(segments, buildVecColumnSegment(table.Rows[cached.rows:], colIdx, includeNorms || cached.normsReady, cached.rows))
 	}
 	segments = mergeVecColumnSegments(segments, includeNorms || cached.normsReady)
+	// Appends do not change existing row overrides or computed norms. Share
+	// their immutable map; refresh takes a private copy before a later UPDATE.
 	overrides := cached.overrides
-	if len(overrides) != 0 {
+	if len(overrides) != 0 && includeNorms && !cached.normsReady {
 		overrides = make(map[int]vecColumnOverride, len(cached.overrides))
 		for row, value := range cached.overrides {
-			// Mirrors the segment-norm gate above exactly: once
-			// cached.normsReady is true, every existing override already
-			// carries a correct norm (this same gate, or refreshVecColumnCache's
-			// identical one at override-creation time, computed it), so
-			// recomputing here on every extend — forever, for any table that
-			// has ever mixed cosine search with an UPDATE — was pure waste. Only
-			// a normsReady transition (false -> true) needs it, same as segments.
-			if includeNorms && !cached.normsReady && value.valid {
+			if value.valid {
 				value.norm = vectorL2Norm(value.vector)
 			}
 			overrides[row] = value
@@ -718,6 +711,7 @@ func extendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 		version:       table.Version,
 		structVersion: table.StructVersion(),
 		rows:          len(table.Rows),
+		shape:         shape,
 		segments:      segments,
 		overrides:     overrides,
 		normsReady:    includeNorms || cached.normsReady,

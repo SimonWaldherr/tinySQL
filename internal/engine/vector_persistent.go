@@ -77,6 +77,7 @@ func usablePersistentVecHNSW(index *storage.VectorIndex, table *storage.Table, c
 	if index.BuiltRows == 0 {
 		return index.Entry == -1 && index.MaxLevel == -1
 	}
+	rows := newVecRowResolver(&cache, false)
 	// A table can have physical rows but no valid vectors (nil or mixed
 	// malformed cells). buildVecHNSWIndex represents that correctly as an
 	// empty graph over a non-empty row range; retain it across reopen too.
@@ -85,7 +86,8 @@ func usablePersistentVecHNSW(index *storage.VectorIndex, table *storage.Table, c
 			return false
 		}
 		for row := 0; row < cache.rowCount(); row++ {
-			if validCacheRow(cache, row, dims) {
+			vector, _, valid := rows.resolve(row)
+			if valid && len(vector) == dims {
 				return false
 			}
 		}
@@ -95,7 +97,11 @@ func usablePersistentVecHNSW(index *storage.VectorIndex, table *storage.Table, c
 		return false
 	}
 	for row, layers := range index.Neighbors {
-		valid := row < cache.rowCount() && validCacheRow(cache, row, dims)
+		valid := false
+		if row < cache.rowCount() {
+			vector, _, found := rows.resolve(row)
+			valid = found && len(vector) == dims
+		}
 		if valid {
 			// Every valid vector is inserted by buildVecHNSWIndex and therefore
 			// owns exactly one adjacency slice per level.  Treat a missing layer

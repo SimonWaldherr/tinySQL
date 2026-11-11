@@ -596,6 +596,11 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 	// assignment predates the last move: building the lists from it would file
 	// rows under a centroid that is no longer their nearest, and search probing
 	// the correct centroid would then miss them.
+	// There are at most 64 centroids. Keep their final assignments in bytes,
+	// then scatter rows stably into one exactly sized arena instead of growing
+	// every inverted list separately.
+	assignments := make([]uint8, len(rows))
+	clear(counts)
 	for i, rowIdx := range rows {
 		if i&1023 == 0 {
 			if err := checkCtx(ctx); err != nil {
@@ -604,7 +609,28 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 		}
 		vec, norm, _ := cache.resolveRow(rowIdx, needNorm)
 		c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
-		idx.lists[c] = append(idx.lists[c], rowIdx)
+		assignments[i] = uint8(c)
+		counts[c]++
+	}
+	listRows := make([]int, len(rows))
+	offset := 0
+	for c, count := range counts {
+		end := offset + count
+		if count != 0 {
+			idx.lists[c] = listRows[offset:end:end]
+		}
+		offset = end
+		counts[c] = 0
+	}
+	for i, rowIdx := range rows {
+		if i&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
+		c := assignments[i]
+		idx.lists[c][counts[c]] = rowIdx
+		counts[c]++
 	}
 	return idx, nil
 }
@@ -1439,6 +1465,31 @@ func vecRankingDistanceKind(kind int, a, b []float64, normA, normB float64) (flo
 }
 
 func validVectorRows(cache vecSearchColumnCacheEntry, dims int) []int {
+	if cache.directScanSegments(0, cache.rowCount()) {
+		// The list is temporary build state. Count first so nullable or mixed-
+		// dimension columns do not reserve an int for every corpus row. Direct
+		// segment access keeps both passes free of per-row binary/map lookups.
+		count := 0
+		for _, segment := range cache.segments {
+			for row, valid := range segment.valid {
+				if valid && len(segment.vectors[row]) == dims {
+					count++
+				}
+			}
+		}
+		rows := make([]int, 0, count)
+		if count == 0 {
+			return rows
+		}
+		for _, segment := range cache.segments {
+			for row, valid := range segment.valid {
+				if valid && len(segment.vectors[row]) == dims {
+					rows = append(rows, segment.start+row)
+				}
+			}
+		}
+		return rows
+	}
 	rows := make([]int, 0, cache.rowCount())
 	for i := 0; i < cache.rowCount(); i++ {
 		if validCacheRow(cache, i, dims) {
@@ -1449,7 +1500,11 @@ func validVectorRows(cache vecSearchColumnCacheEntry, dims int) []int {
 }
 
 func validCacheRow(cache vecSearchColumnCacheEntry, rowIdx int, dims int) bool {
-	return rowIdx >= 0 && rowIdx < cache.rowCount() && cache.validAt(rowIdx) && len(cache.vector(rowIdx)) == dims
+	if rowIdx < 0 || rowIdx >= cache.rowCount() {
+		return false
+	}
+	vector, _, valid := cache.resolveRow(rowIdx, false)
+	return valid && len(vector) == dims
 }
 
 // metricNeedsNorms reports whether the metric consumes vector norms.

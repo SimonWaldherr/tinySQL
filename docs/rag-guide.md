@@ -818,6 +818,11 @@ SQL rows follow their normal durability path. After reopening, warm-up loads
 the validated graph prefix and inserts the missing tail. `VEC_WARM` reports
 the current runtime graph.
 
+Warm-up statistics are computed once per immutable vector-column image and
+reused by subsequent calls. Row changes invalidate the summary; computing
+cosine norms alone preserves it. The reported counts and mixed-dimension
+rules are unchanged.
+
 Embedding updates do not force a full column-cache or HNSW-topology rebuild:
 tinySQL keeps immutable vector segments and applies per-row overrides. ANN
 search also scores a bounded update-delta exactly and merges it into Top-K, so

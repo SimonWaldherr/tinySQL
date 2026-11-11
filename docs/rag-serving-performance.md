@@ -347,3 +347,76 @@ ACL mutations and concurrent cold queries. Persistence tests cover immutable
 prior snapshots, threshold crossings, actual close/reopen, hydration and
 current warm-up results. Segmented scans are compared bit-for-bit with the
 resolver path across partial ranges, invalid data and cancellation points.
+
+## Column summaries, override reuse and IVF storage
+
+Repeated warm-up calls reuse a small, synchronized column-shape summary rather
+than scanning every cached vector again. The summary preserves the first
+nonzero dimension, distinct lengths and exclusion counts, including admitted
+empty vectors. A pointer-owned `sync.Once` permits concurrent readers without
+copying locks. Append/UPDATE/rebuild paths create new summary state; norm-only
+upgrades reuse the existing classification. The first statistics request still
+scans the column, and ANN warm-up still performs any required index build.
+
+Append-only column-cache views now share immutable UPDATE-override maps.
+Applying another UPDATE copies the map before writing; computing previously
+missing cosine norms also produces a private map. Existing cache views and
+filtered graphs retain their original vectors and norm values.
+
+IVF construction counts admitted row IDs before allocating their temporary
+list when the cache has complete adjacent segments and no overrides. Sparse
+or empty vector columns therefore allocate for valid vectors rather than the
+whole corpus. Final centroid assignments use bytes (at most 64 centroids), then
+scatter physical row IDs stably into disjoint, capacity-clipped slices of one
+integer arena. Training arithmetic, centroid assignments, nil empty lists and
+query ordering remain unchanged. Row collection from noncanonical caches keeps
+the existing resolver path.
+HNSW validation also resolves each row once, using direct contiguous reads
+where available, while retaining its format, version and neighbor checks.
+
+Fixed-work allocation comparisons against `3c4d741`, using identical fixtures
+in separate processes, Go 1.27.3, Apple M2 Max and `GOMAXPROCS=2`. Values are
+medians of three runs and describe allocation volume, not peak RSS:
+
+| Workload | B/op before → after | Allocs/op before → after |
+| --- | ---: | ---: |
+| Append view with 1,024 overrides and cached norms | 115,688 → 920 | 12 → 7 |
+| Same append without overrides | 872 → 920 | 6 → 7 |
+| IVF build, 32,768 valid vectors | 908,949 → 571,541 | 730 → 76 |
+| IVF build, one million rows / 1,000 valid vectors | 8,030,048 → 20,949 | 137 → 27 |
+| IVF build, one million rows / no valid vectors | 8,003,696 → 112 | 2 → 1 |
+
+The append fixture repeatedly extends the same immutable 16,384-row base by
+one 64-dimensional vector; it excludes cumulative ingestion growth. The empty
+override control exposes the summary state's 48-byte, one-allocation cost per
+new cache image. Ordinary queries reuse an existing image. A norm-upgrade
+control still copies its override map, with the same added summary-state cost.
+
+The IVF build fixture uses eight dimensions and excludes column-cache setup.
+The row-ID collector alone changes from 8,003,584 to 8,192 B/op for the sparse
+million-row case, and to zero for an empty column. Its dense-million-row control
+retains the same 8,003,584 B/op. Row validation remains allocation-free.
+
+The repeated flat warm-statistics helper excludes cache construction, its first
+summary scan, ANN work and SQL result maps. With a million four-dimensional
+vectors it changed from a full scan (roughly 11 ms locally) to a cached lookup
+(roughly 0.2 µs), both allocation-free. This demonstrates the removal of repeated
+O(rows) work; the host was heavily loaded, so these timings are not a general
+request-latency claim.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkVecWarmRepeatedStats$' -benchtime=20x -count=3 -benchmem
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkVecColumnAppendWithOverrides$' -benchtime=100x -count=3 -benchmem
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^Benchmark(IVFPackedBuild|IVFValidRows)$' -benchtime=3x -count=3 -benchmem
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^Benchmark(VectorRowValidity|PersistentVectorValidation)$' \
+  -benchtime=20x -count=3 -benchmem
+```
+
+Tests compare IVF centroid bits, partitions and query results with the previous
+builder for all four metrics. They also cover sparse/invalid vectors, list
+ownership, cancellation, immutable override views, norm transitions, unchanged
+warm statistics after row changes, and concurrent first use of the summary.

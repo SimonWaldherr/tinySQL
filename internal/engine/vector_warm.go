@@ -140,25 +140,8 @@ func (f *VecWarmTableFunc) Execute(ctx context.Context, args []Expr, env ExecEnv
 func warmVectorStructures(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric, indexMode string) (rowCount, vectorCount, dims, distinctDims, excludedRows int, err error) {
 	cache := getVecColumnCache(tenant, table, colIdx, metricNeedsNorms(metric))
 	rowCount = cache.rowCount()
-	lenCounts := make(map[int]int)
-	for i := 0; i < cache.rowCount(); i++ {
-		// resolveRow resolves validity and the vector in one overrides/segment
-		// lookup instead of validAt+vector's two independent ones — this loop
-		// never reads a norm, so needNorm is false. See resolveRow's doc
-		// comment for why that matters on a per-row scan like this one.
-		if vec, _, valid := cache.resolveRow(i, false); valid {
-			vectorCount++
-			l := len(vec)
-			lenCounts[l]++
-			if dims == 0 {
-				dims = l
-			}
-		}
-	}
-	distinctDims = len(lenCounts)
-	if dims != 0 {
-		excludedRows = vectorCount - lenCounts[dims]
-	}
+	shape := cache.columnShape()
+	vectorCount, dims, distinctDims, excludedRows = shape.vectors, shape.dims, shape.distinctDims, shape.excluded
 	if dims == 0 {
 		return rowCount, vectorCount, dims, distinctDims, excludedRows, nil
 	}
