@@ -33,6 +33,8 @@ make build-gh-pages-demo
 ```
 
 `make check-gh-pages-demo` validates existing output and its asset manifest.
+The build also regenerates `demo.mbtiles` and the matching tracked
+`tiles-demo-data.js` snapshot, so it may leave the snapshot modified.
 The [Pages workflow](../../.github/workflows/pages.yml) publishes from `main`
 and validates pull requests. Its package also includes the SQL function
 reference and, when available, the Bavaria snapshot from `gh-pages`.

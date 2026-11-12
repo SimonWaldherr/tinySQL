@@ -183,6 +183,7 @@ build-query-files-wasm:
 build-gh-pages-demo:
 	@echo "$(GREEN)Building gh-pages demo (incremental)...$(NC)"
 	@$(QUERY_FILES_WASM_SCRIPT) --if-needed --build-only
+	@$(GO) run -tags=sqliteimport ./cmd/mbtilesdemo
 	@$(MAKE) --no-print-directory check-gh-pages-demo
 	@echo "$(GREEN)✓ gh-pages demo artifacts ready$(NC)"
 
