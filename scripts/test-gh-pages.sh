@@ -42,6 +42,41 @@ expect_failure() {
     fi
 }
 
+# The Pages build must generate both demo assets before validating them.
+cat > "$TMP/fake-go" <<'GO'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$*" = 'run -tags=sqliteimport ./cmd/mbtilesdemo' ]
+echo generated >> "$PAGES_TEST_LOG"
+[ ! -e "$PAGES_TEST_FAIL" ]
+GO
+cat > "$TMP/fake-wasm-build" <<'WASM'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$*" = '--if-needed --build-only' ]
+echo wasm >> "$PAGES_TEST_LOG"
+WASM
+cat > "$TMP/fake-pages" <<'PAGES'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$*" = check ]
+echo checked >> "$PAGES_TEST_LOG"
+PAGES
+chmod +x "$TMP/fake-go" "$TMP/fake-wasm-build" "$TMP/fake-pages"
+export PAGES_TEST_LOG="$TMP/pages-build.log" PAGES_TEST_FAIL="$TMP/fail-generator"
+pages_build() {
+    make -s -C "$ROOT" build-gh-pages-demo GO="$TMP/fake-go" \
+        QUERY_FILES_WASM_SCRIPT="$TMP/fake-wasm-build" GH_PAGES_SCRIPT="$TMP/fake-pages" > /dev/null
+}
+pages_build
+printf 'wasm\ngenerated\nchecked\n' > "$TMP/expected-build.log"
+cmp "$TMP/expected-build.log" "$PAGES_TEST_LOG"
+: > "$PAGES_TEST_LOG"
+touch "$PAGES_TEST_FAIL"
+expect_failure pages_build
+printf 'wasm\ngenerated\n' > "$TMP/expected-build.log"
+cmp "$TMP/expected-build.log" "$PAGES_TEST_LOG"
+
 "$PAGES" stage "$TMP/staged"
 [ -f "$TMP/staged/.nojekyll" ]
 printf 'protected\n' > "$TMP/protected"
