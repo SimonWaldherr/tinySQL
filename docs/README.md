@@ -54,6 +54,8 @@ current behavior and keep performance claims scoped to the workload they measure
   filtering, evaluation, and operations.
 - [RAG optimization roadmap](rag-optimization-roadmap.md) — implemented baseline
   and planned retrieval work.
+- [IVF training](ivf-training-performance.md) — e-means research, reproducible
+  initialization, exact convergence and retrieval-quality measurements.
 - [Retrieval performance](retrieval-performance.md) — search-path measurements
   and links to focused RAG/GIS notes.
 - [Exact RAG postings](rag-postings-performance.md) and

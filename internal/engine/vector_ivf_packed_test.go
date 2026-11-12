@@ -32,10 +32,9 @@ func legacyIVFBuild(ctx context.Context, table *storage.Table, metric string, di
 	if len(rows) == 0 || nlist == 0 {
 		return idx, nil
 	}
-	idx.centroids = make([][]float64, nlist)
-	for c := range idx.centroids {
-		idx.centroids[c] = append([]float64(nil), cache.vector(rows[c*len(rows)/nlist])...)
-	}
+	// Share only the starting positions; keep the former full-pass training
+	// and append-grown lists as the reference for convergence and packing.
+	idx.centroids = seedIVFCentroids(rows, nlist, cache)
 	sums, counts := make([]float64, nlist*dims), make([]int, nlist)
 	needNorm := metricNeedsNorms(metric)
 	for range vecIVFKMeansIters {

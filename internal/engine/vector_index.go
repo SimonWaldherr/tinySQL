@@ -534,19 +534,15 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 		return idx, nil
 	}
 
-	// Seed centroids by taking nlist rows spread evenly across the (already
-	// arbitrary-ordered) row set, rather than the first nlist rows — cheap
-	// and avoids every centroid starting near-identical if the table happens
-	// to be sorted or clustered by insertion order.
-	idx.centroids = make([][]float64, nlist)
-	for i := range idx.centroids {
-		src := cache.vector(rows[(i*len(rows))/nlist])
-		idx.centroids[i] = append([]float64(nil), src...)
-	}
+	idx.centroids = seedIVFCentroids(rows, nlist, cache)
 	// Reuse the accumulation buffers across k-means iterations instead of
 	// reallocating nlist*dims floats per pass.
 	sums := make([]float64, nlist*dims)
 	counts := make([]int, nlist)
+	// Keep each pass's labels in the byte buffer needed for the final lists.
+	// If every centroid stays bit-identical, these labels are already exact.
+	assignments := make([]uint8, len(rows))
+	converged := false
 	// Resolved once: metric is fixed for the whole build, and resolveRow lets
 	// each row below pay for one overrides/segment lookup instead of separate
 	// cache.vector and cache.normAt lookups.
@@ -566,10 +562,12 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 			}
 			vec, norm, _ := cache.resolveRow(rowIdx, needNorm)
 			c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
+			assignments[i] = uint8(c)
 			counts[c]++
 			base := c * dims
 			search.VectorAccumulate(sums[base:base+dims], vec)
 		}
+		converged = true
 		for c := range idx.centroids {
 			// A centroid can end up with zero assigned rows this iteration
 			// (every row happened to be closer to some other centroid) —
@@ -584,33 +582,39 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 			inv := 1.0 / float64(counts[c])
 			base := c * dims
 			for d := 0; d < dims; d++ {
-				idx.centroids[c][d] = sums[base+d] * inv
+				next := sums[base+d] * inv
+				if math.Float64bits(next) != math.Float64bits(idx.centroids[c][d]) {
+					converged = false
+				}
+				idx.centroids[c][d] = next
 			}
+		}
+		if converged {
+			break
 		}
 	}
 
 	idx.centroidNorms = centroidNorms(idx.centroids)
 	idx.lists = make([][]int, nlist)
-	// Assign against the final centroids. The loop above assigns at the top of
-	// each iteration and moves the centroids at the bottom, so its last
-	// assignment predates the last move: building the lists from it would file
-	// rows under a centroid that is no longer their nearest, and search probing
-	// the correct centroid would then miss them.
+	// A moving final centroid invalidates its pass's labels; reassign unless
+	// the centroids stayed bit-identical. Convergence retains that pass's
+	// counts too, so the packed-list sizes always match the captured labels.
 	// There are at most 64 centroids. Keep their final assignments in bytes,
 	// then scatter rows stably into one exactly sized arena instead of growing
 	// every inverted list separately.
-	assignments := make([]uint8, len(rows))
-	clear(counts)
-	for i, rowIdx := range rows {
-		if i&1023 == 0 {
-			if err := checkCtx(ctx); err != nil {
-				return nil, err
+	if !converged {
+		clear(counts)
+		for i, rowIdx := range rows {
+			if i&1023 == 0 {
+				if err := checkCtx(ctx); err != nil {
+					return nil, err
+				}
 			}
+			vec, norm, _ := cache.resolveRow(rowIdx, needNorm)
+			c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
+			assignments[i] = uint8(c)
+			counts[c]++
 		}
-		vec, norm, _ := cache.resolveRow(rowIdx, needNorm)
-		c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
-		assignments[i] = uint8(c)
-		counts[c]++
 	}
 	listRows := make([]int, len(rows))
 	offset := 0
