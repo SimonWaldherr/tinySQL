@@ -442,7 +442,13 @@ func (db *DB) IsRBACEnabled() bool {
 	if db == nil {
 		return false
 	}
-	return db.Catalog().IsRBACEnabled()
+	db.catalogMu.RLock()
+	catalog := db.catalog
+	db.catalogMu.RUnlock()
+	if catalog == nil {
+		return false
+	}
+	return catalog.IsRBACEnabled()
 }
 
 // LockContentForRead acquires the database's content lock for a read-only

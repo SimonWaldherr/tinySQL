@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 )
 
 // subqueryCacheEntry holds the cached outcome for one *ExistsExpr,
@@ -54,15 +55,25 @@ type subqueryResultCache struct {
 	entries map[Expr]*subqueryCacheEntry
 }
 
-// newSubqueryResultCache returns an empty cache with entries left nil: most
-// statements (plain INSERT/UPDATE/DELETE with no WHERE subquery, and even
-// most SELECTs) never call evalCachedSubquery at all, so allocating the map
-// unconditionally on every statement execution charged every one of them a
-// map allocation nothing would ever read. Reads on a nil map are already
-// safe zero-value lookups; evalCachedSubquery allocates the map lazily on
-// its first actual write.
+var subqueryCachePool = sync.Pool{
+	New: func() any { return &subqueryResultCache{} },
+}
+
+// newSubqueryResultCache returns a cached or new subqueryResultCache.
+// Most statements never evaluate subqueries, so entries remains nil or is
+// cleared before returning to the pool.
 func newSubqueryResultCache() *subqueryResultCache {
-	return &subqueryResultCache{}
+	return subqueryCachePool.Get().(*subqueryResultCache)
+}
+
+func releaseSubqueryResultCache(c *subqueryResultCache) {
+	if c == nil {
+		return
+	}
+	if len(c.entries) > 0 {
+		clear(c.entries)
+	}
+	subqueryCachePool.Put(c)
 }
 
 // evalCachedSubquery runs sel -- the SELECT owned by node, an *ExistsExpr or

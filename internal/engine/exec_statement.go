@@ -128,7 +128,9 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 		}
 	}()
 
-	env := ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: newSubqueryResultCache(), dml: plan, procedureOverride: procedure, rollbackArmed: snapshot != nil}
+	cache := newSubqueryResultCache()
+	defer releaseSubqueryResultCache(cache)
+	env := ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: cache, dml: plan, procedureOverride: procedure, rollbackArmed: snapshot != nil}
 	var columnarHandled bool
 	if columns != nil {
 		columnarHandled, err = executeSimpleColumnarSelect(env, stmt.(*Select), columns)
