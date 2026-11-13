@@ -5,7 +5,7 @@ go 1.27.3
 require (
 	github.com/SimonWaldherr/tinySQL v0.51.0
 	github.com/microsoft/go-mssqldb v1.11.0
-	golang.org/x/crypto v0.58.0
+	golang.org/x/crypto v0.59.0
 )
 
 require (
