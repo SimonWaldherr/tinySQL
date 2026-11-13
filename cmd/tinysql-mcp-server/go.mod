@@ -5,7 +5,7 @@ go 1.27.3
 replace github.com/SimonWaldherr/tinySQL => ../../
 
 require (
-	github.com/SimonWaldherr/tinySQL v0.51.0
+	github.com/SimonWaldherr/tinySQL v0.72.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 )
 
@@ -21,7 +21,7 @@ require (
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
