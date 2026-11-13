@@ -87,7 +87,6 @@ func mergeFullVecHeaps(results []vecSearchWorkerResult, k, capacity int) ([]vecS
 		}
 	}
 	var runs [64][]vecScoredRow
-	var positions [64]int
 	var headStorage [64]vecMergeHead
 	heads := headStorage[:0]
 	for worker := range results {
@@ -96,10 +95,36 @@ func mergeFullVecHeaps(results []vecSearchWorkerResult, k, capacity int) ([]vecS
 			heads = append(heads, vecMergeHead{row: runs[worker][0], worker: worker})
 		}
 	}
+	// One or two active runs need no frontier heap.
+	if len(heads) <= 2 {
+		if len(heads) == 1 {
+			run := runs[heads[0].worker]
+			if cap(run) == len(run) {
+				// Transfer only a tight buffer. Clear empty worker headers too:
+				// their spare capacity may alias the returned run.
+				for worker := range results {
+					results[worker].heapRows = nil
+				}
+				return run, true
+			}
+			rows := make([]vecScoredRow, total)
+			copy(rows, run)
+			return rows, true
+		}
+		rows := make([]vecScoredRow, total)
+		mergeVecRuns(rows, runs[heads[0].worker], runs[heads[1].worker])
+		return rows, true
+	}
+	rows := make([]vecScoredRow, total)
+	mergeVecRunHeads(rows, runs[:len(results)], heads)
+	return rows, true
+}
+
+func mergeVecRunHeads(rows []vecScoredRow, runs [][]vecScoredRow, heads []vecMergeHead) {
+	var positions [64]int
 	for parent := len(heads)/2 - 1; parent >= 0; parent-- {
 		vecMergeHeadDown(heads, parent)
 	}
-	rows := make([]vecScoredRow, total)
 	for pos := range rows {
 		head := heads[0]
 		rows[pos] = head.row
@@ -112,7 +137,22 @@ func mergeFullVecHeaps(results []vecSearchWorkerResult, k, capacity int) ([]vecS
 		}
 		vecMergeHeadDown(heads, 0)
 	}
-	return rows, true
+}
+
+func mergeVecRuns(rows, left, right []vecScoredRow) {
+	pos := 0
+	for len(left) != 0 && len(right) != 0 {
+		if vecScoredRowLess(right[0], left[0]) {
+			rows[pos] = right[0]
+			right = right[1:]
+		} else {
+			rows[pos] = left[0]
+			left = left[1:]
+		}
+		pos++
+	}
+	pos += copy(rows[pos:], left)
+	copy(rows[pos:], right)
 }
 
 func vecMergeHeadDown(heads []vecMergeHead, parent int) {

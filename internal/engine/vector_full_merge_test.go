@@ -109,18 +109,64 @@ func TestVectorFullMergePreservesResults(t *testing.T) {
 }
 
 func TestVectorFullMergeSparseWorkers(t *testing.T) {
-	results := vectorFullMergeFixture(2048, 4, "random")
-	results[0].heapRows = nil
-	results[2].heapRows = nil
-	want, err := legacyVecMerge(cloneVecWorkerResults(results), 2048, 2048)
-	if err != nil {
-		t.Fatal(err)
+	for _, active := range [][]int{{1}, {0, 3}, {1, 3}, {0, 1, 3}} {
+		t.Run(fmt.Sprint(active), func(t *testing.T) {
+			results := vectorFullMergeFixture(4096, 4, "random")
+			for worker := range results {
+				if !slices.Contains(active, worker) {
+					results[worker].heapRows = nil
+				}
+			}
+			want, err := legacyVecMerge(cloneVecWorkerResults(results), 4096, 4096)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := mergeFullVecHeaps(results, 4096, 4096)
+			if !ok || len(got) != len(active)*1024 || cap(got) != len(got) {
+				t.Fatalf("sparse merge: %d/%d, optimized=%v", len(got), cap(got), ok)
+			}
+			assertVecResultBits(t, got, want)
+		})
 	}
-	got, ok := mergeFullVecHeaps(results, 2048, 2048)
-	if !ok || len(got) != 1024 || cap(got) != 1024 {
-		t.Fatalf("sparse merge: %d/%d, optimized=%v", len(got), cap(got), ok)
+}
+
+func TestVectorFullMergeSingleRunOwnership(t *testing.T) {
+	for _, spareCapacity := range []bool{false, true} {
+		t.Run(fmt.Sprintf("spare%t", spareCapacity), func(t *testing.T) {
+			fixture := vectorFullMergeFixture(4096, 4, "random")
+			heap := fixture[1].heapRows
+			if spareCapacity {
+				buffer := make(vecScoredHeap, len(heap), len(heap)*2)
+				copy(buffer, heap)
+				heap = buffer
+			}
+			results := []vecSearchWorkerResult{
+				{heapRows: heap[:0]}, // An empty worker can still alias the active run.
+				{heapRows: heap},
+				{heapRows: make(vecScoredHeap, 0, 8)},
+				{},
+			}
+			want, err := legacyVecMerge(cloneVecWorkerResults(results), 4096, 4096)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := mergeFullVecHeaps(results, 4096, 4096)
+			if !ok || cap(got) != len(want) {
+				t.Fatalf("single run: optimized=%v, cap=%d, want %d", ok, cap(got), len(want))
+			}
+			assertVecResultBits(t, got, want)
+			if reused := &got[0] == &heap[0]; reused == spareCapacity {
+				t.Fatalf("buffer reused=%v, spare capacity=%v", reused, spareCapacity)
+			}
+			for worker := range results {
+				if !spareCapacity && results[worker].heapRows != nil {
+					t.Fatal("ownership transfer retained a worker buffer")
+				}
+				vecScoredHeapPush(&results[worker].heapRows, vecScoredRow{rowIdx: -1, distance: -999})
+			}
+			assertVecResultBits(t, got, want)
+		})
 	}
-	assertVecResultBits(t, got, want)
 }
 
 func TestVectorFullMergeFallbacks(t *testing.T) {

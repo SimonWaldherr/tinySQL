@@ -68,8 +68,15 @@ unused capacity when NULLs, filters or mixed dimensions exclude source rows.
 If the previous merge could reuse its first worker buffer without allocation,
 that reuse still takes priority.
 
-The frontier, run slices and positions use bounded local arrays. There is one
-output allocation and no per-row state beyond existing scored rows. NaNs,
+One active worker run transfers its buffer when capacity equals length; empty
+worker headers are cleared too, so their spare capacity cannot overwrite the
+returned result. Oversized buffers are copied into a tightly sized output.
+Two active runs use a direct two-way merge followed by a block copy of the
+remaining tail. Larger worker sets continue to use the frontier heap.
+
+The frontier, run slices and positions use bounded local arrays. Multiple runs
+need one output allocation; transferring a single tight buffer needs none.
+There is no per-row state beyond existing scored rows. NaNs,
 negative zero, invalid heaps and overlapping row ranges use the previous merge
 to retain its bit-level behavior and avoid reordering aliased worker buffers.
 These changes do not alter distance calculations or select fewer candidates.
@@ -159,14 +166,14 @@ controls changed by less than 2% in these runs.
 
 Focused merge benchmarks over 8,192 valid results retain one 131,072-byte
 allocation with two or eight workers. A sparse-worker regression case verifies
-that 1,024 accepted results reserve 1,024 entries rather than 2,048 source rows.
+that 1,024 accepted results reserve 1,024 entries rather than 4,096 source rows.
 The fixtures and pre-change references are available in
 `vector_result_sort_benchmark_test.go` and `vector_full_merge_benchmark_test.go`:
 
 ```sh
 go test ./internal/engine -run 'TestVector(FullMerge|ResultSort)' -count=1
 GOMAXPROCS=2 go test ./internal/engine -run '^$' \
-  -bench '^BenchmarkVector(ResultSort|FullMerge|ParallelHeapMerge)$' \
+  -bench '^BenchmarkVector(ResultSort|FullMerge|SparseMerge|ParallelHeapMerge)$' \
   -benchtime=150ms -count=5 -benchmem
 ```
 
@@ -178,3 +185,46 @@ Both complete native profiles passed on an isolated copy of HEAD with only
 these engine changes applied. Targeted race and Go 1.27.3 checks, Vet and
 documentation checks passed too. The new ordering and ownership tests also
 passed under `js/wasm`; full/minimal browser and Node integration checks passed.
+
+### Direct merge follow-up
+
+Compared with `a40b704` on the same machine and toolchain, the one/two-run
+dispatch avoids maintaining the frontier's positions and root for each result.
+The general frontier loop now lives in a separate routine. Output ownership,
+row-ID tie breaking and all eligibility/fallback checks are unchanged.
+
+These process CPU-time medians come from five runs, each alternating 50
+old/new batches of five merges over restored, identical worker heaps.
+
+| Two active workers | Before CPU time | After CPU time |
+|---|---:|---:|
+| 1,024 random scores | 41.936 µs | 36.604 µs |
+| 8,192 random scores | 644.404 µs | 599.348 µs |
+| 8,192 tied scores | 606.224 µs | 582.324 µs |
+| 8,192 descending scores | 70.848 µs | 52.352 µs |
+
+Across all six two-worker cases, savings were 3–36%. Eight-worker controls with
+8,192 results varied from 2.2% faster to 0.8% slower. At 1,024 results those
+controls varied from 2.3% faster to 4.8% slower (up to 1.6 µs more CPU time).
+The optimization therefore benefits two active runs; it is not a general
+speedup for every worker count. These are merge-phase measurements, including
+input restoration and final ordering, rather than total RAG query timings.
+
+The 8,192-result fixtures retain one 131,072-byte output allocation. The native
+suite, targeted minimal/race and WebAssembly ordering tests, Vet and documentation
+link checks passed. Sparse-worker tests cover one, two and three active runs,
+including gaps in worker IDs, and compare result bits with the previous merge.
+
+### Single-run ownership follow-up
+
+The direct-merge measurements above precede the single-run ownership transfer.
+Against that implementation, `BenchmarkVectorSparseMerge` with four workers,
+4,096 source candidates and one full 1,024-row run reduces merge allocations
+from **16,384 B/op and one allocation to 0 B/op and zero allocations**. Three
+runs of 100 iterations each gave the same allocation counts. Timing claims are
+omitted because host load varied between runs.
+
+A run with spare capacity still copies into a 16,384-byte result, and two active
+runs retain one 32,768-byte allocation. The ownership regression test checks
+buffer reuse, oversized-buffer refusal and empty slices that alias the active
+run. Reusing any worker header after the merge must leave returned rows intact.
