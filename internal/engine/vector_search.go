@@ -1001,6 +1001,13 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 
 func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {
 	scoredRows := newScoredHeap(k, end-start)
+	if k >= vecTopKBatchMin && end-start >= vecTopKBatchMin {
+		var err error
+		start, err = fillVecTopKBatch(ctx, start, end, queryLen, k, &cache, distFn, needNorm, scoredRows)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if cache.directScanSegments(start, end) {
 		for _, segment := range cache.segments {
 			from := max(start, segment.start)

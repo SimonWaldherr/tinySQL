@@ -547,6 +547,7 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 	// final assignment. Contiguous caches can index vectors directly.
 	needNorm := metricNeedsNorms(metric)
 	resolver := newVecRowResolver(&cache, needNorm)
+	pruneL2 := metric == "l2" && dims >= ivfL2PruneMinDims && nlist >= ivfL2PruneMinCentroids
 	for iter := 0; iter < vecIVFKMeansIters; iter++ {
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
@@ -565,7 +566,12 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 				}
 			}
 			vec, norm, _ := resolver.resolve(rowIdx)
-			c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
+			var c int
+			if pruneL2 && iter > 0 {
+				c = nearestCentroidL2Pruned(vec, idx.centroids, int(assignments[i]))
+			} else {
+				c = nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
+			}
 			assignments[i] = uint8(c)
 			counts[c]++
 			base := c * dims
@@ -615,7 +621,12 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 				}
 			}
 			vec, norm, _ := resolver.resolve(rowIdx)
-			c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
+			var c int
+			if pruneL2 {
+				c = nearestCentroidL2Pruned(vec, idx.centroids, int(assignments[i]))
+			} else {
+				c = nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
+			}
 			assignments[i] = uint8(c)
 			counts[c]++
 		}
