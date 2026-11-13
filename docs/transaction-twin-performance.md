@@ -89,8 +89,9 @@ written only by autocommit statements or never written keep no twin.
 
 ## Still proportional to something
 
-* `BEGIN` costs about 0.25 µs and 0.5 KB per table in the database (133 µs for
-  500 tables): each table is pinned and recorded individually.
+* `BEGIN` is linear in the number of tables in the database: each table is
+  pinned and recorded individually. See the 2026-11-12 follow-up below for the
+  current cost.
 * The PRIMARY KEY / UNIQUE overlay a transaction's copy borrows is folded into a
   flat map every `max(1024, rows/32)` new keys; that is the 76 KB/op of the
   100,000-row INSERT above.
@@ -202,3 +203,56 @@ GOMAXPROCS=2 go test ./internal/storage -run '^$' \
 GOMAXPROCS=2 go test ./internal/engine -run '^$' \
   -bench '^BenchmarkConstraintBorrowRefusal$' -benchmem -benchtime=100x -count=3
 ```
+
+## Follow-up: what BEGIN builds (2026-11-12)
+
+After the changes above, most of what a one-row transaction still allocated
+was `BEGIN` itself: about 70 of the 108 allocations of a read-only transaction.
+
+* **The catalog image is cached while the catalog is at rest**
+  (`CatalogManager.beginSnapshot`). Every `BEGIN` encoded and sorted the whole
+  catalog to build the transaction's private copy. The image is now kept with
+  the revision it was read at and reused until a mutation bumps the revision;
+  every catalog mutator bumps it before releasing the write lock. Transactions
+  still get a private catalog decoded from the image, so their DDL cannot reach
+  it. Autocommit DML takes the catalog's write lock and therefore invalidates
+  the image; a workload that alternates autocommit writes with transactions
+  rebuilds it as before.
+* **Snapshots are built in a bare database** (`newShadowDB`). `NewDB` creates an
+  MVCC manager and two extension registries; the snapshot replaced the first
+  with the live one and almost never touches the others, which are now created
+  on first use.
+* **The conflict base no longer allocates a record per table.** While a
+  transaction pins a table, that table cannot change, so the base points at the
+  live table itself. The Version is frozen into a stub only when the transaction
+  gives up the pin, which is its first write to that table
+  (`DB.recordBaseVersion`).
+* **A shared table is pinned once, not twice.** The shadow used to count every
+  shared table in its own pin map as well as in the live database's.
+  `IsTablePinnedForStream` and `DetachAllPinnedForWrite` now consult the
+  shadow's shared set directly.
+
+Before is `a793de2` in a clean worktree, after is this change; same benchmark
+binaries run alternately three times, `-benchtime=60000x` (5000x for 500
+tables). The machine was under heavy unrelated load during these runs, so the
+times are only good for the ratio between neighbouring rows; bytes and
+allocations are exact.
+
+| Benchmark (tinySQL/mem, 10,000 rows) | Before | After | Bytes/op | Allocs/op |
+|---|---:|---:|---:|---:|
+| Read-only transaction | 12.1–12.9 µs | 9.4–11.0 µs | 7.7 KB → 5.8 KB | 108 → 77 |
+| UPDATE one row by PK | 16.7–18.9 µs | 13.2–17.4 µs | 11.5 KB → 10.0 KB | 136 → 105 |
+| INSERT one row | 16.8–21.1 µs | 13.2–16.2 µs | 12.6 KB → 11.1 KB | 120 → 90 |
+| Read-only transaction, 500 tables | 290–312 µs | 120–160 µs | 259 KB → 79 KB | 616 → 81 |
+
+`BEGIN` still fills two maps and one pin count per table, so it remains linear
+in the number of tables, at well under half the previous cost. What is left of
+its fixed cost is decoding the private catalog (about 25 allocations).
+
+Tests: `TestSharedBaseKeepsBeginVersionAfterPrivateCopy` and
+`TestBeginCatalogImageIsReusedUntilCatalogChanges` in
+`internal/storage/tx_share_test.go`; `TestBeginCatalogImageInvalidatesAfterRBACWrite`
+also checks invalidation through the separate RBAC write lock and isolation of
+the previous image. The existing pin, conflict and
+catalog-visibility tests in `internal/storage` and `internal/driver` cover the
+rest.

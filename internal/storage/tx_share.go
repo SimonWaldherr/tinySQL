@@ -46,8 +46,8 @@ func (db *DB) SnapshotForTxShared() (base, shadow *DB, release func()) {
 		base, shadow = db.SnapshotForTx()
 		return base, shadow, func() {}
 	}
-	base = NewDB()
-	shadow = NewDB()
+	base = newShadowDB()
+	shadow = newShadowDB()
 	// The shadow needs the full schema and a private catalog; the base is only
 	// read for table identity and Version. See SnapshotForTx.
 	db.copyRuntimeState(shadow, true)
@@ -62,7 +62,7 @@ func (db *DB) SnapshotForReadTxShared() (shadow *DB, release func()) {
 	if !db.canShareTablesWithTx() {
 		return db.SnapshotForReadTx(), func() {}
 	}
-	shadow = NewDB()
+	shadow = newShadowDB()
 	db.copyRuntimeState(shadow, true)
 	markShadow(shadow)
 	return shadow, db.shareTablesInto(shadow, nil)
@@ -80,9 +80,7 @@ func (db *DB) shareTablesInto(shadow, base *DB) (release func()) {
 		count += len(tdb.tables)
 	}
 	shadow.txShared = make(map[*Table]*DB, count)
-	if shadow.streamSnapshots == nil {
-		shadow.streamSnapshots = make(map[*Table]uint32, count)
-	}
+	shadow.txBase = base
 	db.streamSnapshotMu.Lock()
 	if db.streamSnapshots == nil {
 		db.streamSnapshots = make(map[*Table]uint32, count)
@@ -100,11 +98,14 @@ func (db *DB) shareTablesInto(shadow, base *DB) (release func()) {
 		}
 		for key, t := range tdb.tables {
 			if base != nil {
-				baseTables[key] = versionStub(t)
+				// A pinned table cannot change, so while the shadow shares
+				// it the live table is its own record of the Version it had
+				// at BEGIN. recordBaseVersion swaps in a stub when the
+				// shadow gives up the pin.
+				baseTables[key] = t
 			}
 			shadowTables[key] = t
 			shadow.txShared[t] = db
-			shadow.streamSnapshots[t]++
 			db.streamSnapshots[t]++
 		}
 	}
@@ -113,6 +114,20 @@ func (db *DB) shareTablesInto(shadow, base *DB) (release func()) {
 
 	var once sync.Once
 	return func() { once.Do(shadow.releaseSharedTables) }
+}
+
+// recordBaseVersion freezes, in this shadow's conflict-detection base, the
+// Version of a shared table the shadow is about to stop pinning. Until then the
+// base points at the live table itself; once the pin is gone that table may be
+// changed by other writers, so the base keeps a stub instead. The caller still
+// holds the pin.
+func (db *DB) recordBaseVersion(tenant, key string, t *Table) {
+	if db.txBase == nil {
+		return
+	}
+	if td := db.txBase.getTenantRO(tenant); td != nil && td.tables[key] == t {
+		td.tables[key] = versionStub(t)
+	}
 }
 
 // versionStub is the conflict-detection base's record of a table: its name and
@@ -140,9 +155,6 @@ func (db *DB) releaseSharedTables() {
 	db.txShared = nil
 	private := db.txPrivate
 	db.txPrivate = nil
-	for t := range remaining {
-		db.unpinLocked(t)
-	}
 	db.streamSnapshotMu.Unlock()
 	// Copies the transaction made but did not commit hand their unused twins
 	// back; a committed copy has no origin left and is skipped.
@@ -170,6 +182,17 @@ func (db *DB) unpinLocked(t *Table) {
 	}
 }
 
+// pinnedLocked reports whether t must not be written in place: a stream reads
+// it, or it is a table this transaction shadow still shares with the database
+// it was taken from. The caller holds streamSnapshotMu.
+func (db *DB) pinnedLocked(t *Table) bool {
+	if db.streamSnapshots[t] != 0 {
+		return true
+	}
+	_, shared := db.txShared[t]
+	return shared
+}
+
 // isTxShared reports whether t is still shared with the database this
 // transaction shadow was taken from, which means the transaction has not
 // written it.
@@ -184,8 +207,8 @@ func (db *DB) isTxShared(t *Table) bool {
 }
 
 // takeTxShared reports whether t is a table this shadow still shares with its
-// source and, if so, removes it from the shared set together with the shadow's
-// own pin. It returns the source database, whose pin the caller must release
+// source and, if so, removes it from the shared set. It returns the source
+// database, whose pin the caller must release
 // after installing a private copy.
 func (db *DB) takeTxShared(t *Table) (*DB, bool) {
 	db.streamSnapshotMu.Lock()
@@ -195,7 +218,6 @@ func (db *DB) takeTxShared(t *Table) (*DB, bool) {
 		return nil, false
 	}
 	delete(db.txShared, t)
-	db.unpinLocked(t)
 	return src, true
 }
 
@@ -227,10 +249,10 @@ func (db *DB) DetachAllPinnedForWrite() {
 	var pinned []ref
 	db.mu.RLock()
 	db.streamSnapshotMu.Lock()
-	if len(db.streamSnapshots) > 0 {
+	if len(db.streamSnapshots) > 0 || len(db.txShared) > 0 {
 		for tn, tdb := range db.tenants {
 			for _, t := range tdb.tables {
-				if db.streamSnapshots[t] != 0 {
+				if db.pinnedLocked(t) {
 					pinned = append(pinned, ref{tn, t.Name})
 				}
 			}

@@ -29,6 +29,14 @@ func NewDB() *DB {
 	}
 }
 
+// newShadowDB returns the empty database a transaction snapshot is built in. It
+// leaves out what copyRuntimeState replaces anyway (the MVCC manager) and what
+// a snapshot rarely needs (the extension registries, created on first use):
+// together they were a dozen allocations on every BEGIN.
+func newShadowDB() *DB {
+	return &DB{tenants: map[string]*tenantDB{}, storageMode: ModeMemory}
+}
+
 // applyEncryptionKey enables AES-256-GCM encryption at rest on backend when
 // key is non-empty, validating its length immediately with a clear error —
 // rather than letting a wrong-size key surface later as an opaque failure

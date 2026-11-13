@@ -235,3 +235,113 @@ func TestBorrowedSecondaryIndexIsCopyOnWrite(t *testing.T) {
 		t.Fatalf("transaction index saw the live insert: %d", got)
 	}
 }
+
+// The conflict-detection base points at the live table while the shadow pins
+// it, and must hold on to the BEGIN-time Version once the shadow gives the pin
+// up: from then on other writers change the live table in place.
+func TestSharedBaseKeepsBeginVersionAfterPrivateCopy(t *testing.T) {
+	db, big, small := newSharedTestDB(t)
+	base, shadow, release := takeShared(t, db)
+	defer release()
+
+	if !shadow.DetachPinnedTableForWrite("default", "big") {
+		t.Fatal("first write did not detach the shared table")
+	}
+	// The pin is gone, so a live writer now updates the table in place.
+	if db.DetachPinnedTableForWrite("default", "big") {
+		t.Fatal("live table is still pinned after the shadow took its copy")
+	}
+	big.Rows[0] = []any{0, "changed by another connection"}
+	big.Version++
+
+	recorded, err := base.Get("default", "big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorded == big {
+		t.Fatal("base still aliases the live table after the pin was released")
+	}
+	if recorded.Version != 3 {
+		t.Fatalf("base Version = %d, want the BEGIN-time 3", recorded.Version)
+	}
+	// A table the shadow never wrote stays pinned and is its own record.
+	untouched, err := base.Get("default", "small")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if untouched != small || !db.IsTablePinnedForStream(small) {
+		t.Fatal("an unwritten table must stay pinned and shared with the base")
+	}
+	changes := CollectWALChanges(base, shadow)
+	if len(changes) != 0 {
+		t.Fatalf("a private copy that was not written produced %d changes", len(changes))
+	}
+}
+
+// BEGIN reuses the catalog image while the catalog is at rest, rebuilds it after
+// any mutation, and no transaction can reach the shared image through its
+// private catalog.
+func TestBeginCatalogImageIsReusedUntilCatalogChanges(t *testing.T) {
+	db, _, _ := newSharedTestDB(t)
+	if err := db.Catalog().RegisterView("main", "v1", "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	begin := func() (*DB, func()) {
+		db.LockContentForRead()
+		defer db.UnlockContentForRead()
+		_, shadow, release := db.SnapshotForTxShared()
+		return shadow, release
+	}
+	first, release1 := begin()
+	second, release2 := begin()
+	image := db.Catalog().beginImage.Load()
+	if image == nil || first.beginCatalog.Load() != image.snapshot || second.beginCatalog.Load() != image.snapshot {
+		t.Fatal("two BEGINs over an unchanged catalog did not share one image")
+	}
+	// A transaction's catalog work stays on its private copy.
+	if err := first.Catalog().RegisterView("main", "v_private", "SELECT 2"); err != nil {
+		t.Fatal(err)
+	}
+	if !second.BeginCatalogSnapshot().Equal(db.SnapshotCatalog()) {
+		t.Fatal("the shared image changed when a transaction changed its private catalog")
+	}
+	if first.SnapshotCatalog().Equal(first.BeginCatalogSnapshot()) {
+		t.Fatal("the private catalog change is not visible to its own transaction")
+	}
+	release1()
+	release2()
+
+	if err := db.Catalog().RegisterView("main", "v2", "SELECT 3"); err != nil {
+		t.Fatal(err)
+	}
+	third, release3 := begin()
+	defer release3()
+	if third.beginCatalog.Load() == image.snapshot {
+		t.Fatal("BEGIN reused a catalog image from before a catalog mutation")
+	}
+	if !third.BeginCatalogSnapshot().Equal(db.SnapshotCatalog()) {
+		t.Fatal("BEGIN after a catalog mutation does not see it")
+	}
+}
+
+func TestBeginCatalogImageInvalidatesAfterRBACWrite(t *testing.T) {
+	catalog := NewCatalogManager()
+	before := catalog.beginSnapshot()
+	if err := catalog.CreateRole("reader"); err != nil {
+		t.Fatal(err)
+	}
+	after := catalog.beginSnapshot()
+	if after == before {
+		t.Fatal("RBAC mutation reused the previous catalog image")
+	}
+	if roles := diskToCatalog(before.dc).ListRoles(); len(roles) != 0 {
+		t.Fatalf("previous image changed: %v", roles)
+	}
+	roles := diskToCatalog(after.dc).ListRoles()
+	if len(roles) != 1 || roles[0].Name != "reader" {
+		t.Fatalf("new image lost the role: %v", roles)
+	}
+	if catalog.beginSnapshot() != after {
+		t.Fatal("unchanged RBAC catalog did not reuse its image")
+	}
+}

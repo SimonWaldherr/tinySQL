@@ -86,6 +86,7 @@ func (db *DB) detachPinnedTable(tenant, name string, schemaWrite bool) bool {
 	// also be reading it keep their own pins, which stay valid on the old
 	// instance.
 	if src, shared := db.takeTxShared(table); shared {
+		db.recordBaseVersion(tenant, key, table)
 		private := privateCopyOfShared(src, table, schemaWrite)
 		tenantDB.tables[key] = private
 		db.streamSnapshotMu.Lock()
@@ -121,7 +122,7 @@ func (db *DB) IsTablePinnedForStream(table *Table) bool {
 		return false
 	}
 	db.streamSnapshotMu.Lock()
-	pinned := db.streamSnapshots[table] != 0
+	pinned := db.pinnedLocked(table)
 	db.streamSnapshotMu.Unlock()
 	return pinned
 }

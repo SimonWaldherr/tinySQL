@@ -84,6 +84,9 @@ func (db *DB) Use(extension Extension) error {
 		db.extensionsMu.Unlock()
 		return fmt.Errorf("extension %q is already being activated", info.Name)
 	}
+	if db.loadingExtensions == nil {
+		db.loadingExtensions = map[string]struct{}{}
+	}
 	db.loadingExtensions[key] = struct{}{}
 	db.extensionsMu.Unlock()
 
@@ -96,6 +99,9 @@ func (db *DB) Use(extension Extension) error {
 		return fmt.Errorf("activate extension %q: %w", info.Name, err)
 	}
 	info.LoadedAt = time.Now().UTC()
+	if db.extensions == nil {
+		db.extensions = map[string]ExtensionInfo{}
+	}
 	db.extensions[key] = cloneExtensionInfo(info)
 	return nil
 }

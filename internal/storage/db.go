@@ -104,6 +104,9 @@ type DB struct {
 	// streamSnapshots) until the shadow takes a private copy of it or the
 	// transaction ends. Protected by streamSnapshotMu.
 	txShared map[*Table]*DB
+	// txBase is the conflict-detection base that belongs to this transaction
+	// shadow, or nil for a read-only one. See shareTablesInto.
+	txBase *DB
 	// beginCatalog is the immutable image a transaction shadow's private
 	// catalog was built from. Promotion releases it; ordinary deep clones
 	// do not retain it. See BeginCatalogSnapshot.
@@ -323,11 +326,11 @@ func (db *DB) copyRuntimeState(out *DB, isolateCatalog bool) {
 	if isolateCatalog {
 		// Decoding rebuilds private maps and slices from the image, which
 		// also records the catalog contents at construction time.
-		image := catalogToDisk(live)
-		copied := diskToCatalog(image)
+		image := live.beginSnapshot()
+		copied := diskToCatalog(image.dc)
 		copied.setRevision(live.Revision())
 		out.setCatalog(copied)
-		out.beginCatalog.Store(&CatalogSnapshot{dc: image})
+		out.beginCatalog.Store(image)
 	} else {
 		out.setCatalog(live)
 	}

@@ -64,7 +64,10 @@ type CatalogManager struct {
 	// changes were silently dropped at COMMIT, since only tables were
 	// merged. Every write goes through lockWrite/unlockWrite (or the RBAC
 	// pair), so a newly added mutator cannot forget to bump it.
-	revision      atomic.Uint64
+	revision atomic.Uint64
+	// beginImage caches the catalog image the last BEGIN built, with the
+	// revision it describes. See beginSnapshot.
+	beginImage    atomic.Pointer[catalogBeginImage]
 	tables        map[string]*CatalogTable
 	columns       map[string][]CatalogColumn
 	views         map[string]*CatalogView
@@ -159,6 +162,36 @@ func (c *CatalogManager) setRevision(v uint64) {
 		return
 	}
 	c.revision.Store(v)
+}
+
+// catalogBeginImage is a catalog image together with the revision it was read
+// at. The image is never modified after it is built.
+type catalogBeginImage struct {
+	revision uint64
+	snapshot *CatalogSnapshot
+}
+
+// beginSnapshot returns the catalog's contents as an image that must be treated
+// as read-only, reusing the image of the previous call while the catalog has
+// not been mutated since. Every BEGIN needs one, both to build the
+// transaction's private catalog and to tell at COMMIT whether the transaction
+// changed it; a database whose schema is at rest was re-encoding and sorting
+// the same catalog for every transaction.
+//
+// Every mutator bumps revision before it releases the catalog's write lock
+// (unlockWrite, unlockRBACWrite), so an image is stored only when no mutation
+// completed while it was read, and is handed out only while revision still has
+// that value.
+func (c *CatalogManager) beginSnapshot() *CatalogSnapshot {
+	revision := c.revision.Load()
+	if cached := c.beginImage.Load(); cached != nil && cached.revision == revision {
+		return cached.snapshot
+	}
+	snapshot := &CatalogSnapshot{dc: catalogToDisk(c)}
+	if c.revision.Load() == revision {
+		c.beginImage.Store(&catalogBeginImage{revision: revision, snapshot: snapshot})
+	}
+	return snapshot
 }
 
 // NewCatalogManager allocates and returns an initialized CatalogManager.
