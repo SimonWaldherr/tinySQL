@@ -1291,7 +1291,7 @@ func buildCompiledGlobFilter(colIdx int, pattern string, caseInsensitive, negate
 }
 
 // buildInFilter builds a fast set-membership closure for col IN (litVals).
-// A single value reuses a literal comparison; larger lists use typed maps.
+// Small lists use direct comparisons; larger lists use typed maps.
 func buildInFilter(colIdx int, litVals []any, negate bool) func([]any) (bool, error) {
 	if len(litVals) == 1 {
 		op := "="
@@ -1299,6 +1299,11 @@ func buildInFilter(colIdx int, litVals []any, negate bool) func([]any) (bool, er
 			op = "!="
 		}
 		return buildColLiteralFilter(colIdx, op, litVals[0])
+	}
+	if len(litVals) <= 4 {
+		if filter := buildSmallInFilter(colIdx, litVals, negate); filter != nil {
+			return filter
+		}
 	}
 	hasNull := false
 	// Absent domains need no set; their nil-map lookups simply do not match.

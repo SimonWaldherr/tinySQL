@@ -25,6 +25,14 @@ func selectIndexChoices(table *storage.Table, colIndex map[string]int, where Exp
 		if ex.Negate {
 			return nil, false, nil
 		}
+		if ref, ok := ex.Expr.(*VarRef); ok && len(table.Indexes) == 0 {
+			if pos, found := colIndex[strings.ToLower(ref.Name)]; found && pos >= 0 && pos < len(table.Cols) {
+				constraint := table.Cols[pos].Constraint
+				if constraint != storage.PrimaryKey && constraint != storage.Unique {
+					return nil, false, nil
+				}
+			}
+		}
 	case *Binary:
 		if ex.Op != "OR" {
 			return nil, false, nil
@@ -120,7 +128,11 @@ func collectIndexChoices(expr Expr, out *[]*Binary) bool {
 			if _, ok := value.(*Literal); !ok {
 				return false
 			}
-			*out = append(*out, &Binary{Op: "=", Left: ex.Expr, Right: value})
+		}
+		choices := make([]Binary, len(ex.Values))
+		for i, value := range ex.Values {
+			choices[i] = Binary{Op: "=", Left: ex.Expr, Right: value}
+			*out = append(*out, &choices[i])
 		}
 		return true
 	default:
