@@ -543,15 +543,19 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 	// If every centroid stays bit-identical, these labels are already exact.
 	assignments := make([]uint8, len(rows))
 	converged := false
-	// Resolved once: metric is fixed for the whole build, and resolveRow lets
-	// each row below pay for one overrides/segment lookup instead of separate
-	// cache.vector and cache.normAt lookups.
+	// Resolve the metric and cache layout once for every training pass and
+	// final assignment. Contiguous caches can index vectors directly.
 	needNorm := metricNeedsNorms(metric)
+	resolver := newVecRowResolver(&cache, needNorm)
 	for iter := 0; iter < vecIVFKMeansIters; iter++ {
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
 		}
-		idx.centroidNorms = centroidNormsFor(metric, idx.centroids)
+		if iter == 0 {
+			idx.centroidNorms = centroidNormsFor(metric, idx.centroids)
+		} else if needNorm {
+			fillCentroidNorms(idx.centroidNorms, idx.centroids)
+		}
 		clear(sums)
 		clear(counts)
 		for i, rowIdx := range rows {
@@ -560,7 +564,7 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 					return nil, err
 				}
 			}
-			vec, norm, _ := cache.resolveRow(rowIdx, needNorm)
+			vec, norm, _ := resolver.resolve(rowIdx)
 			c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
 			assignments[i] = uint8(c)
 			counts[c]++
@@ -594,7 +598,7 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 		}
 	}
 
-	idx.centroidNorms = centroidNorms(idx.centroids)
+	fillCentroidNorms(idx.centroidNorms, idx.centroids)
 	idx.lists = make([][]int, nlist)
 	// A moving final centroid invalidates its pass's labels; reassign unless
 	// the centroids stayed bit-identical. Convergence retains that pass's
@@ -610,7 +614,7 @@ func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, 
 					return nil, err
 				}
 			}
-			vec, norm, _ := cache.resolveRow(rowIdx, needNorm)
+			vec, norm, _ := resolver.resolve(rowIdx)
 			c := nearestCentroid(metric, vec, norm, idx.centroids, idx.centroidNorms)
 			assignments[i] = uint8(c)
 			counts[c]++
@@ -652,7 +656,13 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 	// flat and hnsw returned k.
 	// Only the nearest probes are normally consumed. Heapify all candidates
 	// once, then pop them as needed instead of fully sorting every centroid.
-	centroidHeap := make(vecMinScoredHeap, 0, len(idx.centroids))
+	// Production indexes have at most 64 centroids. Their per-query frontier
+	// fits on the stack; larger hand-built indexes keep the dynamic path.
+	var centroidScratch [64]vecScoredRow
+	centroidHeap := vecMinScoredHeap(centroidScratch[:0])
+	if len(idx.centroids) > len(centroidScratch) {
+		centroidHeap = make(vecMinScoredHeap, 0, len(idx.centroids))
+	}
 	kind := vecMetricKind(idx.metric)
 	for i, c := range idx.centroids {
 		// Selecting which centroids to probe, not a value ever exposed to a
@@ -675,7 +685,13 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 		if probed >= probes && resultHeap.Len() >= k {
 			break
 		}
-		c := vecMinHeapPop(&centroidHeap)
+		// Pop locally: passing the slice by pointer to vecMinHeapPop would
+		// make the stack frontier escape through its slice assignment.
+		last := len(centroidHeap) - 1
+		centroidHeap.Swap(0, last)
+		vecMinHeapDown(centroidHeap[:last], 0)
+		c := centroidHeap[last]
+		centroidHeap = centroidHeap[:last]
 		list := idx.lists[c.rowIdx]
 		for i, rowIdx := range list {
 			if i&1023 == 0 {
@@ -1520,10 +1536,14 @@ func metricNeedsNorms(metric string) bool {
 
 func centroidNorms(centroids [][]float64) []float64 {
 	norms := make([]float64, len(centroids))
+	fillCentroidNorms(norms, centroids)
+	return norms
+}
+
+func fillCentroidNorms(norms []float64, centroids [][]float64) {
 	for i, c := range centroids {
 		norms[i] = vectorL2Norm(c)
 	}
-	return norms
 }
 
 // centroidNormsFor is centroidNorms gated by metricNeedsNorms: idx.centroidNorms
