@@ -832,6 +832,9 @@ func topKFromHeap(heapRows *vecScoredHeap, k int) []vecScoredRow {
 		return nil
 	}
 	if k == heapRows.Len() {
+		if rows, ok := takeOrderedVecHeap(heapRows); ok {
+			return rows
+		}
 		// Pop already moves each worst entry to the end of the backing slice.
 		// Draining the whole heap therefore sorts that storage best-first.
 		rows := []vecScoredRow(*heapRows)

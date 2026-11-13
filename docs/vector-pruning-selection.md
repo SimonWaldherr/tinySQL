@@ -1,4 +1,4 @@
-# Exact pruning and batched top-k initialization
+# Exact pruning and vector result selection
 
 ## Research and scope
 
@@ -50,6 +50,29 @@ Underfilled worker results are heapified too, so parallel merging receives
 valid heaps. NaN exclusions, override-provided norms, physical-row cancellation
 checkpoints and result ownership are preserved. Small `k` retains the existing
 scan, and HNSW's incremental frontier continues to be a valid heap throughout.
+
+## Ordering complete result sets
+
+When a result heap already has every entry in worst-first order, reversing its
+backing slice replaces the final heap drain. This linear check applies to full
+results of at least 256 entries and stops at the first out-of-order pair.
+Unordered heaps retain the existing drain and ownership transfer. Partial
+drains keep their previous behavior too.
+
+Parallel scans whose combined worker results fit within `k` can sort those
+worker heaps separately and merge their ordered runs through a small frontier.
+This path requires at least 1,024 candidates, 2–64 workers and disjoint physical
+row ranges. Counts and worker errors are checked before examining or changing
+any heap. The output reserves exactly the combined result size, reducing
+unused capacity when NULLs, filters or mixed dimensions exclude source rows.
+If the previous merge could reuse its first worker buffer without allocation,
+that reuse still takes priority.
+
+The frontier, run slices and positions use bounded local arrays. There is one
+output allocation and no per-row state beyond existing scored rows. NaNs,
+negative zero, invalid heaps and overlapping row ranges use the previous merge
+to retain its bit-level behavior and avoid reordering aliased worker buffers.
+These changes do not alter distance calculations or select fewer candidates.
 
 ## Verification
 
@@ -110,3 +133,48 @@ Root and minimal suites, targeted race tests, Go 1.27.3 checks and Vet passed.
 The prefix contract also runs in portable WebAssembly with `GOMAXPROCS=1`;
 the existing browser/Node WASM integration smoke tests passed. AMD64 contract
 tests were cross-compiled locally; their native SIMD execution belongs to CI.
+
+## Result ordering measurements
+
+The ordering changes use baseline `1b07097`, the same machine and Go version.
+Again, shared host load made wall time unreliable. These are process CPU-time
+medians of five runs, each alternating 50 old/new pairs over identical inputs.
+The references retain the previous merge and heap-drain function bodies.
+
+| Complete search workload | Before CPU time | After CPU time |
+|---|---:|---:|
+| Flat, 8,192 random 2D vectors, k=8,192 | 794.32 µs | 772.44 µs |
+| Flat, 8,192 descending-score 2D vectors, k=8,192 | 608.12 µs | 97.40 µs |
+| Flat, 8,192 tied-score 2D vectors, k=8,192 | 756.08 µs | 742.12 µs |
+| Flat, random 2D vectors, k=10 control | 72.46 µs | 71.84 µs |
+| Parallel, 8,192 physical rows, k=10,000 | 901.14 µs | 729.16 µs |
+| Parallel filtered, 4,096 allowed rows, k=10,000 | 421.12 µs | 387.56 µs |
+| Parallel, k=400 control | 190.64 µs | 191.32 µs |
+
+Parallel fixtures include missing vectors, mixed dimensions and repeated
+distances. Their times include scoring, worker scheduling, selection and final
+ordering. The descending case benefits especially from an already ordered
+heap; it does not predict typical RAG latency at small `k`. The small-result
+controls changed by less than 2% in these runs.
+
+Focused merge benchmarks over 8,192 valid results retain one 131,072-byte
+allocation with two or eight workers. A sparse-worker regression case verifies
+that 1,024 accepted results reserve 1,024 entries rather than 2,048 source rows.
+The fixtures and pre-change references are available in
+`vector_result_sort_benchmark_test.go` and `vector_full_merge_benchmark_test.go`:
+
+```sh
+go test ./internal/engine -run 'TestVector(FullMerge|ResultSort)' -count=1
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkVector(ResultSort|FullMerge|ParallelHeapMerge)$' \
+  -benchtime=150ms -count=5 -benchmem
+```
+
+The tests compare row IDs and distance bits, check partial drains and buffer
+ownership, and exercise oversized `k`, sparse workers, duplicate IDs,
+infinities, NaNs, signed zero, invalid heaps, aliasing and worker errors.
+
+Both complete native profiles passed on an isolated copy of HEAD with only
+these engine changes applied. Targeted race and Go 1.27.3 checks, Vet and
+documentation checks passed too. The new ordering and ownership tests also
+passed under `js/wasm`; full/minimal browser and Node integration checks passed.
