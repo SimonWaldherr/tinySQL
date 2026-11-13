@@ -356,28 +356,29 @@ func replDumpTable(db *sql.DB, table string) {
 	defer rows.Close()
 	cols, _ := rows.Columns()
 	fmt.Printf("-- Table: %s\n", table)
+	cells := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range cells {
+		ptrs[i] = &cells[i]
+	}
+	vals := make([]string, len(cols))
+	columnList := strings.Join(cols, ", ")
 	for rows.Next() {
-		cells := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range cells {
-			ptrs[i] = &cells[i]
-		}
 		if err := rows.Scan(ptrs...); err != nil {
 			continue
 		}
-		var vals []string
-		for _, p := range ptrs {
+		for i, p := range ptrs {
 			v := replDePtr(p)
 			if v == nil {
-				vals = append(vals, "NULL")
+				vals[i] = "NULL"
 			} else if s, ok := v.(string); ok {
-				vals = append(vals, "'"+strings.ReplaceAll(s, "'", "''")+"'")
+				vals[i] = "'" + strings.ReplaceAll(s, "'", "''") + "'"
 			} else {
-				vals = append(vals, fmt.Sprintf("%v", v))
+				vals[i] = fmt.Sprintf("%v", v)
 			}
 		}
 		fmt.Printf("INSERT INTO %s (%s) VALUES (%s);\n",
-			table, strings.Join(cols, ", "), strings.Join(vals, ", "))
+			table, columnList, strings.Join(vals, ", "))
 	}
 }
 
@@ -390,22 +391,10 @@ func replDePtr(p any) any {
 
 // replPrintRows prints a simple table for .read results.
 func replPrintRows(rows *sql.Rows, cols []string) {
-	type rowMap = map[string]any
-	var data []rowMap
-	for rows.Next() {
-		cells := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range cells {
-			ptrs[i] = &cells[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			continue
-		}
-		m := rowMap{}
-		for i, c := range cols {
-			m[c] = replDePtr(ptrs[i])
-		}
-		data = append(data, m)
+	data, err := rowsToSlice(rows, cols)
+	if err != nil {
+		fmt.Println("ERR:", err)
+		return
 	}
 
 	cell := func(v any) string {
@@ -468,6 +457,13 @@ func handleSelectStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly
 	}
 
 	rows, err := db.Query(q)
+	if err == nil && errorsOnly {
+		// Execute lazy projections too, without allocating display rows.
+		for rows.Next() {
+		}
+		err = rows.Err()
+		rows.Close()
+	}
 	if err != nil {
 		friendly := friendlyErrorString(err)
 		if htmlMode {
@@ -487,6 +483,9 @@ func handleSelectStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly
 			}
 		}
 		return err
+	}
+	if errorsOnly {
+		return nil
 	}
 
 	cols, _ := rows.Columns()
@@ -567,25 +566,11 @@ func handleNonSelectStatement(db *sql.DB, q string, beautiful, htmlMode, errorsO
 	return nil
 }
 
-//nolint:gocyclo // REPL printer performs scanning, formatting, and alignment for display.
 func printRows(rows *sql.Rows, cols []string, format string) {
-	type rowMap = map[string]any
-	var out []rowMap
-	for rows.Next() {
-		cells := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range cells {
-			ptrs[i] = &cells[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			fmt.Println("ERR:", err)
-			return
-		}
-		m := rowMap{}
-		for i, c := range cols {
-			m[c] = dePtr(ptrs[i])
-		}
-		out = append(out, m)
+	out, err := rowsToSlice(rows, cols)
+	if err != nil {
+		fmt.Println("ERR:", err)
+		return
 	}
 
 	switch strings.ToLower(format) {
@@ -699,22 +684,22 @@ func printJSON(out []map[string]any) {
 func rowsToSlice(rows *sql.Rows, cols []string) ([]map[string]any, error) {
 	type rowMap = map[string]any
 	var out []rowMap
+	cells := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range cells {
+		ptrs[i] = &cells[i]
+	}
 	for rows.Next() {
-		cells := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range cells {
-			ptrs[i] = &cells[i]
-		}
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, err
 		}
-		m := rowMap{}
+		m := make(rowMap, len(cols))
 		for i, c := range cols {
 			m[c] = dePtr(ptrs[i])
 		}
 		out = append(out, m)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // renderRowsHTML returns an HTML table for the given rows and columns.

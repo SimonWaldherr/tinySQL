@@ -8,7 +8,8 @@ An interactive SQL shell over `database/sql` and the tinySQL driver.
 ## Build
 
 ```bash
-go build -o repl ./cmd/repl
+mkdir -p bin
+go build -o bin/repl ./cmd/repl
 ```
 
 ## Usage
@@ -33,14 +34,19 @@ Flags:
 ```
 
 ```bash
-./repl
-./repl -dsn "file:/tmp/demo.db?tenant=main&autosave=1"
-./repl -format json
-./repl -format markdown
+./bin/repl
+./bin/repl -dsn "file:/tmp/demo.db?tenant=main&autosave=1"
+./bin/repl -format json
+./bin/repl -format markdown
 ```
 
 `markdown` emits GitHub-flavoured tables; `json` an array of objects; `yaml` a
 sequence. `md` is accepted as an alias for `markdown`.
+
+Result readers reuse their scan buffers while keeping each displayed row and
+BLOB value independent. Table and HTML output still retain the result set for
+rendering. `-errors-only` consumes SELECT results without retaining display
+rows, so errors raised during lazy row evaluation are reported as well.
 
 ## Interactive commands
 
