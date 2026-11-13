@@ -1,16 +1,5 @@
-# Compiled binaries and build artifacts.
-#
-# These patterns are what stops a `git add -A` from committing a 30 MB
-# executable. They deliberately cover the whole repo rather than the handful of
-# specific paths that used to be listed one by one below: `go build` and
-# `go test -c` drop their output next to the package being built, so any
-# directory can grow one, and a rule that names paths only catches the ones
-# somebody already tripped over. Two binaries did reach this repository's
-# history that way (query_files.wasm, tinySQL.test).
-#
-# Do not rely on a personal global gitignore for this. Ignoring *.exe in
-# ~/gitignore_global.txt protects exactly one machine; CI, a container and
-# every other contributor see none of it.
+# Compiled binaries, test executables and profiles. Keep these rules repository-wide
+# because Go tools can emit artifacts next to any package.
 *.exe
 *.dll
 *.so
@@ -34,7 +23,6 @@ mutex.out
 wasm_exec.js
 
 cmd/cmd
-tinySQL.wasm
 
 # macOS cruft
 .DS_Store
@@ -49,20 +37,14 @@ coverage.txt
 .actrc
 .env
 .gh-pages-worktree/
-*.wasm
 persist_test.dat.wal
 tinyrag
 /sqltools
-libtinysql.so
-wasm_browser.test
 main
 cmd/desktop/build
-cmd/studio/build/bin/tinySQL Studio.app
 cmd/studio/build
-query_files.wasm.gz
 /cmd/query_files_wasm/.build-fingerprint
 /cmd/query_files_wasm/.wasm-build.*/
-cmd/wasm_browser/web/tinySQL.wasm.gz
 data/osm_full
 data/osm_full_tags
 data/osm_sample
@@ -70,7 +52,6 @@ data/osm_sample2
 niederbayern-251206.osm.pbf
 osm_import
 cover_*
-libtinysqlodbc.so
 /demo
 /wikirag
 cmd.zip
@@ -80,8 +61,6 @@ cmd/formigo/formigo
 formigo.db
 formigo.db.wal
 /.gomodcache
-benchmarks/cpu.out
-benchmarks/mem.out
 # Local benchmark captures and comparison reports are reproducible evidence,
 # not repository documentation. Keep them available for local optimization work
 # without accidentally adding them to commits.
@@ -91,7 +70,6 @@ benchmarks/mem.out
 demo.mbtiles
 /mbtilesdemo
 /mbtilesregion
-/tiles.test
 /odbc/odbc
 
 # Apple / Swift build products
@@ -101,7 +79,6 @@ demo.mbtiles
 /bindings/python/dist/
 /bindings/python/*.egg-info/
 /bindings/python/tinysql/libtinysql.*
-/bindings/python/tinysql/tinysql.dll
 /bindings/rust/target/
 /bindings/rust/Cargo.lock
 /bindings/swift/CTinySQL.xcframework/

@@ -27,6 +27,8 @@ current behavior and keep performance claims scoped to the workload they measure
 - [SQL feature gaps](sql-feature-gaps.md) — supported additions and known limits.
 - [SQL semantics](sql-semantics.md) — date differences, NULLs, trimming, filtered
   aggregates, window frames and dialect compatibility.
+- [Query analyzer](query-analyzer.md) — inspect plans and execution timings with
+  `EXPLAIN ANALYZE`.
 
 ## Use the runtime
 
@@ -47,6 +49,8 @@ current behavior and keep performance claims scoped to the workload they measure
 - [Clusters and load balancing](cluster.md) — primary/replica deployment.
 - [TinyGo and embedded targets](tinygo-guide.md) — supported targets and build
   flow.
+- [Calendar conversion](calendar-conversion.md) — date-only conversions between
+  Gregorian and other supported calendars.
 
 ## Search, RAG, and GIS
 
@@ -57,7 +61,9 @@ current behavior and keep performance claims scoped to the workload they measure
 - [IVF training](ivf-training-performance.md) — e-means research, reproducible
   initialization, exact convergence and retrieval-quality measurements.
 - [Exact vector pruning and selection](vector-pruning-selection.md) —
-  SuperKMeans-inspired bounds and batched top-k initialization.
+  SuperKMeans-inspired bounds, batched top-k initialization and result ordering.
+- [RAG serving](rag-serving-performance.md) — cache identity, authorization,
+  context lookup and result allocations.
 - [Retrieval performance](retrieval-performance.md) — search-path measurements
   and links to focused RAG/GIS notes.
 - [Exact RAG postings](rag-postings-performance.md) and
@@ -82,6 +88,10 @@ current behavior and keep performance claims scoped to the workload they measure
   research sources, CTE binding, INTO/TEMP construction and measured tradeoffs.
 - [JSON and set performance](json-and-set-performance.md) — Go JSON compatibility,
   streaming export, normalization, and set representation.
+- [BLOB and vector execution](blob-vector-performance.md) — byte ownership,
+  legacy string inputs and shared value kernels.
+- [WASM result transfer](wasm-result-performance.md) — bounded Go-to-JavaScript
+  result blocks and compatibility of the browser and Node APIs.
 - [RAG, vector, and GROUP BY performance](rag-group-performance.md) — context
   expansion, HNSW traversal, integer grouping, and aggregate pagination.
 - [Query and index performance](query-index-performance.md) — text ordering,
@@ -114,3 +124,9 @@ current behavior and keep performance claims scoped to the workload they measure
   [streaming and live queries](streaming-live-performance.md).
 - [Text predicates](predicate-string-performance.md), [LIKE and views](like-view-performance.md),
   and [REGEXP](regexp-performance.md).
+- [SQL hot paths](sql-hotpath-performance.md) — parser allocations, large result
+  pages, GROUP BY and stream cleanup.
+- [Text, ranges and aggregates](text-range-performance.md) — quoted strings,
+  trimming, integer BETWEEN and aggregate execution.
+- [Date and time execution](datetime-performance.md) — parsing, formatting and
+  date arithmetic.
