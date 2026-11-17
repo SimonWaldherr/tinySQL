@@ -379,7 +379,9 @@ func looksLikeTransactionControl(sqlStr string) bool {
 		asciiKeywordEqual(keyword, "START") ||
 		asciiKeywordEqual(keyword, "COMMIT") ||
 		asciiKeywordEqual(keyword, "END") ||
-		asciiKeywordEqual(keyword, "ROLLBACK")
+		asciiKeywordEqual(keyword, "ROLLBACK") ||
+		asciiKeywordEqual(keyword, "SAVEPOINT") ||
+		asciiKeywordEqual(keyword, "RELEASE")
 }
 
 // asciiKeywordEqual compares a source keyword with its uppercase SQL spelling
@@ -412,6 +414,9 @@ const (
 	txBegin
 	txCommit
 	txRollback
+	txSavepointCreate
+	txSavepointRollback
+	txSavepointRelease
 )
 
 // classifyTransactionSQL maps an already-normalized (upper-cased,
@@ -431,18 +436,44 @@ const (
 //     accepting the weaker spellings as that is strictly closer to what the
 //     engine does than rejecting them.
 //
-// Nothing here matches SAVEPOINT, RELEASE, or ROLLBACK TO <name>. Those are
-// left to fail on purpose: there is no nested-transaction support in this
-// engine, so aliasing `ROLLBACK TO sp` onto a full ROLLBACK would silently
-// discard work the caller expected to keep, and aliasing SAVEPOINT onto a no-op
-// would make the following ROLLBACK TO look like it worked. A confusing error
-// beats silent data loss -- do not "helpfully" add them without real savepoints.
+// SAVEPOINT, RELEASE [SAVEPOINT] and ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT]
+// are matched with their name in classifyTransactionSQLWithTarget. A savepoint
+// is only meaningful inside a transaction; conn.savepoint enforces that. Each
+// verb is handled explicitly, never aliased onto COMMIT or ROLLBACK, because a
+// ROLLBACK TO that silently discarded the whole transaction would lose work the
+// caller expected to keep.
 func classifyTransactionSQL(norm string) (txAction, bool) {
+	action, readOnly, _ := classifyTransactionSQLWithTarget(norm)
+	return action, readOnly
+}
+
+func classifyTransactionSQLWithTarget(norm string) (txAction, bool, string) {
 	switch norm {
 	case "COMMIT", "COMMIT TRANSACTION", "END", "END TRANSACTION":
-		return txCommit, false
+		return txCommit, false, ""
 	case "ROLLBACK", "ROLLBACK TRANSACTION":
-		return txRollback, false
+		return txRollback, false, ""
+	}
+	if rest, ok := strings.CutPrefix(norm, "SAVEPOINT "); ok && !strings.Contains(rest, " ") && rest != "" {
+		return txSavepointCreate, false, rest
+	}
+	if rest, ok := strings.CutPrefix(norm, "RELEASE SAVEPOINT "); ok && !strings.Contains(rest, " ") && rest != "" {
+		return txSavepointRelease, false, rest
+	}
+	if rest, ok := strings.CutPrefix(norm, "RELEASE "); ok && !strings.Contains(rest, " ") && rest != "" {
+		return txSavepointRelease, false, rest
+	}
+	for _, prefix := range []string{
+		"ROLLBACK TRANSACTION TO SAVEPOINT ",
+		"ROLLBACK WORK TO SAVEPOINT ",
+		"ROLLBACK TO SAVEPOINT ",
+		"ROLLBACK TRANSACTION TO ",
+		"ROLLBACK WORK TO ",
+		"ROLLBACK TO ",
+	} {
+		if rest, ok := strings.CutPrefix(norm, prefix); ok && !strings.Contains(rest, " ") && rest != "" {
+			return txSavepointRollback, false, rest
+		}
 	}
 	// READ ONLY is a suffix on any BEGIN/START form, so strip it once here
 	// instead of doubling the case list below.
@@ -457,13 +488,13 @@ func classifyTransactionSQL(norm string) (txAction, bool) {
 		"BEGIN IMMEDIATE", "BEGIN IMMEDIATE TRANSACTION",
 		"BEGIN EXCLUSIVE", "BEGIN EXCLUSIVE TRANSACTION",
 		"START TRANSACTION":
-		return txBegin, readOnly
+		return txBegin, readOnly, ""
 	}
-	return txNone, false
+	return txNone, false, ""
 }
 
 func (c *conn) execTransactionControl(ctx context.Context, sqlStr string) (driver.Result, bool, error) {
-	action, readOnly := classifyTransactionSQL(normalizeTransactionSQL(sqlStr))
+	action, readOnly, target := classifyTransactionSQLWithTarget(normalizeTransactionSQL(sqlStr))
 	switch action {
 	case txBegin:
 		if c.inTx {
@@ -480,6 +511,21 @@ func (c *conn) execTransactionControl(ctx context.Context, sqlStr string) (drive
 		return driver.RowsAffected(0), true, nil
 	case txRollback:
 		if err := c.rollbackTx(); err != nil {
+			return nil, true, err
+		}
+		return driver.RowsAffected(0), true, nil
+	case txSavepointCreate:
+		if err := c.savepoint(target); err != nil {
+			return nil, true, err
+		}
+		return driver.RowsAffected(0), true, nil
+	case txSavepointRollback:
+		if err := c.rollbackToSavepoint(target); err != nil {
+			return nil, true, err
+		}
+		return driver.RowsAffected(0), true, nil
+	case txSavepointRelease:
+		if err := c.releaseSavepoint(target); err != nil {
 			return nil, true, err
 		}
 		return driver.RowsAffected(0), true, nil

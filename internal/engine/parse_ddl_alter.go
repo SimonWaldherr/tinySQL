@@ -69,7 +69,11 @@ func (p *Parser) parseAlter() (Statement, error) {
 			DeclaredType: colType.declared,
 			Affinity:     colType.affinity,
 		}
-		return &AlterTable{Table: tableName, AddColumn: &col}, nil
+		var checks []storage.CheckConstraint
+		if err := p.parseColumnConstraints(&col, &checks); err != nil {
+			return nil, err
+		}
+		return &AlterTable{Table: tableName, AddColumn: &col, AddChecks: checks}, nil
 	case "RENAME":
 		p.next()
 		if err := p.expectKeyword("COLUMN"); err != nil {

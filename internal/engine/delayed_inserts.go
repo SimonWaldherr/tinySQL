@@ -117,6 +117,12 @@ func enqueueDelayedInsert(pc ProcedureContext, args []any) (*ResultSet, error) {
 	if !ok || len(insert.Returning) != 0 {
 		return nil, fmt.Errorf("DELAY_INSERT requires INSERT without RETURNING")
 	}
+	// The queued payload keeps only a target-less ON CONFLICT DO NOTHING flag.
+	// A conflict target or DO UPDATE would be dropped and delivered as a plain
+	// INSERT, so reject it here rather than change what the statement means.
+	if insert.OnConflict != nil {
+		return nil, fmt.Errorf("DELAY_INSERT supports only target-less ON CONFLICT DO NOTHING")
+	}
 	if strings.EqualFold(insert.Table, delayedInsertTable) {
 		return nil, fmt.Errorf("cannot enqueue into the internal queue")
 	}

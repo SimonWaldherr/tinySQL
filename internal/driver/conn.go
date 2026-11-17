@@ -37,6 +37,7 @@ type conn struct {
 	// and only if no concurrent change would be discarded by doing so.
 	txCatalogRev uint64
 	txCatalog    storage.CatalogSnapshot
+	savepoints   []txSavepoint
 
 	// wrote is set the first time this connection executes a statement that
 	// is not a pure read (see execStatement's isWrite switch — the same

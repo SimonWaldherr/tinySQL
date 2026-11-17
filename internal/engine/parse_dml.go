@@ -48,7 +48,7 @@ func (p *Parser) parseInsert() (Statement, error) {
 	default:
 		return nil, p.errf("expected VALUES or SELECT")
 	}
-	onConflictDoNothing, err := p.parseInsertOnConflict()
+	onConflictDoNothing, onConflict, err := p.parseInsertOnConflict()
 	if err != nil {
 		return nil, err
 	}
@@ -56,29 +56,86 @@ func (p *Parser) parseInsert() (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Insert{Table: tname, Cols: cols, Rows: rows, Select: selectSource, OnConflictDoNothing: onConflictDoNothing, Returning: returning}, nil
+	return &Insert{Table: tname, Cols: cols, Rows: rows, Select: selectSource, OnConflictDoNothing: onConflictDoNothing, OnConflict: onConflict, Returning: returning}, nil
 }
 
-// parseInsertOnConflict supports PostgreSQL's target-less conflict action.
-// A conflict target and DO UPDATE need composite-constraint metadata that the
-// current catalog does not yet represent, so reject them explicitly instead
-// of silently applying a different conflict policy.
-func (p *Parser) parseInsertOnConflict() (bool, error) {
+func (p *Parser) parseInsertOnConflict() (bool, *OnConflictClause, error) {
 	if p.cur.Typ != tKeyword || p.cur.Val != "ON" {
-		return false, nil
+		return false, nil, nil
 	}
 	p.next()
 	if err := p.expectKeyword("CONFLICT"); err != nil {
-		return false, err
+		return false, nil, err
+	}
+	var targetCols []string
+	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
+		p.next()
+		for {
+			id := p.parseIdentLike()
+			if id == "" {
+				return false, nil, p.errf("expected conflict target column name")
+			}
+			targetCols = append(targetCols, id)
+			if p.cur.Typ == tSymbol && p.cur.Val == "," {
+				p.next()
+				continue
+			}
+			if err := p.expectSymbol(")"); err != nil {
+				return false, nil, err
+			}
+			break
+		}
 	}
 	if err := p.expectKeyword("DO"); err != nil {
-		return false, err
+		return false, nil, err
 	}
-	if p.cur.Typ != tKeyword || p.cur.Val != "NOTHING" {
-		return false, p.errf("only ON CONFLICT DO NOTHING is supported")
+	if p.cur.Typ == tKeyword && p.cur.Val == "NOTHING" {
+		p.next()
+		if len(targetCols) == 0 {
+			return true, nil, nil
+		}
+		return false, &OnConflictClause{TargetCols: targetCols, DoNothing: true}, nil
+	}
+	if p.cur.Typ != tKeyword || p.cur.Val != "UPDATE" {
+		return false, nil, p.errf("expected NOTHING or UPDATE after ON CONFLICT DO")
 	}
 	p.next()
-	return true, nil
+	if len(targetCols) == 0 {
+		return false, nil, p.errf("ON CONFLICT DO UPDATE requires a conflict target")
+	}
+	if err := p.expectKeyword("SET"); err != nil {
+		return false, nil, err
+	}
+	sets := map[string]Expr{}
+	for {
+		col := p.parseIdentLike()
+		if col == "" {
+			return false, nil, p.errf("expected column name")
+		}
+		if err := p.expectSymbol("="); err != nil {
+			return false, nil, err
+		}
+		e, err := p.parseExpr()
+		if err != nil {
+			return false, nil, err
+		}
+		sets[col] = e
+		if p.cur.Typ == tSymbol && p.cur.Val == "," {
+			p.next()
+			continue
+		}
+		break
+	}
+	var where Expr
+	if p.cur.Typ == tKeyword && p.cur.Val == "WHERE" {
+		p.next()
+		e, err := p.parseExpr()
+		if err != nil {
+			return false, nil, err
+		}
+		where = e
+	}
+	return false, &OnConflictClause{TargetCols: targetCols, DoUpdate: sets, Where: where}, nil
 }
 
 func (p *Parser) parseInsertValueRows() ([][]Expr, error) {

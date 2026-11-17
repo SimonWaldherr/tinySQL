@@ -278,6 +278,12 @@ func (a ReferentialAction) String() string {
 	}
 }
 
+// CheckConstraint describes a SQL CHECK (expr) constraint on a table or column.
+type CheckConstraint struct {
+	Name string `json:"name,omitempty"`
+	Expr string `json:"expr"`
+}
+
 // ForeignKeyRef describes a foreign key reference target.
 type ForeignKeyRef struct {
 	Table    string

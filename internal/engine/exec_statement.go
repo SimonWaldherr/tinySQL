@@ -41,7 +41,8 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 		}
 	}
 
-	if isReadOnlyStatementWithProc(stmt, procedure) {
+	readOnly := isReadOnlyStatementWithProc(stmt, procedure)
+	if readOnly {
 		db.LockContentForRead()
 		defer db.UnlockContentForRead()
 	} else {
@@ -59,12 +60,15 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 	// TABLE are logged too — a schema change that never reaches the log is
 	// replayed onto a database that no longer has the table.
 	var walBefore *storage.DB
-	if !isReadOnlyStatementWithProc(stmt, procedure) && db.StatementWAL() != nil {
+	if !readOnly && db.StatementWAL() != nil {
 		walBefore = db.MetaSnapshot()
 	}
 
 	var planStorage dmlPlan
-	plan := newDMLPlan(&planStorage, db, tenant, stmt)
+	var plan *dmlPlan
+	if !readOnly {
+		plan = newDMLPlan(&planStorage, db, tenant, stmt)
+	}
 
 	var snapshot *storage.StatementSnapshot
 	switch {
@@ -428,6 +432,9 @@ func appendOnlySnapshotTarget(plan *dmlPlan) (string, bool) {
 	}
 	s, ok := plan.stmt.(*Insert)
 	if !ok || plan.hasTriggers() {
+		return "", false
+	}
+	if s.OnConflict != nil && !s.OnConflict.DoNothing {
 		return "", false
 	}
 	if plan.table == nil {

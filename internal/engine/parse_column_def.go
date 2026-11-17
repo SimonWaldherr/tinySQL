@@ -8,11 +8,12 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
+func (p *Parser) parseColumnDefs() ([]storage.Column, []storage.CheckConstraint, error) {
 	if err := p.expectSymbol("("); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cols := make([]storage.Column, 0, 8) // Pre-allocate for typical table
+	var checks []storage.CheckConstraint
 	for {
 		// A comma-separated item can be a table-level constraint rather than
 		// a column definition, in which case it is applied to the
@@ -22,13 +23,13 @@ func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
 		// column that reached storage and the stored schema text, and whose
 		// only symptom was a later "INSERT expects 3 values".
 		if p.startsTableLevelConstraint() {
-			if err := p.parseTableLevelConstraint(cols); err != nil {
-				return nil, err
+			if err := p.parseTableLevelConstraint(cols, &checks); err != nil {
+				return nil, nil, err
 			}
 		} else {
-			col, err := p.parseSingleColumnDef()
+			col, err := p.parseSingleColumnDef(&checks)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			cols = append(cols, col)
 		}
@@ -38,11 +39,11 @@ func (p *Parser) parseColumnDefs() ([]storage.Column, error) {
 			continue
 		}
 		if err := p.expectSymbol(")"); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		break
 	}
-	return cols, nil
+	return cols, checks, nil
 }
 
 // startsTableLevelConstraint reports whether the item about to be parsed is a
@@ -111,14 +112,14 @@ func (p *Parser) tokenAfterPeek() token {
 // constraint over exactly one column is expressible and one over several is
 // not. The unsupported cases are reported by name rather than approximated,
 // because a dropped PRIMARY KEY or UNIQUE silently admits duplicate rows.
-func (p *Parser) parseTableLevelConstraint(cols []storage.Column) error {
+func (p *Parser) parseTableLevelConstraint(cols []storage.Column, checks *[]storage.CheckConstraint) error {
+	var constraintName string
 	if p.constraintWord() == "CONSTRAINT" {
 		p.next()
-		if name := p.parseIdentLike(); name == "" {
+		constraintName = p.parseIdentLike()
+		if constraintName == "" {
 			return p.errf("expected constraint name after CONSTRAINT")
 		}
-		// The name itself is dropped; see parseColumnConstraints for why that
-		// is safe where dropping the constraint would not be.
 	}
 	switch p.constraintWord() {
 	case "FOREIGN":
@@ -133,7 +134,12 @@ func (p *Parser) parseTableLevelConstraint(cols []storage.Column) error {
 		p.next()
 		return p.applyTableLevelKeyConstraint("UNIQUE", storage.Unique, cols)
 	case "CHECK":
-		return p.errf("table-level CHECK constraints are not supported; enforce the predicate in the application")
+		ck, err := p.parseCheckConstraintClause(constraintName)
+		if err != nil {
+			return err
+		}
+		*checks = append(*checks, ck)
+		return nil
 	}
 	return p.errf("unsupported table-level constraint; expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY")
 }
@@ -251,7 +257,7 @@ func (p *Parser) parseTableLevelForeignKey(cols []storage.Column) error {
 	return p.errf("FOREIGN KEY (%s): no such column in this table", localCol)
 }
 
-func (p *Parser) parseSingleColumnDef() (storage.Column, error) {
+func (p *Parser) parseSingleColumnDef(checks *[]storage.CheckConstraint) (storage.Column, error) {
 	name := p.parseIdentLike()
 	if name == "" {
 		return storage.Column{}, p.errf("expected column name")
@@ -270,7 +276,7 @@ func (p *Parser) parseSingleColumnDef() (storage.Column, error) {
 	}
 
 	// Parse constraints
-	err = p.parseColumnConstraints(&col)
+	err = p.parseColumnConstraints(&col, checks)
 	if err != nil {
 		return storage.Column{}, err
 	}
@@ -278,67 +284,97 @@ func (p *Parser) parseSingleColumnDef() (storage.Column, error) {
 	return col, nil
 }
 
-func (p *Parser) parseColumnConstraints(col *storage.Column) error {
+func (p *Parser) parseColumnConstraints(col *storage.Column, checks *[]storage.CheckConstraint) error {
+	var constraintName string
 	for {
-		switch p.constraintWord() {
+		word := p.constraintWord()
+		switch word {
 		case "":
 			return nil
 		case "NOT":
+			constraintName = ""
 			p.next()
 			if err := p.expectKeyword("NULL"); err != nil {
 				return err
 			}
 			col.NotNull = true
 		case "NULL":
+			constraintName = ""
 			// Explicit NULL is the default in ordinary SQLite tables.
 			p.next()
 			col.NotNull = false
 		case "DEFAULT":
+			constraintName = ""
 			if err := p.parseColumnDefault(col); err != nil {
 				return err
 			}
 		case "PRIMARY":
+			constraintName = ""
 			if err := p.parsePrimaryKeyConstraint(col); err != nil {
 				return err
 			}
 		case "FOREIGN":
+			constraintName = ""
 			if err := p.parseForeignKeyConstraint(col); err != nil {
 				return err
 			}
 		case "UNIQUE":
+			constraintName = ""
 			if err := p.parseUniqueConstraint(col); err != nil {
 				return err
 			}
 		case "REFERENCES":
+			constraintName = ""
 			if err := p.parseReferencesConstraint(col); err != nil {
 				return err
 			}
 		case "CONSTRAINT":
-			// A named column constraint ("CONSTRAINT nn NOT NULL"). The name
-			// is metadata with nowhere to live (storage.Column has no field
-			// for it) and nothing that looks it up, so it is skipped and the
-			// constraint behind it is parsed normally. Dropping a
-			// constraint's NAME changes nothing about which rows the table
-			// accepts; dropping the constraint itself would, which is why
-			// the clauses below are errors instead.
 			p.next()
-			if name := p.parseIdentLike(); name == "" {
+			name := p.parseIdentLike()
+			if name == "" {
 				return p.errf("expected constraint name after CONSTRAINT on column %q", col.Name)
 			}
-		case "CHECK", "GENERATED", "AS", "COLLATE", "AUTOINCREMENT":
-			// These parse cleanly but cannot be honoured, and each one
-			// changes what the column MEANS. Before the type parser
-			// terminated on them they were absorbed into the declared type
-			// string and then ignored, which is the worst of the three
-			// options: a CHECK that never rejects a row, or a generated
-			// column that reads NULL forever, is wrong data that looks like
-			// a working schema. Failing at CREATE TABLE keeps the mistake
-			// where its author can still see it.
+			constraintName = name
+		case "CHECK":
+			ck, err := p.parseCheckConstraintClause(constraintName)
+			if err != nil {
+				return err
+			}
+			constraintName = ""
+			*checks = append(*checks, ck)
+		case "GENERATED", "AS", "COLLATE", "AUTOINCREMENT":
 			return p.unsupportedColumnConstraint(col.Name)
 		default:
 			return nil
 		}
 	}
+}
+
+func (p *Parser) parseCheckConstraintClause(constraintName string) (storage.CheckConstraint, error) {
+	p.next() // CHECK
+	if err := p.expectSymbol("("); err != nil {
+		return storage.CheckConstraint{}, err
+	}
+	startPos := p.cur.Pos
+	expr, err := p.parseExpr()
+	if err != nil {
+		return storage.CheckConstraint{}, err
+	}
+	endPos := p.cur.Pos
+	if err := p.expectSymbol(")"); err != nil {
+		return storage.CheckConstraint{}, err
+	}
+	if err := validateCheckExprAST(expr); err != nil {
+		return storage.CheckConstraint{}, err
+	}
+	exprText := ""
+	if startPos >= 0 && endPos >= startPos && endPos <= len(p.lx.s) {
+		exprText = strings.TrimSpace(p.lx.s[startPos:endPos])
+	}
+	if exprText == "" {
+		return storage.CheckConstraint{}, p.errf("empty CHECK constraint expression")
+	}
+	return storage.CheckConstraint{Name: constraintName, Expr: exprText}, nil
 }
 
 // unsupportedColumnConstraint reports the column constraint at the current

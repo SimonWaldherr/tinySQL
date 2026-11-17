@@ -51,8 +51,6 @@ func TestUnsupportedColumnConstraintsAreRejected(t *testing.T) {
 		sql  string
 		want string
 	}{
-		{`CREATE TABLE ck (b INT CHECK (b > 0))`, "CHECK constraints are not supported"},
-		{`CREATE TABLE ck (b CHECK (b > 0))`, "CHECK constraints are not supported"},
 		{`CREATE TABLE gc (a INT, b INT GENERATED ALWAYS AS (a+1))`, "generated columns are not supported"},
 		// The bare "AS (expr)" spelling of a generated column, without the
 		// GENERATED ALWAYS prefix.
@@ -77,7 +75,6 @@ func TestUnsupportedColumnConstraintsAreRejected(t *testing.T) {
 // worth pinning here is that the clause is not silently accepted.
 func TestAlterTableAddColumnRejectsUnsupportedClauses(t *testing.T) {
 	for _, sql := range []string{
-		`ALTER TABLE t ADD COLUMN b INT CHECK (b > 0)`,
 		`ALTER TABLE t ADD COLUMN b TEXT COLLATE NOCASE`,
 		`ALTER TABLE t ADD COLUMN b INT GENERATED ALWAYS AS (a+1)`,
 	} {
@@ -102,7 +99,14 @@ func TestNamedColumnConstraintIsApplied(t *testing.T) {
 	if cols[1].Constraint != storage.Unique {
 		t.Fatalf("CONSTRAINT uq UNIQUE = %v, want UNIQUE", cols[1].Constraint)
 	}
-	expectParseError(t, `CREATE TABLE nc (id INT CONSTRAINT ck CHECK (id > 0))`, "CHECK constraints are not supported")
+	stmt, err := NewParser(`CREATE TABLE nc (id INT CONSTRAINT ck CHECK (id > 0))`).ParseStatement()
+	if err != nil {
+		t.Fatalf("parse named CHECK failed: %v", err)
+	}
+	ct := stmt.(*CreateTable)
+	if len(ct.CheckConstraints) != 1 || ct.CheckConstraints[0].Name != "ck" || ct.CheckConstraints[0].Expr != "id > 0" {
+		t.Fatalf("unexpected CheckConstraints: %#v", ct.CheckConstraints)
+	}
 }
 
 // TestConstraintWordsRemainUsableAsColumnNames guards the cost of recognising
@@ -178,7 +182,6 @@ func TestUnsupportedTableLevelConstraintsAreRejected(t *testing.T) {
 		{`CREATE TABLE mc (a INT, b INT, PRIMARY KEY (a,b))`, "composite primary keys are not supported"},
 		{`CREATE TABLE mc (a INT, b INT, CONSTRAINT pk_mc PRIMARY KEY (a,b))`, "composite primary keys are not supported"},
 		{`CREATE TABLE mc (a INT, b INT, UNIQUE (a,b))`, "composite UNIQUE constraints are not supported"},
-		{`CREATE TABLE mc (a INT, b INT, CHECK (a < b))`, "table-level CHECK constraints are not supported"},
 		{`CREATE TABLE mc (a INT, PRIMARY KEY (zz))`, "no such column"},
 		// PRIMARY KEY and UNIQUE cannot both be recorded on one column, so
 		// the conflict is reported instead of one silently replacing the other.

@@ -98,10 +98,14 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	if hasAfter {
 		afterRunner = &triggerListRunner{triggers: afterTriggers}
 	}
+	onConflictPrep, beforeUpdateRunner, afterUpdateRunner, err := prepareInsertOnConflict(env, s, t)
+	if err != nil {
+		return nil, err
+	}
 	// buildTableRow allocates a map(2*len(cols)); resolve both timing lists
 	// once before the row loop and skip that map entirely when neither triggers
 	// nor RETURNING needs it.
-	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	needsRow := hasBefore || hasAfter || len(s.Returning) > 0 || (onConflictPrep != nil && !s.OnConflict.DoNothing)
 	// Both of these are for RETURNING and trigger rows only. Building them
 	// unconditionally charged every plain INSERT a slice sized to its row count
 	// plus one string concatenation per column, none of which anything read.
@@ -130,7 +134,8 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// Which columns can ever fail validateOneRowConstraint is a pure function
 	// of the schema; computed once here instead of validateRowConstraintsWith
 	// visiting every column of the table (constrained or not) on every row.
-	constrainedCols := constrainedColumnIndices(t.Cols)
+	var constrainedBuf [16]int
+	constrainedCols := constrainedColumnIndicesInto(t.Cols, constrainedBuf[:0])
 	wal, err := beginWALAuto(env, s.Table)
 	if err != nil {
 		return nil, err
@@ -139,6 +144,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// owned maps, while trigger-only rows can reuse one statement-local map.
 	var triggerRow Row
 	inserted := 0
+	updated := 0
 	// Reserve row headers once when every input row will be appended on
 	// success. Triggers can mutate the table, and DO NOTHING may skip most
 	// inputs, so those paths retain incremental growth.
@@ -171,6 +177,30 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 				return nil, err
 			}
 			if insertConflictsUniqueConstraint(t, row) {
+				continue
+			}
+		} else if onConflictPrep != nil {
+			if err := validateInsertNonUniqueConstraints(env, t, row, constrainedCols, fks); err != nil {
+				return nil, err
+			}
+			conflictRowID, hasConflict, err := onConflictPrep.findConflictRow(t, row)
+			if err != nil {
+				return nil, err
+			}
+			if hasConflict {
+				if onConflictPrep.clause.DoNothing {
+					continue
+				}
+				didUpdate, retRow, err := applyOnConflictUpdate(env, s, t, conflictRowID, row, onConflictPrep, keys, indexNames, wal, fks, beforeUpdateRunner, afterUpdateRunner)
+				if err != nil {
+					return nil, err
+				}
+				if didUpdate {
+					updated++
+					if len(s.Returning) > 0 && retRow != nil {
+						returningRows = append(returningRows, retRow)
+					}
+				}
 				continue
 			}
 		}
@@ -217,11 +247,15 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}
-	if inserted > 0 {
-		tryFastPathAppend(env, s.Table, t, inserted)
+	if inserted > 0 || updated > 0 {
+		if inserted > 0 && updated == 0 {
+			tryFastPathAppend(env, s.Table, t, inserted)
+			t.MarkDirtyFrom(len(t.Rows) - inserted)
+		} else if inserted > 0 {
+			t.MarkDirtyFrom(-1)
+		}
 		t.Version++
 		t.InvalidateStats()
-		t.MarkDirtyFrom(len(t.Rows) - inserted)
 		markDependentMaterializedViewsStale(env, s.Table)
 	}
 	if len(s.Returning) > 0 {
@@ -250,7 +284,11 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	if hasAfter {
 		afterRunner = &triggerListRunner{triggers: afterTriggers}
 	}
-	needsRow := hasBefore || hasAfter || len(s.Returning) > 0
+	onConflictPrep, beforeUpdateRunner, afterUpdateRunner, err := prepareInsertOnConflict(env, s, t)
+	if err != nil {
+		return nil, err
+	}
+	needsRow := hasBefore || hasAfter || len(s.Returning) > 0 || (onConflictPrep != nil && !s.OnConflict.DoNothing)
 	// See executeInsertAllColumns: neither is read unless a trigger or a
 	// RETURNING clause asks for the row map.
 	var returningRows []Row
@@ -277,7 +315,8 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	sort.Strings(indexNames)
 	// See executeInsertAllColumns: both are pure functions of the schema,
 	// computed once per statement instead of per row.
-	constrainedCols := constrainedColumnIndices(t.Cols)
+	var constrainedBuf [16]int
+	constrainedCols := constrainedColumnIndicesInto(t.Cols, constrainedBuf[:0])
 	hasDefaults := tableHasDefaults(t.Cols)
 	var defaults []insertColumnDefault
 	if hasDefaults && rowCount > 1 && !hasBefore && !hasAfter {
@@ -291,6 +330,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	// owned maps, while trigger-only rows can reuse one statement-local map.
 	var triggerRow Row
 	inserted := 0
+	updated := 0
 	// Reserve row headers once when every input row will be appended on
 	// success. Triggers can mutate the table, and DO NOTHING may skip most
 	// inputs, so those paths retain incremental growth.
@@ -336,6 +376,30 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			if insertConflictsUniqueConstraint(t, row) {
 				continue
 			}
+		} else if onConflictPrep != nil {
+			if err := validateInsertNonUniqueConstraints(env, t, row, constrainedCols, fks); err != nil {
+				return nil, err
+			}
+			conflictRowID, hasConflict, err := onConflictPrep.findConflictRow(t, row)
+			if err != nil {
+				return nil, err
+			}
+			if hasConflict {
+				if onConflictPrep.clause.DoNothing {
+					continue
+				}
+				didUpdate, retRow, err := applyOnConflictUpdate(env, s, t, conflictRowID, row, onConflictPrep, keys, indexNames, wal, fks, beforeUpdateRunner, afterUpdateRunner)
+				if err != nil {
+					return nil, err
+				}
+				if didUpdate {
+					updated++
+					if len(s.Returning) > 0 && retRow != nil {
+						returningRows = append(returningRows, retRow)
+					}
+				}
+				continue
+			}
 		}
 		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
 			return nil, err
@@ -380,11 +444,15 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}
-	if inserted > 0 {
-		tryFastPathAppend(env, s.Table, t, inserted)
+	if inserted > 0 || updated > 0 {
+		if inserted > 0 && updated == 0 {
+			tryFastPathAppend(env, s.Table, t, inserted)
+			t.MarkDirtyFrom(len(t.Rows) - inserted)
+		} else if inserted > 0 {
+			t.MarkDirtyFrom(-1)
+		}
 		t.Version++
 		t.InvalidateStats()
-		t.MarkDirtyFrom(len(t.Rows) - inserted)
 		markDependentMaterializedViewsStale(env, s.Table)
 	}
 	if len(s.Returning) > 0 {
@@ -432,7 +500,7 @@ func validateInsertNonUniqueConstraints(env ExecEnv, t *storage.Table, row []any
 			}
 		}
 	}
-	return nil
+	return validateCheckConstraints(env, t, row)
 }
 
 // tryFastPathAppend opportunistically hands the rows this INSERT statement
@@ -480,7 +548,11 @@ func tableHasDefaults(cols []storage.Column) bool {
 	return false
 }
 
-// constrainedColumnIndices returns, in ascending column-index order, every
+// emptyConstrainedCols is the shared result for a table without constrained
+// columns. It has no capacity, so any append allocates and it is never written.
+var emptyConstrainedCols = []int{}
+
+// constrainedColumnIndicesInto returns, in ascending column-index order, every
 // column validateOneRowConstraint could ever reject (NOT NULL or a
 // PRIMARY KEY/UNIQUE/FOREIGN KEY constraint). INSERT always validates every
 // inserted row against the table's full constraint set, but passing this
@@ -491,17 +563,20 @@ func tableHasDefaults(cols []storage.Column) bool {
 // function call and two field reads per column per row. Ascending order
 // preserves validateRowConstraintsWith's existing first-failure-wins error
 // semantics, same as ranging over t.Cols directly did.
-func constrainedColumnIndices(cols []storage.Column) []int {
+func constrainedColumnIndicesInto(cols []storage.Column, dst []int) []int {
 	// Always non-nil, even when empty: validateRowConstraintsWith treats a
 	// nil changedCols as "no restriction, check every column" -- an empty
 	// slice for a table with zero constrained columns must instead mean
 	// "nothing to check", not accidentally re-trigger the full scan this
 	// function exists to avoid.
-	idx := make([]int, 0, len(cols))
+	idx := dst[:0]
 	for i, c := range cols {
 		if c.NotNull || c.Constraint != storage.NoConstraint {
 			idx = append(idx, i)
 		}
+	}
+	if len(idx) == 0 {
+		return emptyConstrainedCols
 	}
 	return idx
 }
@@ -671,14 +746,14 @@ func validateRowConstraintsWith(env ExecEnv, t *storage.Table, row []any, exclud
 				return err
 			}
 		}
-		return nil
+		return validateCheckConstraints(env, t, row)
 	}
 	for _, colIdx := range changedCols {
 		if err := validateOneRowConstraint(env, t, row, excludeRow, colIdx, fks); err != nil {
 			return err
 		}
 	}
-	return nil
+	return validateCheckConstraints(env, t, row)
 }
 
 // validateOneRowConstraint is validateRowConstraints's per-column body,

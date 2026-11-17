@@ -51,12 +51,12 @@ func TestClassifyTransactionSQLSpellings(t *testing.T) {
 		// transaction support, so folding these onto BEGIN/COMMIT/ROLLBACK
 		// would silently discard or silently keep work. txNone routes them to
 		// the engine, which rejects them. Do not "fix" these rows.
-		{"SAVEPOINT sp1", txNone, false},
-		{"RELEASE sp1", txNone, false},
-		{"RELEASE SAVEPOINT sp1", txNone, false},
-		{"ROLLBACK TO sp1", txNone, false},
-		{"ROLLBACK TO SAVEPOINT sp1", txNone, false},
-		{"ROLLBACK TRANSACTION TO SAVEPOINT sp1", txNone, false},
+		{"SAVEPOINT sp1", txSavepointCreate, false},
+		{"RELEASE sp1", txSavepointRelease, false},
+		{"RELEASE SAVEPOINT sp1", txSavepointRelease, false},
+		{"ROLLBACK TO sp1", txSavepointRollback, false},
+		{"ROLLBACK TO SAVEPOINT sp1", txSavepointRollback, false},
+		{"ROLLBACK TRANSACTION TO SAVEPOINT sp1", txSavepointRollback, false},
 
 		// Not transaction control at all.
 		{"SELECT 1", txNone, false},
@@ -212,10 +212,10 @@ func TestENDCommitsViaQueryPath(t *testing.T) {
 }
 
 // TestSavepointSpellingsStillRejected is the counterpart to the txNone rows in
-// the classifier table: the driver must not have quietly started accepting
-// savepoints. Only the error's *kind* matters here (some rejection), not its
-// text, since the message comes from the engine.
-func TestSavepointSpellingsStillRejected(t *testing.T) {
+// TestSavepointSpellingsRequireActiveTxAndWorkInTx verifies that savepoint
+// statements fail outside a transaction, work inside an active transaction,
+// and leave the transaction intact when an unknown savepoint is referenced.
+func TestSavepointSpellingsRequireActiveTxAndWorkInTx(t *testing.T) {
 	d := &drv{}
 	rawConn, err := d.Open("mem://")
 	if err != nil {
@@ -226,18 +226,28 @@ func TestSavepointSpellingsStillRejected(t *testing.T) {
 	if _, err := c.ExecContext(ctx, "CREATE TABLE tx_sp (id INT)", nil); err != nil {
 		t.Fatal(err)
 	}
+	for _, sql := range []string{"SAVEPOINT sp1", "RELEASE sp1", "ROLLBACK TO sp1"} {
+		if _, err := c.ExecContext(ctx, sql, nil); err == nil {
+			t.Fatalf("%q outside transaction was accepted, want error", sql)
+		}
+	}
 	if _, err := c.ExecContext(ctx, "BEGIN", nil); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _, _ = c.ExecContext(ctx, "ROLLBACK", nil) }()
-	for _, sql := range []string{"SAVEPOINT sp1", "RELEASE sp1", "ROLLBACK TO sp1"} {
-		if _, err := c.ExecContext(ctx, sql, nil); err == nil {
-			t.Fatalf("%q was accepted; savepoints are not implemented and must keep failing", sql)
-		}
+	if _, err := c.ExecContext(ctx, "SAVEPOINT sp1", nil); err != nil {
+		t.Fatalf("SAVEPOINT sp1 failed: %v", err)
 	}
-	// A plain ROLLBACK must still work after those rejections, i.e. the
-	// rejected statements did not consume or corrupt the transaction.
+	if _, err := c.ExecContext(ctx, "ROLLBACK TO unknown_sp", nil); err == nil {
+		t.Fatal("expected ROLLBACK TO unknown_sp to fail")
+	}
 	if !c.inTx {
 		t.Fatal("transaction was lost by a rejected savepoint statement")
+	}
+	if _, err := c.ExecContext(ctx, "ROLLBACK TO sp1", nil); err != nil {
+		t.Fatalf("ROLLBACK TO sp1 failed: %v", err)
+	}
+	if _, err := c.ExecContext(ctx, "RELEASE sp1", nil); err != nil {
+		t.Fatalf("RELEASE sp1 failed: %v", err)
 	}
 }

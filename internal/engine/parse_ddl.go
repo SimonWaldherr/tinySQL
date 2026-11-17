@@ -107,11 +107,11 @@ func (p *Parser) parseCreateTable() (Statement, error) {
 		return nil, p.errf("expected table name")
 	}
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
-		cols, err := p.parseColumnDefs()
+		cols, checks, err := p.parseColumnDefs()
 		if err != nil {
 			return nil, err
 		}
-		return &CreateTable{Name: name, Cols: cols, IsTemp: isTemp, IfNotExists: ifNotExists}, nil
+		return &CreateTable{Name: name, Cols: cols, CheckConstraints: checks, IsTemp: isTemp, IfNotExists: ifNotExists}, nil
 	}
 	if p.cur.Typ == tKeyword && p.cur.Val == "AS" {
 		p.next()

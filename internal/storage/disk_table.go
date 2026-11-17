@@ -43,17 +43,18 @@ func tableToDiskRangeIndexed(tn string, t *Table, from, to int, includeIndexes b
 		vectorIndexes = t.snapshotVectorIndexes()
 	}
 	dt := diskTable{
-		Tenant:        tn,
-		Name:          t.Name,
-		IsTemp:        t.IsTemp,
-		Version:       t.Version,
-		StructVersion: t.structVersion,
-		Cols:          make([]diskColumn, len(t.Cols)),
-		Rows:          make([][]any, to-from),
-		Indexes:       indexes,
-		FTSIndexes:    ftsIndexes,
-		VectorIndexes: vectorIndexes,
-		Stats:         cloneTableStats(t.Stats),
+		Tenant:           tn,
+		Name:             t.Name,
+		IsTemp:           t.IsTemp,
+		CheckConstraints: CloneCheckConstraints(t.CheckConstraints),
+		Version:          t.Version,
+		StructVersion:    t.structVersion,
+		Cols:             make([]diskColumn, len(t.Cols)),
+		Rows:             make([][]any, to-from),
+		Indexes:          indexes,
+		FTSIndexes:       ftsIndexes,
+		VectorIndexes:    vectorIndexes,
+		Stats:            cloneTableStats(t.Stats),
 	}
 	for i, c := range t.Cols {
 		dt.Cols[i] = diskColumn(c)
@@ -83,12 +84,13 @@ func tableToDiskRows(tn string, t *Table, indexes []int) (diskTable, []int) {
 	}
 
 	dt := diskTable{
-		Tenant:  tn,
-		Name:    t.Name,
-		IsTemp:  t.IsTemp,
-		Version: t.Version,
-		Cols:    make([]diskColumn, len(t.Cols)),
-		Rows:    make([][]any, 0, len(kept)),
+		Tenant:           tn,
+		Name:             t.Name,
+		IsTemp:           t.IsTemp,
+		CheckConstraints: CloneCheckConstraints(t.CheckConstraints),
+		Version:          t.Version,
+		Cols:             make([]diskColumn, len(t.Cols)),
+		Rows:             make([][]any, 0, len(kept)),
 		// See tableToDiskRange: a delta record's Indexes field is never read
 		// back, so materializing it is pure cost on every UPDATE.
 		Stats: cloneTableStats(t.Stats),
@@ -176,6 +178,7 @@ func restoreDiskTable(dt diskTable, owned bool) *Table {
 		cols[i] = Column(c)
 	}
 	t := NewTable(dt.Name, cols, dt.IsTemp)
+	t.CheckConstraints = CloneCheckConstraints(dt.CheckConstraints)
 	t.Version = dt.Version
 	t.structVersion = dt.StructVersion
 	if owned {

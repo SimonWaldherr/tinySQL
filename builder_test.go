@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -282,5 +283,30 @@ func TestGeneratedInsertRoundTrip(t *testing.T) {
 	}
 	if len(table.Rows) != 2 || table.Rows[0][1] != "O'Reilly\n漢字" || !bytes.Equal(table.Rows[0][2].([]byte), payload) {
 		t.Fatal(table.Rows)
+	}
+}
+
+// ToSQL must not drop an ON CONFLICT clause: the rendered text has to parse
+// back to the same conflict target, assignments and WHERE filter.
+func TestBuilderInsertToSQLKeepsOnConflictClause(t *testing.T) {
+	for _, sql := range []string{
+		`INSERT INTO users (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = excluded.name, hits = users.hits + 1 WHERE users.hits < 10`,
+		`INSERT INTO users (id, name) VALUES (1, 'a') ON CONFLICT (id) DO NOTHING`,
+		`INSERT INTO users (id, name) VALUES (1, 'a') ON CONFLICT DO NOTHING`,
+	} {
+		stmt, err := engine.NewParser(sql).ParseStatement()
+		if err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		rendered := ToSQL(stmt)
+		again, err := engine.NewParser(rendered).ParseStatement()
+		if err != nil {
+			t.Fatalf("re-parse of %q (rendered %q): %v", sql, rendered, err)
+		}
+		want := stmt.(*engine.Insert)
+		got := again.(*engine.Insert)
+		if !reflect.DeepEqual(got.OnConflict, want.OnConflict) || got.OnConflictDoNothing != want.OnConflictDoNothing {
+			t.Fatalf("ON CONFLICT lost in %q:\nrendered: %s\ngot  %#v\nwant %#v", sql, rendered, got.OnConflict, want.OnConflict)
+		}
 	}
 }

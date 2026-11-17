@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -240,5 +241,25 @@ func TestDelayedInsertRunsDefaultsTriggersAndIndexesAtDelivery(t *testing.T) {
 	expectInt(t, audit[0]["amount"], 7, "default visible to trigger")
 	if len(execSQL(t, db, `CALL DELAYED_INSERTS()`).Rows) != 1 {
 		t.Fatal("batch limit ignored")
+	}
+}
+
+// A queued INSERT keeps only the target-less ON CONFLICT DO NOTHING flag, so a
+// conflict target or DO UPDATE must be refused instead of delivered as a plain
+// INSERT.
+func TestDelayedInsertRejectsConflictTargets(t *testing.T) {
+	db := storage.NewDB()
+	execSQL(t, db, `CREATE TABLE d (id INT PRIMARY KEY, note TEXT)`)
+	for _, sql := range []string{
+		`CALL DELAY_INSERT('0s', 'INSERT INTO d VALUES (1, ''a'') ON CONFLICT (id) DO NOTHING')`,
+		`CALL DELAY_INSERT('0s', 'INSERT INTO d VALUES (1, ''a'') ON CONFLICT (id) DO UPDATE SET note = excluded.note')`,
+	} {
+		_, err := Execute(context.Background(), db, "default", mustParse(sql))
+		if err == nil || !strings.Contains(err.Error(), "target-less ON CONFLICT DO NOTHING") {
+			t.Errorf("expected conflict-target rejection for %s, got %v", sql, err)
+		}
+	}
+	if _, err := Execute(context.Background(), db, "default", mustParse(`CALL DELAY_INSERT('0s', 'INSERT INTO d VALUES (1, ''a'') ON CONFLICT DO NOTHING')`)); err != nil {
+		t.Fatalf("target-less DO NOTHING should still enqueue: %v", err)
 	}
 }

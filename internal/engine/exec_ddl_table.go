@@ -23,7 +23,12 @@ func executeCreateTable(env ExecEnv, s *CreateTable) (*ResultSet, error) {
 		return executeCreateSpecializedTable(env, s)
 	}
 	if s.AsSelect == nil {
-		return nil, env.db.Put(env.tenant, storage.NewTable(s.Name, s.Cols, s.IsTemp))
+		if err := validateCheckConstraintSchema(s.Name, s.Cols, s.CheckConstraints); err != nil {
+			return nil, err
+		}
+		t := storage.NewTable(s.Name, s.Cols, s.IsTemp)
+		t.CheckConstraints = storage.CloneCheckConstraints(s.CheckConstraints)
+		return nil, env.db.Put(env.tenant, t)
 	}
 	rs, err := execStmt(env, s.AsSelect)
 	if err != nil {

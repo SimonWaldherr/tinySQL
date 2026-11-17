@@ -155,14 +155,15 @@ type Pragma struct {
 
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
-	Name         string
-	Cols         []storage.Column
-	IsTemp       bool
-	AsSelect     *Select
-	IfNotExists  bool     // IF NOT EXISTS clause
-	VirtualTable bool     // CREATE VIRTUAL TABLE
-	Using        string   // e.g. "fts"
-	FTSColumns   []string // columns passed to fts(...)
+	Name             string
+	Cols             []storage.Column
+	CheckConstraints []storage.CheckConstraint
+	IsTemp           bool
+	AsSelect         *Select
+	IfNotExists      bool     // IF NOT EXISTS clause
+	VirtualTable     bool     // CREATE VIRTUAL TABLE
+	Using            string   // e.g. "fts"
+	FTSColumns       []string // columns passed to fts(...)
 }
 
 // DropTable represents a DROP TABLE statement.
@@ -296,8 +297,17 @@ type DropTrigger struct {
 type AlterTable struct {
 	Table            string
 	AddColumn        *storage.Column // For ADD COLUMN
+	AddChecks        []storage.CheckConstraint
 	RenameColumnFrom string
 	RenameColumnTo   string
+}
+
+// OnConflictClause represents ON CONFLICT [(target...)] DO NOTHING | DO UPDATE SET ... [WHERE ...].
+type OnConflictClause struct {
+	TargetCols []string
+	DoNothing  bool
+	DoUpdate   map[string]Expr
+	Where      Expr
 }
 
 // Insert represents an INSERT statement.
@@ -307,6 +317,7 @@ type Insert struct {
 	Rows                [][]Expr
 	Select              *Select // INSERT INTO ... SELECT ...
 	OnConflictDoNothing bool
+	OnConflict          *OnConflictClause
 	Returning           []SelectItem
 }
 

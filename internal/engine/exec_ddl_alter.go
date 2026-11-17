@@ -1,7 +1,11 @@
 // ALTER TABLE.
 package engine
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
+)
 
 func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 	t, err := env.db.Get(env.tenant, s.Table)
@@ -10,6 +14,22 @@ func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 	}
 
 	if s.AddColumn != nil {
+		if len(s.AddChecks) > 0 {
+			nextCols := append(append([]storage.Column(nil), t.Cols...), *s.AddColumn)
+			if err := validateCheckConstraintSchema(t.Name, nextCols, s.AddChecks); err != nil {
+				return nil, err
+			}
+			tmpTable := storage.NewTable(t.Name, nextCols, t.IsTemp)
+			tmpTable.CheckConstraints = s.AddChecks
+			rowBuf := make([]any, len(nextCols))
+			for _, row := range t.Rows {
+				copy(rowBuf, row)
+				rowBuf[len(nextCols)-1] = nil
+				if err := validateCheckConstraints(env, tmpTable, rowBuf); err != nil {
+					return nil, err
+				}
+			}
+		}
 		// Added through storage rather than by appending to t.Cols here:
 		// storage.Table owns the column-name index that ColIndex answers
 		// from, and appending to Cols alone leaves a column no lookup can
@@ -17,6 +37,9 @@ func executeAlterTable(env ExecEnv, s *AlterTable) (*ResultSet, error) {
 		// mutates anything, and backfills existing rows. See its doc comment.
 		if err := t.AddColumn(*s.AddColumn); err != nil {
 			return nil, err
+		}
+		if len(s.AddChecks) > 0 {
+			t.CheckConstraints = append(t.CheckConstraints, s.AddChecks...)
 		}
 		t.InvalidateStats()
 		// Deliberately no db.Put: t is the live table and has just been

@@ -25,7 +25,8 @@ type StatementSnapshot struct {
 	// restoreAppendOnlyTable). Keeping it outside tables avoids allocating two
 	// small maps for every ordinary INSERT while preserving the same in-place
 	// restore path.
-	appendOnly *appendOnlyTableState
+	appendOnly      *appendOnlyTableState
+	appendOnlyState appendOnlyTableState
 	// rowUpdate is the compact rollback state for a triggerless UPDATE whose
 	// constraint-index seek bounds the only rows it can replace.
 	rowUpdate *rowUpdateTableState
@@ -378,9 +379,9 @@ func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*Stateme
 	if err != nil {
 		return nil, err
 	}
-	return &StatementSnapshot{
+	snap := &StatementSnapshot{
 		tenant: tenant,
-		appendOnly: &appendOnlyTableState{
+		appendOnlyState: appendOnlyTableState{
 			table:          table,
 			rowCount:       len(table.Rows),
 			version:        table.Version,
@@ -390,7 +391,9 @@ func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*Stateme
 			dirtyRowsState: table.dirtyRowsState,
 		},
 		catalog: armCatalogRollback(db.Catalog()),
-	}, nil
+	}
+	snap.appendOnly = &snap.appendOnlyState
+	return snap, nil
 }
 
 // SnapshotForRowUpdateStatement captures a lightweight rollback point for an
@@ -772,6 +775,7 @@ func restoreTable(dst, saved *Table) {
 	dst.vectorGeneration = copy.vectorGeneration
 	dst.vectorPersistedGeneration = copy.vectorPersistedGeneration
 	dst.IsTemp = copy.IsTemp
+	dst.CheckConstraints = copy.CheckConstraints
 	dst.colPos = copy.colPos
 	dst.Version = copy.Version
 	dst.structVersion = copy.structVersion

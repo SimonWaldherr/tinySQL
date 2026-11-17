@@ -161,14 +161,55 @@ frames. STRING_SPLIT accepts multi-character delimiters and an optional ordinal
 column. [SQL semantics](sql-semantics.md) describes the contracts, execution
 fallbacks and remaining window limitations.
 
+## Constraints, upserts and savepoints
+
+| Feature | Behavior |
+| --- | --- |
+| `CHECK` constraints | Column-level or table-level, optionally named with `CONSTRAINT name`. Accepted by CREATE TABLE and by ALTER TABLE ... ADD COLUMN, which validates the existing rows first. Enforced on INSERT, UPDATE and upsert with SQL three-valued logic: FALSE fails, while TRUE and NULL pass. Subqueries, aggregates, window functions and parameters are rejected when the table is defined. |
+| `ON CONFLICT (target) DO UPDATE` | The target is a PRIMARY KEY or UNIQUE column, or a unique index whose columns match the target exactly. `excluded.column` is the proposed row. The existing row is read by column name or qualified by the table name. An optional `WHERE` gates the update. `DO NOTHING` also accepts a target. The conflict update fires AFTER UPDATE triggers, with the existing row as `OLD`. |
+| `SAVEPOINT`, `RELEASE`, `ROLLBACK TO` | Accepted by the database/sql driver inside an explicit transaction. Savepoints nest, and `ROLLBACK TO` keeps the savepoint. Outside a transaction they fail. |
+
+```sql
+CREATE TABLE inventory (
+  id  INT PRIMARY KEY,
+  sku TEXT UNIQUE,
+  qty INT NOT NULL CHECK (qty >= 0)
+);
+
+INSERT INTO inventory VALUES (1, 'A1', 5)
+  ON CONFLICT (id) DO UPDATE SET qty = inventory.qty + excluded.qty
+  WHERE inventory.qty < 1000
+  RETURNING id, qty;
+
+BEGIN;
+INSERT INTO inventory VALUES (2, 'B2', 3);
+SAVEPOINT before_restock;
+UPDATE inventory SET qty = qty * 2;
+ROLLBACK TO SAVEPOINT before_restock; -- the doubling is undone, the insert stays
+COMMIT;
+```
+
+- The proposed row is checked against CHECK constraints before the conflict
+  lookup. A malformed row is rejected even when `DO NOTHING` would skip it, in
+  the same way NOT NULL is enforced first.
+- `DELAY_INSERT` queues only a target-less `ON CONFLICT DO NOTHING`. A conflict
+  target or `DO UPDATE` is rejected when the row is queued, because the queued
+  form keeps no more than that flag.
+- A savepoint copies the transaction's tables when it is created. A long
+  transaction that opens many savepoints over large tables pays for each copy.
+- On `mode=advancedwal`, `ROLLBACK TO SAVEPOINT` logs compensating row
+  operations, so a restart replays the transaction to the savepoint's state. It
+  cannot undo a CREATE, DROP or ALTER TABLE made after the savepoint: that
+  rollback fails and the transaction continues unchanged. Other modes have no
+  such restriction.
+- `RowsAffected` for an INSERT still counts the VALUES rows, so a skipped or
+  unchanged conflict is included in the count.
+
 ## Important remaining gaps
 
 | Missing operation | Current boundary | Main implementation work |
 | --- | --- | --- |
-| `CHECK` constraints | Explicitly rejected by column/table constraint parsing | Persist expressions and enforce SQL three-valued constraint semantics on INSERT, UPDATE and schema changes. |
 | Composite PRIMARY/UNIQUE/FOREIGN KEY constraints | Constraint metadata is column-oriented | Composite metadata, conflict indexes, foreign-key matching and cascades. |
-| `ON CONFLICT (...) DO UPDATE` / full UPSERT | Only target-less `DO NOTHING` exists | Conflict-target resolution, `excluded` row binding, UPDATE constraints and triggers. |
-| `SAVEPOINT`, `ROLLBACK TO`, `RELEASE` | Driver deliberately rejects nested transaction spellings | Nested rollback boundaries integrated with storage and WAL. |
 | Partial indexes and generated columns | Not supported by the schema/parser | Persist predicates/expressions and maintain them on every mutation path. |
 | WITH-prefixed UPDATE/DELETE and modifying CTE bodies | SELECT-based CTEs only | DML scope, execution order, RETURNING relations and atomic rollback. |
 
@@ -186,8 +227,14 @@ go test ./cmd/gameoflife
 go test ./internal/engine -run 'TestInSubquery|TestInScalarSubquery|TestLogicalSubqueriesDeclineRawFilter|TestSubqueryRequiresSingleColumn|TestSubqueryCache|TestFetchDefaultCountAndSingularOffset|TestPagination'
 go test ./internal/driver -run TestSQLPreparedInSubqueryBindingsAndFetch
 go test ./cmd/wasm_browser
+go test ./internal/engine -run 'TestCheckConstraints|TestOnConflict|TestDelayedInsertRejectsConflictTargets'
+go test ./internal/driver -run 'TestSavepoint|TestDriverSavepoints|TestSQLiteTransactionSpellings|TestUpsertAndCheckConstraintsSurviveRestart'
+go test . -run TestBuilderInsertToSQLKeepsOnConflictClause
 ```
 
 The regressions cover operator precedence, NULL/zero/negative/decimal operands,
 raw scans and joins, nested CTE scope, recursive INSERT, conflicts and rollback,
 delayed delivery, prepared parameters, empty joined views and fresh view data.
+The constraint, upsert and savepoint regressions also reopen the database: a
+copy taken while it is open exercises WAL replay, and a clean restart exercises
+the checkpoint.

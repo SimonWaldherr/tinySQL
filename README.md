@@ -92,9 +92,10 @@ describe internals and compatibility guarantees.
 - Use one writer process per database. [Server replicas](docs/cluster.md) are
   asynchronous; sharding, automatic failover, multi-primary writes, and
   distributed transactions are not supported.
-- Composite PRIMARY/UNIQUE/FOREIGN KEY, CHECK, target-bearing ON CONFLICT DO UPDATE,
-  SAVEPOINT, ATTACH/DETACH, VACUUM, partial indexes, generated columns, and
-  data-modifying CTE bodies are not supported.
+- Composite PRIMARY/UNIQUE/FOREIGN KEY, ATTACH/DETACH, VACUUM, partial indexes,
+  generated columns, and data-modifying CTE bodies are not supported. CHECK,
+  `ON CONFLICT (target) DO UPDATE` and SAVEPOINT work, with the limits described
+  in [SQL feature gaps](docs/sql-feature-gaps.md#constraints-upserts-and-savepoints).
 - Secondary indexes accelerate equality/prefix seeks and numeric ranges. Use
   GEO_SEARCH for indexed point-column bbox/radius queries; ordinary
   WHERE GEO_DWITHIN(...) predicates are not planner-accelerated.

@@ -6,7 +6,9 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -214,6 +216,12 @@ func (c *conn) rollbackTx() error {
 	return err
 }
 
+type txSavepoint struct {
+	name   string
+	shadow *storage.DB
+	dirty  bool
+}
+
 func (c *conn) clearTxState() {
 	if c.txRelease != nil {
 		c.txRelease()
@@ -225,4 +233,96 @@ func (c *conn) clearTxState() {
 	c.txReadOnly = false
 	c.txDirty = false
 	c.txCatalogRev = 0
+	c.savepoints = nil
+}
+
+func (c *conn) savepoint(name string) error {
+	if !c.inTx {
+		return fmt.Errorf("tinysql: SAVEPOINT requires an active transaction")
+	}
+	var spShadow *storage.DB
+	if c.shadow != nil {
+		spShadow = c.snapshotShadow()
+	}
+	c.savepoints = append(c.savepoints, txSavepoint{
+		name:   strings.ToLower(name),
+		shadow: spShadow,
+		dirty:  c.txDirty,
+	})
+	return nil
+}
+
+func (c *conn) findSavepoint(name string) int {
+	target := strings.ToLower(name)
+	for i := len(c.savepoints) - 1; i >= 0; i-- {
+		if c.savepoints[i].name == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func (c *conn) rollbackToSavepoint(name string) error {
+	if !c.inTx {
+		return fmt.Errorf("tinysql: ROLLBACK TO SAVEPOINT requires an active transaction")
+	}
+	idx := c.findSavepoint(name)
+	if idx < 0 {
+		return fmt.Errorf("tinysql: no such savepoint: %s", name)
+	}
+	sp := c.savepoints[idx]
+	var restored *storage.DB
+	if sp.shadow != nil {
+		if err := c.logSavepointRestore(sp.shadow); err != nil {
+			return err
+		}
+		// The savepoint copy is never written, so each rollback takes a fresh
+		// writable shadow and the same savepoint stays usable afterwards.
+		restored = sp.shadow.SnapshotForWriteTx()
+		restored.AdoptAmbientWALTx(c.shadow)
+	}
+	c.shadow = restored
+	c.txDirty = sp.dirty
+	c.savepoints = c.savepoints[:idx+1]
+	return nil
+}
+
+// snapshotShadow copies the transaction's shadow. Tables the shadow has not
+// written yet can still be shared with the live database (see
+// SnapshotForTxShared), so the copy is taken under the same content read lock
+// BeginTx holds for its own snapshot.
+func (c *conn) snapshotShadow() *storage.DB {
+	c.srv.db.LockContentForRead()
+	defer c.srv.db.UnlockContentForRead()
+	return c.shadow.SnapshotForWriteTx()
+}
+
+// logSavepointRestore records, in the transaction's AdvancedWAL transaction,
+// the row operations that discard what was done after saved was taken. A
+// schema error is returned before anything is logged, so the transaction stays
+// usable. Any other failure can leave part of the compensation in the log, so
+// the whole transaction is rolled back rather than committed in that state.
+func (c *conn) logSavepointRestore(saved *storage.DB) error {
+	c.srv.db.LockContentForRead()
+	err := c.shadow.LogSavepointRestore(saved)
+	c.srv.db.UnlockContentForRead()
+	if err == nil || errors.Is(err, storage.ErrSavepointSchemaRollback) {
+		return err
+	}
+	if rbErr := c.rollbackTx(); rbErr != nil {
+		return fmt.Errorf("tinysql: ROLLBACK TO SAVEPOINT failed (%v) and aborting the transaction also failed: %w", err, rbErr)
+	}
+	return fmt.Errorf("tinysql: ROLLBACK TO SAVEPOINT failed, the transaction was rolled back: %w", err)
+}
+
+func (c *conn) releaseSavepoint(name string) error {
+	if !c.inTx {
+		return fmt.Errorf("tinysql: RELEASE SAVEPOINT requires an active transaction")
+	}
+	idx := c.findSavepoint(name)
+	if idx < 0 {
+		return fmt.Errorf("tinysql: no such savepoint: %s", name)
+	}
+	c.savepoints = c.savepoints[:idx]
+	return nil
 }

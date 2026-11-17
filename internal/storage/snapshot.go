@@ -103,6 +103,7 @@ func (db *DB) SnapshotForTx() (base *DB, shadow *DB) {
 // cannot hide a change.
 func cloneTableMeta(t *Table) *Table {
 	nt := NewTable(t.Name, t.Cols, t.IsTemp)
+	nt.CheckConstraints = CloneCheckConstraints(t.CheckConstraints)
 	nt.Version = t.Version
 	nt.structVersion = t.structVersion
 	nt.rowUpdateBase = t.rowUpdateBase
@@ -186,6 +187,7 @@ func cloneTableCore(t *Table, rows [][]any, copySearchIndexes, borrow bool) *Tab
 	cols := make([]Column, len(t.Cols))
 	copy(cols, t.Cols)
 	nt := NewTable(t.Name, cols, t.IsTemp)
+	nt.CheckConstraints = CloneCheckConstraints(t.CheckConstraints)
 	nt.Version = t.Version
 	nt.structVersion = t.structVersion
 	nt.rowUpdateBase = t.rowUpdateBase

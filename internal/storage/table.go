@@ -51,6 +51,7 @@ type Table struct {
 	vectorGeneration          int
 	vectorPersistedGeneration int
 	IsTemp                    bool
+	CheckConstraints          []CheckConstraint
 	colPos                    map[string]int
 	Version                   int
 	// Stats is populated by ANALYZE and persisted with the table. DML marks it
@@ -418,6 +419,16 @@ type TableStats struct {
 	Columns    map[string]ColumnStats // lower-cased column name → statistics
 	AnalyzedAt time.Time
 	Stale      bool
+}
+
+// CloneCheckConstraints returns a copy of src (or nil if empty).
+func CloneCheckConstraints(src []CheckConstraint) []CheckConstraint {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]CheckConstraint, len(src))
+	copy(out, src)
+	return out
 }
 
 // NewTable creates a new Table with case-insensitive column lookup indices.

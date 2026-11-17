@@ -1032,7 +1032,47 @@ func insertToSQL(i *engine.Insert) string {
 		}
 		sb.WriteString(")")
 	}
+	switch {
+	case i.OnConflict != nil:
+		writeOnConflictSQL(&sb, i.OnConflict)
+	case i.OnConflictDoNothing:
+		sb.WriteString(" ON CONFLICT DO NOTHING")
+	}
 	return sb.String()
+}
+
+// writeOnConflictSQL renders an ON CONFLICT clause in the form the parser
+// accepts. SET assignments are sorted by column because they are stored in a
+// map.
+func writeOnConflictSQL(sb *strings.Builder, oc *engine.OnConflictClause) {
+	sb.WriteString(" ON CONFLICT")
+	if len(oc.TargetCols) > 0 {
+		sb.WriteString(" (")
+		sb.WriteString(strings.Join(oc.TargetCols, ", "))
+		sb.WriteString(")")
+	}
+	if oc.DoNothing {
+		sb.WriteString(" DO NOTHING")
+		return
+	}
+	cols := make([]string, 0, len(oc.DoUpdate))
+	for col := range oc.DoUpdate {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+	sb.WriteString(" DO UPDATE SET ")
+	for n, col := range cols {
+		if n > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(col)
+		sb.WriteString(" = ")
+		writeExprSQL(sb, oc.DoUpdate[col])
+	}
+	if oc.Where != nil {
+		sb.WriteString(" WHERE ")
+		writeExprSQL(sb, oc.Where)
+	}
 }
 
 func updateToSQL(u *engine.Update) string {
