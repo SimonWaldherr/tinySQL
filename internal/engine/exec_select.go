@@ -602,6 +602,9 @@ type simpleSelectPlan struct {
 	// rowIDs is nil for a table scan. A non-nil slice is a materialized
 	// secondary-index point/prefix seek and contains table row positions.
 	rowIDs []int
+	// rowIDBuf is a stack/inline buffer for small point-lookup results so
+	// single-row PK/UNIQUE seeks do not allocate a slice on the heap.
+	rowIDBuf [8]int
 	// rows is a query-private source supplied by page-oriented index seeks.
 	// It is never retained in a cached plan, so decoded BLOBs remain bounded
 	// to the request that loaded them.

@@ -54,8 +54,8 @@ func coerceToTypeAllowNull(v any, t storage.ColType) (any, error) {
 	case storage.FloatType:
 		return coerceToFloat(v)
 	case storage.TextType:
-		if s, ok := v.(string); ok {
-			return s, nil
+		if _, ok := v.(string); ok {
+			return v, nil
 		}
 		return valueText(v), nil
 	case storage.BoolType:
@@ -118,8 +118,8 @@ func coerceColumnValue(v any, col storage.Column) (any, error) {
 		if _, ok := v.([]byte); ok {
 			return v, nil
 		}
-		if s, ok := v.(string); ok {
-			return s, nil
+		if _, ok := v.(string); ok {
+			return v, nil
 		}
 		return valueText(v), nil
 	case storage.AffinityNumeric:

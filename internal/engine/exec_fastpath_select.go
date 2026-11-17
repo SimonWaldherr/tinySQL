@@ -15,10 +15,12 @@ import (
 )
 
 func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error) {
-	plan, ok, err := buildSimpleSelectPlan(env, s)
+	var planStorage simpleSelectPlan
+	ok, err := buildSimpleSelectPlanInto(&planStorage, env, s)
 	if !ok || err != nil {
 		return nil, ok, err
 	}
+	plan := &planStorage
 	if s.Distinct {
 		// Ordered DISTINCT may sort only projected keys after deduplication.
 		// Non-projected ordering and colliding output names retain the general path.

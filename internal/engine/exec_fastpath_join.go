@@ -55,12 +55,14 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 		}
 		for rowID := rightByKey.first(comparableKeyPart(leftKey)); rowID != 0; rowID = rightByKey.after(rowID) {
 			right := rightByKey.rows[rowID-1]
-			match, err := evalJoinRawWhere(plan, left, right)
-			if err != nil {
-				return nil, true, err
-			}
-			if !match {
-				continue
+			if plan.where != nil {
+				match, err := evalJoinRawWhere(plan, left, right)
+				if err != nil {
+					return nil, true, err
+				}
+				if !match {
+					continue
+				}
 			}
 			out, err := projectJoinRawRow(plan, left, right)
 			if err != nil {

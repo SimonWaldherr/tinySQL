@@ -130,7 +130,11 @@ func explainSelect(env ExecEnv, rows *[]Row, sel *Select, prefix string) {
 		if err == nil && ok {
 			detail := fmt.Sprintf("table=%s scan=%s estimated_rows=%d", sel.From.Table, plan.scanType, plan.estimatedRows)
 			if plan.indexName != "" {
-				detail += fmt.Sprintf(" index=%s predicates=%s residual_filter=%t covering_index=%t", plan.indexName, strings.Join(plan.indexPredicates, ", "), plan.residualFilter, plan.coveringIndex)
+				preds := strings.Join(plan.indexPredicates, ", ")
+				if preds == "" && plan.scanType == "CONSTRAINT INDEX POINT SEEK" {
+					preds = plan.indexName + " = ?"
+				}
+				detail += fmt.Sprintf(" index=%s predicates=%s residual_filter=%t covering_index=%t", plan.indexName, preds, plan.residualFilter, plan.coveringIndex)
 			}
 			addExplainStep(rows, plan.scanType, detail)
 			if batchAggregate {

@@ -13,12 +13,21 @@ import (
 )
 
 func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, error) {
+	var plan simpleSelectPlan
+	ok, err := buildSimpleSelectPlanInto(&plan, env, s)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	return &plan, true, nil
+}
+
+func buildSimpleSelectPlanInto(plan *simpleSelectPlan, env ExecEnv, s *Select) (bool, error) {
 	// Trigger pseudo-columns require the general evaluator's ambient bindings.
 	if env.triggerRow != nil {
-		return nil, false, nil
+		return false, nil
 	}
 	if !simpleSelectEligible(s) {
-		return nil, false, nil
+		return false, nil
 	}
 
 	// ModePagedIndex exposes table schema and index roots without loading row
@@ -27,35 +36,38 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 	// deliberately fall through to the established full-table compatibility
 	// path rather than pretending a scan is a page seek.
 	if metadata, paged, metaErr := env.db.PagedIndexMetadata(env.tenant, s.From.Table); metaErr != nil {
-		return nil, true, metaErr
+		return true, metaErr
 	} else if paged {
 		if s.Limit != nil && *s.Limit == 0 {
 			template, ok, err := loadSimpleSelectPlanTemplate(metadata, s, true)
 			if !ok || err != nil {
-				return nil, ok, err
+				return ok, err
 			}
-			plan := *template
-			bindSimplePlanClock(&plan, env)
+			*plan = *template
+			bindSimplePlanClock(plan, env)
 			plan.table = metadata
-			return simpleLimitZeroPlan(env, &plan)
+			if _, ok, err := simpleLimitZeroPlan(env, plan); !ok || err != nil {
+				return ok, err
+			}
+			return true, nil
 		}
 		colIndex := simpleColumnIndex(metadata, aliasOr(s.From))
 		if idx, values, predicates, residual := selectSecondaryIndex(metadata, colIndex, s.Where); idx != nil && len(values) == len(idx.Columns) {
 			rows, exists, seekErr := env.db.PagedIndexRows(env.tenant, s.From.Table, idx.Name, values)
 			if seekErr != nil {
-				return nil, true, seekErr
+				return true, seekErr
 			}
 			if exists {
 				// Compile/cache from immutable schema metadata. Candidate rows live
 				// only on this plan copy, so a template never retains a decoded BLOB.
 				template, ok, err := loadSimpleSelectPlanTemplate(metadata, s, true)
 				if !ok || err != nil {
-					return nil, ok, err
+					return ok, err
 				}
-				plan := *template
-				bindSimplePlanClock(&plan, env)
+				*plan = *template
+				bindSimplePlanClock(plan, env)
 				plan.table = metadata
-				resetSimplePlanAccess(&plan, len(rows))
+				resetSimplePlanAccess(plan, len(rows))
 				plan.rows = rows
 				plan.scanType = "PAGED INDEX POINT SEEK"
 				plan.indexName = idx.Name
@@ -63,7 +75,7 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 				plan.residualFilter = residual
 				plan.coveringIndex = projectionsCoveredByIndex(plan.projs, idx, metadata)
 				plan.estimatedRows = len(rows)
-				return &plan, true, nil
+				return true, nil
 			}
 		}
 	}
@@ -74,28 +86,31 @@ func buildSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, bool, err
 		if mv, ok := env.db.Catalog().GetMaterializedView(schema, name); ok {
 			table, err = ensureMaterializedViewCache(env, s.From.Table, mv)
 			if err != nil {
-				return nil, true, err
+				return true, err
 			}
 		} else if isCatalogViewSource(env, s.From.Table) {
-			return nil, false, nil
+			return false, nil
 		} else {
-			return nil, true, err
+			return true, err
 		}
 	}
 	template, ok, err := loadSimpleSelectPlanTemplate(table, s, false)
 	if !ok || err != nil {
-		return nil, ok, err
+		return ok, err
 	}
-	plan := *template
-	bindSimplePlanClock(&plan, env)
+	*plan = *template
+	bindSimplePlanClock(plan, env)
 	if s.Limit != nil && *s.Limit == 0 {
-		return simpleLimitZeroPlan(env, &plan)
+		if _, ok, err := simpleLimitZeroPlan(env, plan); !ok || err != nil {
+			return ok, err
+		}
+		return true, nil
 	}
-	resetSimplePlanAccess(&plan, len(table.Rows))
-	if err := selectSimplePlanIndexRows(&plan, s.Where); err != nil {
-		return nil, true, err
+	resetSimplePlanAccess(plan, len(table.Rows))
+	if err := selectSimplePlanIndexRows(plan, s.Where); err != nil {
+		return true, err
 	}
-	return &plan, true, nil
+	return true, nil
 }
 
 // selectSimplePlanIndexRows shares candidate selection between projections
@@ -156,14 +171,13 @@ func selectSimplePlanIndexRows(plan *simpleSelectPlan, where Expr) error {
 			plan.coveringIndex = projectionsCoveredByIndex(plan.projs, rangePlan.index, table)
 			plan.estimatedRows = len(rowIDs)
 		}
-	} else if rowIDs, column, residual, ok := selectConstraintIndex(table, plan.colIndex, where); ok {
+	} else if rowIDs, column, residual, ok := selectConstraintIndexInto(table, plan.colIndex, where, plan.rowIDBuf[:0]); ok {
 		// PRIMARY KEY and UNIQUE enforcement already maintains this hash index
 		// incrementally for DML. Reusing it here avoids a full table scan for
 		// the common key lookup shape without adding another persistent index.
 		plan.rowIDs = rowIDs
 		plan.scanType = "CONSTRAINT INDEX POINT SEEK"
 		plan.indexName = column
-		plan.indexPredicates = []string{column + " = ?"}
 		plan.residualFilter = residual
 		plan.filterFullyCovered = !residual
 		plan.estimatedRows = len(rowIDs)
@@ -456,8 +470,28 @@ func selectSecondaryIndex(table *storage.Table, colIndex map[string]int, where E
 // complete point lookups. The normal raw filter still runs over the located
 // rows, preserving residual predicates and SQL's three-valued logic.
 func selectConstraintIndex(table *storage.Table, colIndex map[string]int, where Expr) ([]int, string, bool, bool) {
+	return selectConstraintIndexInto(table, colIndex, where, nil)
+}
+
+func selectConstraintIndexInto(table *storage.Table, colIndex map[string]int, where Expr, dst []int) ([]int, string, bool, bool) {
 	if table == nil || where == nil {
 		return nil, "", false, false
+	}
+	// Fast path for a single `col = lit` predicate: avoid allocating the map.
+	if predicate, single := where.(*Binary); single && predicate.Op == "=" {
+		colIdx, value, ok := extractConstraintEquality(predicate, table, colIndex, false)
+		if !ok || colIdx < 0 || colIdx >= len(table.Cols) {
+			return nil, "", false, false
+		}
+		column := table.Cols[colIdx]
+		if column.Constraint != storage.PrimaryKey && column.Constraint != storage.Unique {
+			return nil, "", false, false
+		}
+		rows := lookupConstraintIndexRowsInto(getConstraintIndex(table, colIdx), value, dst)
+		if rows == nil {
+			rows = emptyRowIDs
+		}
+		return rows, column.Name, false, true
 	}
 	equalities := make(map[int]any)
 	collectConstraintEqualityTerms(where, table, colIndex, equalities, false)
@@ -473,15 +507,65 @@ func selectConstraintIndex(table *storage.Table, colIndex map[string]int, where 
 		if column.Constraint != storage.PrimaryKey && column.Constraint != storage.Unique {
 			continue
 		}
-		rows := lookupConstraintIndexRows(getConstraintIndex(table, colIdx), value)
+		rows := lookupConstraintIndexRowsInto(getConstraintIndex(table, colIdx), value, dst)
 		// A non-nil empty slice distinguishes an indexed negative lookup from
 		// the nil RowID set used for a table scan.
 		if rows == nil {
-			rows = []int{}
+			rows = emptyRowIDs
 		}
 		return rows, column.Name, residual, true
 	}
 	return nil, "", false, false
+}
+
+var emptyRowIDs = []int{}
+
+func extractConstraintEquality(b *Binary, table *storage.Table, colIndex map[string]int, warmOnly bool) (int, any, bool) {
+	if b.Op != "=" {
+		return 0, nil, false
+	}
+	ref, ok := b.Left.(*VarRef)
+	operand := b.Right
+	if !ok {
+		ref, ok = b.Right.(*VarRef)
+		operand = b.Left
+	}
+	if !ok {
+		return 0, nil, false
+	}
+	key := ref.Lower
+	if key == "" {
+		key = strings.ToLower(ref.Name)
+	}
+	pos, found := colIndex[key]
+	if !found || pos < 0 || pos >= len(table.Cols) {
+		return 0, nil, false
+	}
+	if lit, ok := operand.(*Literal); ok {
+		return pos, lit.Val, true
+	}
+	literal, ok := signedNumericLiteral(operand)
+	if !ok {
+		return 0, nil, false
+	}
+	value, ok := signedIntegerKey(literal)
+	if !ok {
+		return 0, nil, false
+	}
+	constraint := table.Cols[pos].Constraint
+	if constraint != storage.PrimaryKey && constraint != storage.Unique {
+		return 0, nil, false
+	}
+	var index *constraintIndexEntry
+	if warmOnly {
+		index = currentConstraintIndex(table, pos)
+	} else {
+		index = getConstraintIndex(table, pos)
+	}
+	if index == nil || index.nonIntegerRows != 0 {
+		return 0, nil, false
+	}
+	return pos, value, true
 }
 
 // collectConstraintEqualityTerms extends literal equality to signed integral
@@ -546,13 +630,18 @@ func collectConstraintEqualityTerms(expr Expr, table *storage.Table, colIndex ma
 // equal values as identical. Merging at most three buckets preserves that SQL
 // behavior without falling back to a full scan.
 func lookupConstraintIndexRows(index *constraintIndexEntry, value any) []int {
+	return lookupConstraintIndexRowsInto(index, value, nil)
+}
+
+func lookupConstraintIndexRowsInto(index *constraintIndexEntry, value any, dst []int) []int {
 	if index == nil {
 		return nil
 	}
-	// Gather every candidate bucket's rows into one stack buffer; the only
-	// allocation is the returned slice itself.
 	var stack [8]int
-	rows := stack[:0]
+	rows := dst[:0]
+	if cap(rows) == 0 {
+		rows = stack[:0]
+	}
 	buckets := 0
 	add := func(v any) {
 		var ok bool
@@ -582,6 +671,12 @@ func lookupConstraintIndexRows(index *constraintIndexEntry, value any) []int {
 	}
 	if len(rows) == 0 {
 		return nil
+	}
+	if cap(dst) >= len(rows) {
+		if buckets > 1 {
+			sort.Ints(rows)
+		}
+		return rows
 	}
 	out := append(make([]int, 0, len(rows)), rows...)
 	if buckets > 1 {
