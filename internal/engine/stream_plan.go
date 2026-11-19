@@ -50,15 +50,16 @@ func buildStreamingSimpleSelectPlan(env ExecEnv, s *Select) (*simpleSelectPlan, 
 	resetSimplePlanAccess(&plan, 0)
 	source := &pagedSimpleSelectSource{tenant: env.tenant, table: s.From.Table}
 
-	// A complete composite equality predicate maps to one contiguous physical
-	// index key. The 0xff suffix includes every row-ID payload behind a
-	// non-unique key while remaining before the next complete component (whose
-	// type tag is at most 0x7f in CanonicalIndexKey).
+	// A complete equality predicate on a unique index maps to one physical key.
 	if idx, values, predicates, residual := selectSecondaryIndex(metadata, plan.colIndex, s.Where); idx != nil && len(values) == len(idx.Columns) {
 		start := storage.CanonicalIndexKey(values)
 		source.indexName = idx.Name
 		source.startKey = start
-		source.endKey = append(append([]byte(nil), start...), 0xff)
+		source.endKey = start // The cursor's bounds are inclusive.
+		if !idx.Unique {
+			// Include extensions of a non-unique key up to the next component.
+			source.endKey = append(append([]byte(nil), start...), 0xff)
+		}
 		plan.scanType = "PAGED INDEX POINT SEEK"
 		plan.pagedSingleRow = idx.Unique
 		plan.indexName = idx.Name

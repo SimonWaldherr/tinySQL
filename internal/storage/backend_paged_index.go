@@ -513,6 +513,14 @@ func (b *PagedIndexBackend) LocateIndex(tenant, table, indexName string) (*Paged
 	return &PagedIndexLocator{page: b.page, tableRoot: metadata.tableRoot, indexRoot: root, indexName: indexName}, true, nil
 }
 
+// LookupUniqueRow decodes the row selected by a complete unique key.
+func (locator *PagedIndexLocator) LookupUniqueRow(key []byte) ([]any, bool, error) {
+	if locator == nil || locator.page == nil {
+		return nil, false, errors.New("paged index locator is unavailable")
+	}
+	return locator.page.LookupUniqueIndexRowByRoot(locator.tableRoot, locator.indexRoot, locator.indexName, key)
+}
+
 // LookupUniqueColumn performs an exact seek through a unique index and
 // invokes visit with one decoded column from the matching table row.
 func (locator *PagedIndexLocator) LookupUniqueColumn(key []byte, column int, visit func(any) error) (bool, error) {

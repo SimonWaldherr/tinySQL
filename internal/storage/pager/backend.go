@@ -578,42 +578,28 @@ func (pb *PageBackend) LookupIndexRowsByRoot(tableRoot, indexRoot PageID, indexN
 	return pb.lookupIndexRowsLocked(tableRoot, indexRoot, indexName, key)
 }
 
+// LookupUniqueIndexRowByRoot returns an owned row for a complete unique key.
+func (pb *PageBackend) LookupUniqueIndexRowByRoot(tableRoot, indexRoot PageID, indexName string, key []byte) ([]any, bool, error) {
+	var row []any
+	found, err := pb.visitUniqueIndexRow(tableRoot, indexRoot, indexName, key, func(encoded []byte, owned bool) error {
+		var err error
+		row, err = unmarshalRow(encoded, !owned)
+		return err
+	})
+	return row, found, err
+}
+
 // LookupUniqueIndexRowColumnByRoot resolves one unique index entry and decodes
 // only the requested table column. It avoids allocating a row-ID slice, an
 // outer rows slice and values for columns the typed caller does not consume.
 func (pb *PageBackend) LookupUniqueIndexRowColumnByRoot(tableRoot, indexRoot PageID, indexName string, key []byte, column int, visit func(any) error) (bool, error) {
-	pb.mu.RLock()
-	defer pb.mu.RUnlock()
-	if tableRoot == InvalidPageID || indexRoot == InvalidPageID {
-		return false, nil
-	}
-	var rowID int64
-	found, err := NewBTree(pb.pager, indexRoot).GetValue(key, func(value []byte) error {
-		if len(value) != 12 || binary.BigEndian.Uint32(value[:4]) != 1 {
-			return fmt.Errorf("unique index %s has invalid row locator", indexName)
-		}
-		rowID = int64(binary.BigEndian.Uint64(value[4:12]))
-		return nil
-	})
-	if err != nil || !found {
-		return found, err
-	}
-	var rowKey [8]byte
-	binary.BigEndian.PutUint64(rowKey[:], uint64(rowID))
-	found, err = NewBTree(pb.pager, tableRoot).getValue(rowKey[:], func(encoded []byte, owned bool) error {
-		value, decodeErr := unmarshalRowColumn(encoded, column, !owned)
-		if decodeErr != nil {
-			return decodeErr
+	return pb.visitUniqueIndexRow(tableRoot, indexRoot, indexName, key, func(encoded []byte, owned bool) error {
+		value, err := unmarshalRowColumn(encoded, column, !owned)
+		if err != nil {
+			return err
 		}
 		return visit(value)
 	})
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return false, fmt.Errorf("index %s refers to missing row %d", indexName, rowID)
-	}
-	return true, nil
 }
 
 // LookupUniqueIndexRowBytesColumnByRoot is the concrete-BLOB variant of
@@ -621,6 +607,16 @@ func (pb *PageBackend) LookupUniqueIndexRowColumnByRoot(tableRoot, indexRoot Pag
 // read a BLOB column (notably immutable tile artifacts), avoiding interface
 // boxing and a type assertion per request.
 func (pb *PageBackend) LookupUniqueIndexRowBytesColumnByRoot(tableRoot, indexRoot PageID, indexName string, key []byte, column int, visit func([]byte) error) (bool, error) {
+	return pb.visitUniqueIndexRow(tableRoot, indexRoot, indexName, key, func(encoded []byte, owned bool) error {
+		value, err := unmarshalRowBytesColumn(encoded, column, !owned)
+		if err != nil {
+			return err
+		}
+		return visit(value)
+	})
+}
+
+func (pb *PageBackend) visitUniqueIndexRow(tableRoot, indexRoot PageID, indexName string, key []byte, visit func([]byte, bool) error) (bool, error) {
 	pb.mu.RLock()
 	defer pb.mu.RUnlock()
 	if tableRoot == InvalidPageID || indexRoot == InvalidPageID {
@@ -639,13 +635,7 @@ func (pb *PageBackend) LookupUniqueIndexRowBytesColumnByRoot(tableRoot, indexRoo
 	}
 	var rowKey [8]byte
 	binary.BigEndian.PutUint64(rowKey[:], uint64(rowID))
-	found, err = NewBTree(pb.pager, tableRoot).getValue(rowKey[:], func(encoded []byte, owned bool) error {
-		value, decodeErr := unmarshalRowBytesColumn(encoded, column, !owned)
-		if decodeErr != nil {
-			return decodeErr
-		}
-		return visit(value)
-	})
+	found, err = NewBTree(pb.pager, tableRoot).getValue(rowKey[:], visit)
 	if err != nil {
 		return false, err
 	}

@@ -508,96 +508,59 @@ func produceStreamTail(stream *ResultStream, plan *simpleSelectPlan, st simpleSc
 	err = streamSimpleSelectPlanFrom(stream, plan, db, st)
 }
 
-// streamSmallPagedSelect is streamSmallSelect for a paged (read-only on-disk)
-// point seek on a unique index, which yields at most one row. The cursor is
-// drained here, under the read lock, so no producer goroutine is needed to
-// serve a tile or a record by key.
+// streamSmallPagedSelect resolves a complete unique key against the immutable
+// index roots. The synchronous stream has at most one row to buffer.
 func streamSmallPagedSelect(ctx context.Context, db *storage.DB, tenant string, sel *Select, plan *simpleSelectPlan, buffer int) (*ResultStream, error) {
-	source := plan.pagedSource
+	row, scanned, err := lookupPagedSelectRow(ctx, db, plan)
+	recordAudit(ctx, db, tenant, sel, err)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return failedResultStream(ctx, plan.outputCols, err, buffer), nil
+	}
 	var out []Row
-	var scanned uint64
-	var evalErr error
-	run := func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				evalErr = fmt.Errorf("internal error executing streamed statement: %v", recovered)
-			}
-		}()
-		cursor, ok, err := db.OpenPagedIndexRangeCursor(source.tenant, source.table, source.indexName, source.startKey, source.endKey)
-		if err == nil && (!ok || cursor == nil) {
-			err = fmt.Errorf("paged stream source is unavailable")
+	if row != nil {
+		out = []Row{row}
+	}
+	return completedResultStream(ctx, plan.outputCols, out, scanned, nil, buffer), nil
+}
+
+func lookupPagedSelectRow(ctx context.Context, db *storage.DB, plan *simpleSelectPlan) (row Row, scanned uint64, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("internal error executing streamed statement: %v", recovered)
 		}
-		if err != nil {
-			evalErr = err
-			return
-		}
-		offset := 0
-		if plan.offset != nil && *plan.offset > 0 {
-			offset = *plan.offset
-		}
-		limit := -1
-		if plan.limit != nil {
-			limit = *plan.limit
-		}
-		if limit == 0 {
-			return
-		}
-		matched := 0
-		for !cursor.Done() {
-			if err := checkCtx(ctx); err != nil {
-				evalErr = context.Cause(ctx)
-				return
-			}
-			batch, err := cursor.NextBatch(pagedResultStreamBatchRows)
-			if err != nil {
-				evalErr = err
-				return
-			}
-			for _, raw := range batch {
-				scanned++
-				match := plan.filterFullyCovered
-				if !match {
-					if plan.filter != nil {
-						match, err = plan.filter(raw)
-					} else {
-						match, err = evalRawWhere(plan, raw)
-					}
-					if err != nil {
-						evalErr = err
-						return
-					}
-				}
-				if !match {
-					continue
-				}
-				if matched < offset {
-					matched++
-					continue
-				}
-				row, err := projectRawRowPooled(plan, raw)
-				if err != nil {
-					evalErr = err
-					return
-				}
-				out = append(out, row)
-				if limit >= 0 && len(out) >= limit {
-					return
-				}
-			}
+	}()
+	if plan.limit != nil && *plan.limit == 0 {
+		return nil, 0, nil
+	}
+	if err := checkCtx(ctx); err != nil {
+		return nil, 0, context.Cause(ctx)
+	}
+	source := plan.pagedSource
+	locator, ok, err := db.LocatePagedIndex(source.tenant, source.table, source.indexName)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !ok {
+		return nil, 0, fmt.Errorf("paged stream source is unavailable")
+	}
+	raw, found, err := locator.LookupUniqueRow(source.startKey)
+	if err != nil || !found {
+		return nil, 0, err
+	}
+	if !plan.filterFullyCovered {
+		match, err := evalRawWhere(plan, raw)
+		if err != nil || !match {
+			return nil, 1, err
 		}
 	}
-	run()
-	if evalErr != nil && len(out) == 0 {
-		// Nothing was produced: report like the producer does for a source that
-		// cannot be opened or read.
-		recordAudit(ctx, db, tenant, sel, evalErr)
-		if errors.Is(evalErr, context.Canceled) || errors.Is(evalErr, context.DeadlineExceeded) {
-			return nil, evalErr
-		}
-		return failedResultStream(ctx, plan.outputCols, evalErr, buffer), nil
+	if plan.offset != nil && *plan.offset > 0 {
+		return nil, 1, nil
 	}
-	recordAudit(ctx, db, tenant, sel, evalErr)
-	return completedResultStream(ctx, plan.outputCols, out, scanned, evalErr, buffer), nil
+	row, err = projectRawRowPooled(plan, raw)
+	return row, 1, err
 }
 
 // completedResultStream wraps already-produced rows in a finished ResultStream.

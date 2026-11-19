@@ -28,6 +28,7 @@ func openReadOnlyPagedStreamDB(t *testing.T, rows int) *storage.DB {
 	for _, sql := range []string{
 		`CREATE TABLE paged_stream_rows (id INT, name TEXT)`,
 		`CREATE INDEX idx_paged_stream_rows_id ON paged_stream_rows(id)`,
+		`CREATE UNIQUE INDEX idx_paged_stream_rows_name_id ON paged_stream_rows(name, id)`,
 	} {
 		if _, err := Execute(context.Background(), builder, "default", mustParsePagedSQL(t, sql)); err != nil {
 			_ = builder.Close()
@@ -150,6 +151,25 @@ func TestExecuteStreamPagedIndexRangeFirstRowDoesNotMaterialize(t *testing.T) {
 	}
 	if count != 32 {
 		t.Fatalf("paged range returned %d rows, want 32", count)
+	}
+}
+
+func TestExecuteStreamPagedUniqueKeyWithNoBuffer(t *testing.T) {
+	db := openReadOnlyPagedStreamDB(t, 128)
+	stmt := mustParsePagedSQL(t, `SELECT id FROM paged_stream_rows WHERE name = 'row' AND id = 64`)
+	stream, err := ExecuteStreamWithOptions(t.Context(), db, "default", stmt, StreamOptions{Buffer: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if !stream.Next() || expectAsInt(t, stream.Row()["id"]) != 64 {
+		t.Fatalf("expected row 64, got %v (err %v)", stream.Row(), stream.Err())
+	}
+	if stream.Next() || stream.Err() != nil {
+		t.Fatalf("expected EOF, got %v (err %v)", stream.Row(), stream.Err())
+	}
+	if stats := stream.Stats(); stats.RowsScanned != 1 || stats.BufferCapacity != 0 || stats.Materialized {
+		t.Fatalf("expected an unbuffered point seek, got %+v", stats)
 	}
 }
 

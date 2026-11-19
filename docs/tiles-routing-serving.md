@@ -95,6 +95,20 @@ place instead of allocating a second path.
 
 ## Measured serving improvements
 
+For a read-only `paged_index` database, a prepared point lookup on a complete
+unique key seeks directly to its row in the B-tree. This covers both steps
+in a normalized MBTiles read, from `(zoom_level, tile_column, tile_row)` in
+`map` to the BLOB for `tile_id` in `images`.
+
+`BenchmarkReadOnlyPagedIndexMBTilesLikeTwoPointReadsWarm` reads 1 KiB tiles
+from a 10,000-tile fixture through both prepared SQL statements. With the
+pages warm, the median time per complete tile fell from 12.51 to 5.63 µs,
+allocated bytes from 11,175 to 6,950, and allocations from 118 to 91.
+These are three paired runs of 10,000 reads on an Apple M2 Max with
+Go 1.27.4 and `GOMAXPROCS=2`, measured at the SQL driver.
+Reusing the encoded key as both inclusive bounds of the cursor removed two
+more allocations per tile (6,886 B/op, 89 allocs/op in five paired runs).
+
 Local Apple M2 Max, Go 1.27.1, darwin/arm64; medians of three 700ms runs:
 
 | Benchmark | Before / cache disabled | After / cache enabled |
