@@ -12,16 +12,107 @@
 package driver
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 func advancedWALDSN(t *testing.T, name string) string {
 	t.Helper()
 	return "file:" + filepath.Join(t.TempDir(), name) + "?tenant=default&mode=advancedwal"
+}
+
+func TestAdvancedWALRollbackOnlyCommit(t *testing.T) {
+	for _, api := range []string{"sql.Tx", "SQL COMMIT"} {
+		t.Run(api, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			const suffix = "/db?mode=advanced_wal"
+			db, err := sql.Open("tinysql", "file:"+dir+suffix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := conn.ExecContext(ctx, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)"); err != nil {
+				t.Fatal(err)
+			}
+
+			exec := conn.ExecContext
+			commit := func() error {
+				_, err := exec(ctx, "COMMIT")
+				return err
+			}
+			if api == "sql.Tx" {
+				tx, err := conn.BeginTx(ctx, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback()
+				exec, commit = tx.ExecContext, tx.Commit
+			} else if _, err := exec(ctx, "BEGIN"); err != nil {
+				t.Fatal(err)
+			}
+			for _, stmt := range []string{"INSERT INTO t VALUES (1, 'pending')", "SAVEPOINT s"} {
+				if _, err := exec(ctx, stmt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := exec(ctx, "INSERT INTO t VALUES (2, 'first'), (2, 'duplicate')"); !errors.Is(err, storage.ErrAmbientWALRollbackOnly) {
+				t.Fatalf("partial statement error = %v", err)
+			}
+			for _, stmt := range []string{"ROLLBACK TO s", "INSERT INTO t VALUES (3, 'later')"} {
+				if _, err := exec(ctx, stmt); !errors.Is(err, storage.ErrAmbientWALRollbackOnly) {
+					t.Fatalf("%s after failed write: %v", stmt, err)
+				}
+			}
+			if err := commit(); !errors.Is(err, storage.ErrAmbientWALRollbackOnly) {
+				t.Fatalf("commit error = %v", err)
+			}
+
+			// Exercise the same connection and flush the aborted group's WAL
+			// records before reopening a copy of the durable files.
+			if _, err := conn.ExecContext(ctx, "INSERT INTO t VALUES (4, 'committed')"); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"4:committed"}
+			if got := savepointRows(t, db); !slices.Equal(got, want) {
+				t.Fatalf("live rows = %v, want %v", got, want)
+			}
+			crashDir := t.TempDir()
+			copyDBFilesForCrash(t, dir, crashDir)
+			reopened, err := sql.Open("tinysql", "file:"+crashDir+suffix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if got := savepointRows(t, reopened); !slices.Equal(got, want) {
+				t.Fatalf("recovered rows = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestAdvancedWALStatementFailureBeforeLoggingAllowsCommit(t *testing.T) {
+	runSavepointDurabilityScenario(t, "advancedwal",
+		[]string{"CREATE TABLE t (id INT, val TEXT)"},
+		[]savepointStep{
+			{sql: "INSERT INTO t VALUES (1, 'first')"},
+			{sql: "INSERT INTO missing_table VALUES (2)", wantErr: "missing_table"},
+			{sql: "INSERT INTO t VALUES (3, 'last')"},
+		},
+		[]string{"1:first", "3:last"})
 }
 
 // TestAdvancedWALExplicitTransactionRollbackLeavesNoTrace mirrors

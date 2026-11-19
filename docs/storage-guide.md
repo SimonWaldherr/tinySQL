@@ -37,6 +37,12 @@ Common DSNs:
 | `file:/path/to/dbdir?tenant=default&mode=json` | JSON table files |
 | `file:/path/to/dbdir?tenant=default&mode=advanced_wal` | Row-level WAL mode |
 
+In an explicit `advanced_wal` transaction, a statement that fails after
+attempting a row-log write makes the whole transaction rollback-only. Roll
+back and retry the transaction. A subsequent COMMIT discards the pending
+changes and returns an error. A failure before row logging, such as an
+unknown table, leaves the transaction usable.
+
 External projects should import `github.com/SimonWaldherr/tinySQL/driver`, not
 `internal/driver`.
 

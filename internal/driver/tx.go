@@ -14,6 +14,11 @@ import (
 )
 
 func (c *conn) commitTx(ctx context.Context) error {
+	// Check before txDirty: even the first write in a transaction may have
+	// logged a row before failing. Both SQL COMMIT and sql.Tx.Commit end here.
+	if c.shadow.AmbientWALRollbackOnly() {
+		return errors.Join(storage.ErrAmbientWALRollbackOnly, c.rollbackTx())
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -266,6 +271,9 @@ func (c *conn) rollbackToSavepoint(name string) error {
 	if !c.inTx {
 		return fmt.Errorf("tinysql: ROLLBACK TO SAVEPOINT requires an active transaction")
 	}
+	if c.shadow.AmbientWALRollbackOnly() {
+		return storage.ErrAmbientWALRollbackOnly
+	}
 	idx := c.findSavepoint(name)
 	if idx < 0 {
 		return fmt.Errorf("tinysql: no such savepoint: %s", name)
@@ -283,6 +291,7 @@ func (c *conn) rollbackToSavepoint(name string) error {
 	}
 	c.shadow = restored
 	c.txDirty = sp.dirty
+	clear(c.savepoints[idx+1:])
 	c.savepoints = c.savepoints[:idx+1]
 	return nil
 }
@@ -323,6 +332,7 @@ func (c *conn) releaseSavepoint(name string) error {
 	if idx < 0 {
 		return fmt.Errorf("tinysql: no such savepoint: %s", name)
 	}
+	clear(c.savepoints[idx:])
 	c.savepoints = c.savepoints[:idx]
 	return nil
 }

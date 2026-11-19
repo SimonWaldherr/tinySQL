@@ -13,6 +13,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -187,6 +188,9 @@ type DB struct {
 	// becomes one AdvancedWAL transaction, committed or aborted as a unit.
 	// Zero means "no ambient transaction: each statement is its own".
 	ambientWALTx atomic.Uint64
+	// A failed statement may already have appended rows to this transaction.
+	// Those rows disappear from the shadow on rollback but remain in the WAL.
+	ambientWALRollbackOnly atomic.Bool
 
 	// advancedWALMetadataDirty belongs only to an uncommitted transaction
 	// shadow. DDL/catalog work has no row-level AdvancedWAL record, but its
@@ -194,6 +198,21 @@ type DB struct {
 	// the driver has actually committed this shadow. Keeping it local prevents
 	// a ROLLBACK from unnecessarily forcing healthy replicas to re-bootstrap.
 	advancedWALMetadataDirty atomic.Bool
+}
+
+// ErrAmbientWALRollbackOnly requires the caller to retry the whole transaction.
+var ErrAmbientWALRollbackOnly = errors.New("advanced WAL transaction requires rollback after a failed row write")
+
+// MarkAmbientWALRollbackOnly prevents publication of a partially logged statement.
+func (db *DB) MarkAmbientWALRollbackOnly() {
+	if _, open := db.AmbientWALTx(); open {
+		db.ambientWALRollbackOnly.Store(true)
+	}
+}
+
+// AmbientWALRollbackOnly reports whether COMMIT must discard the transaction.
+func (db *DB) AmbientWALRollbackOnly() bool {
+	return db != nil && db.ambientWALRollbackOnly.Load()
 }
 
 // BeginAmbientWALTx opens one AdvancedWAL transaction that every subsequent
@@ -214,6 +233,9 @@ func (db *DB) BeginAmbientWALTx() (bool, error) {
 		return false, nil
 	}
 	if _, open := db.AmbientWALTx(); open {
+		if db.AmbientWALRollbackOnly() {
+			return false, ErrAmbientWALRollbackOnly
+		}
 		return true, nil
 	}
 	txID := wal.NewAutoTxID()
@@ -237,6 +259,9 @@ func (db *DB) AmbientWALTx() (TxID, bool) {
 // clears it. Recovery replays the transaction's operations only after seeing
 // this record.
 func (db *DB) CommitAmbientWALTx() error {
+	if db.AmbientWALRollbackOnly() {
+		return errors.Join(ErrAmbientWALRollbackOnly, db.AbortAmbientWALTx())
+	}
 	txID, ok := db.AmbientWALTx()
 	if !ok {
 		return nil
@@ -258,6 +283,7 @@ func (db *DB) AbortAmbientWALTx() error {
 		return nil
 	}
 	db.ambientWALTx.Store(0)
+	db.ambientWALRollbackOnly.Store(false)
 	wal := db.AdvancedWAL()
 	if wal == nil {
 		return nil

@@ -36,6 +36,7 @@ func (db *DB) AdoptAmbientWALTx(src *DB) {
 	}
 	if txID, ok := src.AmbientWALTx(); ok {
 		db.ambientWALTx.Store(uint64(txID))
+		db.ambientWALRollbackOnly.Store(src.AmbientWALRollbackOnly())
 	}
 	if src.advancedWALMetadataDirty.Load() {
 		db.advancedWALMetadataDirty.Store(true)

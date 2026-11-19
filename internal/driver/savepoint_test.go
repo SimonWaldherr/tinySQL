@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 )
 
@@ -63,6 +64,7 @@ func TestDriverSavepointsNestedRollbackAndRelease(t *testing.T) {
 
 	// Rollback to sp1 discards row 2 and pops sp2.
 	mustExec(`ROLLBACK TO sp1`)
+	assertDiscardedSavepointsCleared(t, conn)
 	if _, err := conn.ExecContext(ctx, `RELEASE sp2`); err == nil {
 		t.Fatal("expected RELEASE sp2 after ROLLBACK TO sp1 to fail")
 	}
@@ -75,6 +77,7 @@ func TestDriverSavepointsNestedRollbackAndRelease(t *testing.T) {
 
 	mustExec(`INSERT INTO sp_items VALUES (5, 'kept')`)
 	mustExec(`RELEASE SAVEPOINT sp1`)
+	assertDiscardedSavepointsCleared(t, conn)
 	mustExec(`COMMIT`)
 
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sp_items`).Scan(&count); err != nil {
@@ -82,5 +85,21 @@ func TestDriverSavepointsNestedRollbackAndRelease(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("expected 2 committed rows, got %d", count)
+	}
+}
+
+func assertDiscardedSavepointsCleared(t *testing.T, sqlConn *sql.Conn) {
+	t.Helper()
+	err := sqlConn.Raw(func(driverConn any) error {
+		stack := driverConn.(*conn).savepoints
+		for _, discarded := range stack[len(stack):cap(stack)] {
+			if discarded.shadow != nil {
+				return fmt.Errorf("discarded savepoint %q still holds a snapshot", discarded.name)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

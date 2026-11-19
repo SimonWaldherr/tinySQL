@@ -121,7 +121,7 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 	}()
 	defer func() {
 		if err != nil {
-			if abortErr := statementWAL.abort(); abortErr != nil {
+			if abortErr := statementWAL.abort(db); abortErr != nil {
 				err = errors.Join(err, fmt.Errorf("abort statement WAL: %w", abortErr))
 			}
 		}

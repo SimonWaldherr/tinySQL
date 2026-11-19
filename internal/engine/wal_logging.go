@@ -46,7 +46,8 @@ type statementWAL struct {
 	started bool
 	// ambient is set when txID belongs to a transaction the SQL driver owns.
 	// Such a transaction must not be committed per statement.
-	ambient bool
+	ambient      bool
+	rowAttempted bool
 }
 
 // noWALStatement is the shared, immutable return value of newStatementWAL
@@ -99,8 +100,15 @@ func (s *statementWAL) commit() error {
 	return err
 }
 
-func (s *statementWAL) abort() error {
-	if s == nil || s.wal == nil || !s.started || s.ambient {
+func (s *statementWAL) abort(db *storage.DB) error {
+	if s == nil || s.wal == nil || !s.started {
+		return nil
+	}
+	if s.ambient {
+		if s.rowAttempted {
+			db.MarkAmbientWALRollbackOnly()
+			return storage.ErrAmbientWALRollbackOnly
+		}
 		return nil
 	}
 	_, err := s.wal.LogAbort(s.txID)
@@ -147,8 +155,20 @@ func beginWALAuto(env ExecEnv, table string) (*walAuto, error) {
 	return &walAuto{wal: wal, txID: txID, table: table}, nil
 }
 
-func (a *walAuto) logInsert(env ExecEnv, rowIdx int, row []any, cols []storage.Column) error {
+// startRow marks the attempt before writing. A WAL I/O error may leave bytes
+// on disk even when logging did not return a successful LSN.
+func (a *walAuto) startRow(env ExecEnv) bool {
 	if a == nil || a.wal == nil {
+		return false
+	}
+	if s := env.statementWAL; s != nil && s.ambient {
+		s.rowAttempted = true
+	}
+	return true
+}
+
+func (a *walAuto) logInsert(env ExecEnv, rowIdx int, row []any, cols []storage.Column) error {
+	if !a.startRow(env) {
 		return nil
 	}
 	_, err := a.wal.LogInsert(a.txID, env.tenant, a.table, int64(rowIdx), row, cols)
@@ -156,7 +176,7 @@ func (a *walAuto) logInsert(env ExecEnv, rowIdx int, row []any, cols []storage.C
 }
 
 func (a *walAuto) logUpdate(env ExecEnv, rowIdx int, before, after []any, cols []storage.Column) error {
-	if a == nil || a.wal == nil {
+	if !a.startRow(env) {
 		return nil
 	}
 	_, err := a.wal.LogUpdate(a.txID, env.tenant, a.table, int64(rowIdx), before, after, cols)
@@ -164,7 +184,7 @@ func (a *walAuto) logUpdate(env ExecEnv, rowIdx int, before, after []any, cols [
 }
 
 func (a *walAuto) logDelete(env ExecEnv, rowIdx int, before []any, cols []storage.Column) error {
-	if a == nil || a.wal == nil {
+	if !a.startRow(env) {
 		return nil
 	}
 	_, err := a.wal.LogDelete(a.txID, env.tenant, a.table, int64(rowIdx), before, cols)
