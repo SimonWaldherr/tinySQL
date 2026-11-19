@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -468,6 +470,106 @@ func TestRetrievalSpatialPreFilterValidationIsColdCheap(t *testing.T) {
 	geoGridCacheMu.RUnlock()
 	if built {
 		t.Fatal("invalid spatial pre-filter built the geo grid before validation")
+	}
+}
+
+func TestRetrievalSpatialPolygonBeforeRanking(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	execSQL(t, db, `CREATE TABLE district_chunks (id INT PRIMARY KEY, visible BOOL, geom GEOMETRY, body TEXT, embedding VECTOR)`)
+	execSQL(t, db, `INSERT INTO district_chunks VALUES
+		(1, TRUE, ST_MAKEPOINT(2.5,2.5), 'map', '[1,0]'),
+		(2, TRUE, ST_MAKEPOINT(1,1), 'map', '[0.9,0.1]'),
+		(3, TRUE, ST_MAKEPOINT(3,2.5), 'map', '[0.8,0.2]'),
+		(4, TRUE, ST_MAKEPOINT(8,8), 'map', '[0.7,0.3]'),
+		(5, FALSE, ST_MAKEPOINT(1,1), 'map', '[1,0]'),
+		(6, TRUE, ST_MAKEPOINT(5,5), 'map', '[1,0]'),
+		(7, TRUE, NULL, 'map', '[1,0]'),
+		(8, TRUE, '{"type":"LineString","coordinates":[[0,0],[2,2]]}', 'map', '[0.6,0.4]')`)
+	const opts = `'{"pre_filter":{"allowed_row_ids":[1,2,3,4,5,6,7,8],"equals":{"visible":true},
+		"spatial":{"geometry_column":"geom","polygon":{"type":"MultiPolygon","coordinates":[
+			[[[0,0],[4,0],[4,4],[0,4],[0,0]],[[2,2],[2,3],[3,3],[3,2],[2,2]]],
+			[[[7,7],[9,7],[9,9],[7,9],[7,7]]]
+		]}}}}'`
+	query := `SELECT id FROM VEC_SEARCH_FILTERED('district_chunks','embedding','[1,0]',1,` + opts + `)`
+	if got := execSQL(t, db, query).Rows; len(got) != 1 || expectAsInt(t, got[0]["id"]) != 2 {
+		t.Fatalf("nearest authorized vector inside polygon = %v, want only 2", got)
+	}
+	otherPolygon := strings.Replace(query,
+		`[[[0,0],[4,0],[4,4],[0,4],[0,0]],[[2,2],[2,3],[3,3],[3,2],[2,2]]]`,
+		`[[[15,15],[16,15],[16,16],[15,16],[15,15]]]`, 1)
+	if got := execSQL(t, db, otherPolygon).Rows; len(got) != 1 || expectAsInt(t, got[0]["id"]) != 4 {
+		t.Fatalf("changing only the polygon returned %v, want only 4", got)
+	}
+	for _, query := range []string{
+		`SELECT id FROM HYBRID_SEARCH('district_chunks','embedding','body','map','[1,0]',10,` + opts + `) ORDER BY id`,
+		`SELECT id FROM FTS_SEARCH_FILTERED('district_chunks','map',10,` + opts + `,'body') ORDER BY id`,
+	} {
+		var ids []int
+		for _, row := range execSQL(t, db, query).Rows {
+			ids = append(ids, expectAsInt(t, row["id"]))
+		}
+		if !slices.Equal(ids, []int{2, 3, 4, 8}) {
+			t.Fatalf("spatial hits = %v, want IDs in either polygon, including the hole boundary and line centroid", ids)
+		}
+	}
+	execSQL(t, db, `UPDATE district_chunks SET geom = ST_MAKEPOINT(1,1) WHERE id = 1`)
+	if got := execSQL(t, db, query).Rows; len(got) != 1 || expectAsInt(t, got[0]["id"]) != 1 {
+		t.Fatalf("nearest hit after geometry update = %v, want only 1", got)
+	}
+}
+
+func TestRetrievalSpatialPolygonValidation(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	execSQL(t, db, `CREATE TABLE bad_polygon_filter (id INT PRIMARY KEY, geom GEOMETRY, embedding VECTOR)`)
+	execSQL(t, db, `INSERT INTO bad_polygon_filter VALUES (1, ST_MAKEPOINT(0,0), '[1,0]')`)
+	for _, options := range []string{
+		`"polygon":null, "bbox":[-1,-1,1,1]`,
+		`"polygon":null`,
+		`"polygon":{"type":"Point","coordinates":[0,0]}`,
+		`"polygon":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1]]]}`,
+		`"polygon":{"type":"Polygon","coordinates":[[[0,0],[181,0],[1,1],[0,0]]]}`,
+	} {
+		query := `SELECT id FROM VEC_SEARCH_FILTERED('bad_polygon_filter','embedding','[1,0]',1,
+			'{"pre_filter":{"spatial":{"geometry_column":"geom",` + options + `}}}')`
+		if _, err := Execute(t.Context(), db, "default", mustParse(query)); err == nil {
+			t.Fatalf("accepted invalid spatial options %s", options)
+		}
+	}
+	geoGridCacheMu.RLock()
+	_, built := geoGridCache[geoIndexCacheKey{tenant: "default", table: "bad_polygon_filter", colIdx: 1}]
+	geoGridCacheMu.RUnlock()
+	if built {
+		t.Fatal("invalid polygon built the spatial grid")
+	}
+}
+
+func BenchmarkRetrievalSpatialPolygonWarm(b *testing.B) {
+	db := storage.NewDB()
+	b.Cleanup(func() { _ = db.Close() })
+	table := storage.NewTable("warm_polygon_chunks", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "location", Type: storage.GeometryType},
+		{Name: "embedding", Type: storage.VectorType},
+	}, false)
+	for i := range 1024 {
+		location, err := geoPointJSON(11+float64(i%32)*0.025, 48+float64(i/32)*0.025, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		table.Rows = append(table.Rows, []any{i, location, []float64{1, float64(i) / 1024}})
+	}
+	if err := db.Put("default", table); err != nil {
+		b.Fatal(err)
+	}
+	for _, vertices := range []int{64, 3000} {
+		b.Run(strconv.Itoa(vertices), func(b *testing.B) {
+			polygon := `{"type":"Polygon","coordinates":[` + geoBenchRing(11.2, 48.2, 0.13, vertices) + `]}`
+			opts := fmt.Sprintf(`{"pre_filter":{"spatial":{"geometry_column":"location","polygon":%s}}}`, polygon)
+			query := `SELECT id FROM VEC_SEARCH_FILTERED('warm_polygon_chunks','embedding','[1,0]',6,'` + opts + `')`
+			runRAGBench(b, db, query, 6)
+		})
 	}
 }
 

@@ -32,6 +32,8 @@ import (
 	"maps"
 	"math"
 	"runtime"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -251,8 +253,9 @@ type vecSearchColumnCacheEntry struct {
 	segments      []vecColumnSegment
 	// overrides hold UPDATE-only row deltas. They keep large immutable base
 	// segments reusable instead of recopying an entire embedding column.
-	overrides  map[int]vecColumnOverride
-	normsReady bool
+	overrides    map[int]vecColumnOverride
+	overrideRows []int // sorted row IDs for sequential scans
+	normsReady   bool
 }
 
 type vecColumnOverride struct {
@@ -373,7 +376,11 @@ func (c vecSearchColumnCacheEntry) contiguousSegment() (vecColumnSegment, bool) 
 // segment instead of resolving its row through a binary search on every visit.
 // Incomplete or overlapping layouts keep resolveRow's lookup semantics.
 func (c vecSearchColumnCacheEntry) directScanSegments(start, end int) bool {
-	if start < 0 || end > c.rows || len(c.overrides) != 0 {
+	return len(c.overrides) == 0 && c.adjacentSegments(start, end)
+}
+
+func (c vecSearchColumnCacheEntry) adjacentSegments(start, end int) bool {
+	if start < 0 || end > c.rows {
 		return false
 	}
 	next := 0
@@ -580,6 +587,15 @@ func refreshVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Tabl
 	if vecColumnOverridesNeedCompaction(entry) {
 		return buildVecColumnCache(table, colIdx, includeNorms || cached.normsReady)
 	}
+	// A refresh only adds or replaces overrides, so an unchanged count can
+	// keep sharing the published row list.
+	if len(entry.overrides) != len(entry.overrideRows) {
+		entry.overrideRows = make([]int, 0, len(entry.overrides))
+		for row := range entry.overrides {
+			entry.overrideRows = append(entry.overrideRows, row)
+		}
+		slices.Sort(entry.overrideRows)
+	}
 	return entry
 }
 
@@ -718,6 +734,7 @@ func extendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 		shape:         shape,
 		segments:      segments,
 		overrides:     overrides,
+		overrideRows:  cached.overrideRows,
 		normsReady:    includeNorms || cached.normsReady,
 	}
 }
@@ -1015,14 +1032,16 @@ func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen,
 			return nil, err
 		}
 	}
-	if cache.directScanSegments(start, end) {
-		for _, segment := range cache.segments {
-			from := max(start, segment.start)
-			to := min(end, segment.start+len(segment.vectors))
+	if len(cache.overrides) == len(cache.overrideRows) && cache.adjacentSegments(start, end) {
+		// Overlay only changed rows while scanning the packed base sequentially.
+		// Skip overrides before this worker's slice and probe the map only at
+		// a matching row ID.
+		overrides := cache.overrideRows[sort.SearchInts(cache.overrideRows, start):]
+		scan := func(segment vecColumnSegment, from, to int) error {
 			for i := from; i < to; i++ {
 				if i&1023 == 0 {
 					if err := checkCtx(ctx); err != nil {
-						return nil, err
+						return err
 					}
 				}
 				local := i - segment.start
@@ -1046,6 +1065,36 @@ func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen,
 					continue
 				}
 				pushTopK(scoredRows, i, dist, k)
+			}
+			return nil
+		}
+		for _, segment := range cache.segments {
+			from := max(start, segment.start)
+			to := min(end, segment.start+len(segment.vectors))
+			if from >= to {
+				continue
+			}
+			for len(overrides) != 0 && overrides[0] < to {
+				row := overrides[0]
+				if err := scan(segment, from, row); err != nil {
+					return nil, err
+				}
+				if row&1023 == 0 {
+					if err := checkCtx(ctx); err != nil {
+						return nil, err
+					}
+				}
+				vec, norm, valid := cache.resolveRow(row, needNorm)
+				if valid && len(vec) == queryLen {
+					if dist, ok := distFn(vec, norm); ok {
+						pushTopK(scoredRows, row, dist, k)
+					}
+				}
+				overrides = overrides[1:]
+				from = row + 1
+			}
+			if err := scan(segment, from, to); err != nil {
+				return nil, err
 			}
 		}
 		return *scoredRows, nil
@@ -1168,6 +1217,29 @@ func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*st
 		recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: a.indexMode, K: a.k, CacheHit: cacheHit, Duration: time.Since(started)})
 	}
 	return table, scoredRowsOrdered, nil
+}
+
+func validateVecMaxDistance(metric string, limit *float64) error {
+	if limit == nil {
+		return nil
+	}
+	if math.IsNaN(*limit) || math.IsInf(*limit, 0) {
+		return fmt.Errorf("max_distance must be finite")
+	}
+	if metric != "dot" && *limit < 0 {
+		return fmt.Errorf("max_distance must be nonnegative for metric %s", metric)
+	}
+	return nil
+}
+
+// trimVecDistance keeps a prefix of closest-first candidates in output
+// distance units. Reslicing leaves cached rankings and ANN traversal intact.
+func trimVecDistance(rows []vecScoredRow, limit *float64) []vecScoredRow {
+	if limit == nil || len(rows) == 0 || rows[len(rows)-1].distance <= *limit {
+		return rows
+	}
+	end := sort.Search(len(rows), func(i int) bool { return rows[i].distance > *limit })
+	return rows[:end]
 }
 
 func materializeVecCandidates(table *storage.Table, scoredRowsOrdered []vecScoredRow, metric string) *ResultSet {

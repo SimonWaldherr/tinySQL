@@ -64,9 +64,12 @@ func TestVecSegmentScanMatchesResolver(t *testing.T) {
 			withOverrides := base
 			withOverrides.overrides = map[int]vecColumnOverride{
 				0: {vector: []float64{-2, 1}, norm: math.Sqrt(5), valid: true},
-				6: {},
+				5: {},
+				6: {vector: []float64{1}, norm: 1, valid: true},
 			}
 			cases["overrides"] = withOverrides
+			withOverrides.overrideRows = []int{0, 5, 6}
+			cases["indexed overrides"] = withOverrides
 			for name, cache := range cases {
 				if got := cache.directScanSegments(0, len(rows)); got != (name == "direct") {
 					t.Fatalf("%s direct scan eligibility = %t", name, got)
@@ -167,7 +170,7 @@ func TestVecSegmentScanAppendAndUpdateSQL(t *testing.T) {
 	check([]int{4, 0, 3, 2})
 	table, _ = db.Get("default", name)
 	cache = getVecColumnCache("default", table, 1, false)
-	if len(cache.overrides) == 0 || cache.directScanSegments(0, len(table.Rows)) {
-		t.Fatal("UPDATE did not preserve the override lookup path")
+	if len(cache.overrides) != 1 || len(cache.overrideRows) != 1 || cache.overrideRows[0] != 0 {
+		t.Fatal("UPDATE did not index the changed embedding")
 	}
 }

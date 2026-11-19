@@ -38,6 +38,7 @@ func BenchmarkVecSegmentedFlatScan(b *testing.B) {
 					view := cache
 					if override {
 						view.overrides = map[int]vecColumnOverride{count / 2: {}}
+						view.overrideRows = []int{count / 2}
 					}
 					distance := buildVecDistanceFunc("cosine", query, vectorL2Norm(query))
 					b.ReportAllocs()

@@ -4,10 +4,174 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
+
+func TestGeoSearchNearestMatchesRadiusOrder(t *testing.T) {
+	db := storage.NewDB()
+	defer db.Close()
+	execSQL(t, db, `CREATE TABLE points (id INT, geom TEXT)`)
+	// IDs descend within equal-distance groups, so the tie break deliberately
+	// differs from primary-key order.
+	execSQL(t, db, geoSearchPoint(50, 179.5, 70))
+	execSQL(t, db, geoSearchPoint(40, -179.5, 70))
+	execSQL(t, db, geoSearchPoint(30, 179.5, 70))
+	execSQL(t, db, geoSearchPoint(20, 0, 75))
+	execSQL(t, db, `INSERT INTO points VALUES (5, NULL), (1, 'not a geometry')`)
+	boundary := haversineMeters(70, 179, 70, 179.5)
+	for _, tc := range []struct {
+		lon, lat, radius float64
+		k, wantRows      int
+	}{
+		{179, 70, 80_000, 2, 2},
+		{179, 70, 80_000, 2147483647, 3},
+		{179, 70, math.Nextafter(boundary, 0), 10, 0},
+		{179, 70, boundary, 10, 2},
+		{180, 89, 3_000_000, 10, 4},
+		{0, 0, 1, 3, 0},
+	} {
+		center := fmt.Sprintf("%v,%v", tc.lon, tc.lat)
+		actual := execSQL(t, db, fmt.Sprintf(`SELECT id, _geo_rank, _geo_distance_m AS meters
+			FROM GEO_SEARCH('points', 'geom', 'nearest', %s, %v, %d) ORDER BY _geo_rank`, center, tc.radius, tc.k))
+		reference := execSQL(t, db, fmt.Sprintf(`SELECT id, GEO_DISTANCE(GEO_POINT(%s), geom) AS meters
+			FROM GEO_SEARCH('points', 'geom', 'radius', %s, %v) ORDER BY meters, id DESC LIMIT %d`,
+			center, center, tc.radius, tc.k))
+		if len(actual.Rows) != tc.wantRows || len(reference.Rows) != tc.wantRows {
+			t.Fatalf("case %+v: got %d nearest rows, radius returned %d, want %d", tc, len(actual.Rows), len(reference.Rows), tc.wantRows)
+		}
+		for i, got := range actual.Rows {
+			if got["_geo_rank"] != i+1 {
+				t.Fatalf("unexpected rank in %v", got)
+			}
+			delete(got, "_geo_rank")
+			if !reflect.DeepEqual(got, reference.Rows[i]) {
+				t.Fatalf("case %+v rank %d: got %v, radius returned %v", tc, i+1, got, reference.Rows[i])
+			}
+		}
+	}
+}
+
+func TestGeoSearchNearestValidatesInputs(t *testing.T) {
+	db := storage.NewDB()
+	defer db.Close()
+	execSQL(t, db, `CREATE TABLE points (id INT, geom GEOMETRY)`)
+	for _, args := range []string{"0,0,1", "0,0,1,0", "0,0,1,1.5", "0,0,1,2147483648", "0,0,1,NULL", "0,0,0,1", "181,0,1,1", "0,91,1,1"} {
+		q := `SELECT id FROM GEO_SEARCH('points', 'geom', 'nearest', ` + args + `)`
+		if _, err := Execute(t.Context(), db, "default", mustParse(q)); err == nil {
+			t.Errorf("invalid nearest query unexpectedly succeeded: %s", q)
+		}
+	}
+}
+
+func TestGeoSearchFindsCentroidOutsideExtent(t *testing.T) {
+	db := storage.NewDB()
+	defer db.Close()
+	execSQL(t, db, `CREATE TABLE layer (id INT, geom GEOMETRY)`)
+	// A hole overlapping the exterior leaves a positive signed mass but
+	// places the computed centroid west of the entire geometry.
+	execSQL(t, db, `INSERT INTO layer VALUES (1, '{"type":"Polygon","coordinates":[
+		[[0,0],[1,0],[1,1],[0,1],[0,0]],[[0.5,0],[1.48,0],[1.48,1],[0.5,1],[0.5,0]]
+	]}')`)
+	for _, tc := range []struct {
+		query string
+		want  int
+	}{
+		{`'bbox', -24,0,-23,1`, 1},
+		{`'bbox_intersects', -24,0,-23,1`, 0},
+		{`'bbox_intersects', 0,0,1,1`, 1},
+		{`'nearest', -23.51,0.5,10,1`, 1},
+		{`'radius', -23.51,0.5,10`, 1},
+		{`'bbox', -25,-1,2,1`, 1}, // present in both cells and the outlier list
+	} {
+		rs := execSQL(t, db, `SELECT id FROM GEO_SEARCH('layer', 'geom', `+tc.query+`)`)
+		if len(rs.Rows) != tc.want {
+			t.Errorf("%s returned %v, want %d rows", tc.query, rs.Rows, tc.want)
+		}
+	}
+}
+
+func TestGeoGridPointDecodeMatchesGeneralPath(t *testing.T) {
+	for _, coords := range []string{
+		`[11.576124,48.137154]`,
+		`[-0,-0,42]`,
+		`[0.00000001,1.2345678901234567,0,9]`,
+		`[1,2,1e309]`, // all ordinates must be finite
+		`[1,2,[]]`,
+	} {
+		fastBox, fastPoint, fastOK := geoGridGeometry(`{"coordinates":` + coords + `,"type":"Point"}`)
+		slowBox, slowPoint, slowOK := geoGridGeometry(`{"type":"Point","coordinates":` + coords + `}`)
+		if fastOK != slowOK || fastBox != slowBox || fastPoint != slowPoint {
+			t.Fatalf("%s: compact point = %v %v %t, general = %v %v %t", coords, fastBox, fastPoint, fastOK, slowBox, slowPoint, slowOK)
+		}
+		if math.Float64bits(fastBox.MinX) != math.Float64bits(slowBox.MinX) ||
+			math.Float64bits(fastBox.MinY) != math.Float64bits(slowBox.MinY) ||
+			math.Float64bits(fastPoint.Lon) != math.Float64bits(slowPoint.Lon) ||
+			math.Float64bits(fastPoint.Lat) != math.Float64bits(slowPoint.Lat) {
+			t.Fatalf("%s: point decoding changed signed zero", coords)
+		}
+	}
+}
+
+func geoSearchBenchmarkPointTable() *storage.Table {
+	table := storage.NewTable("search_points", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "geom", Type: storage.GeometryType},
+	}, false)
+	// A point layer covering roughly the extent of Bavaria.
+	for id := range 20_000 {
+		lon, lat := 9+0.025*float64(id%200), 47+0.038*float64(id/200)
+		geom, _ := geoPointJSON(lon, lat, nil)
+		table.Rows = append(table.Rows, []any{id, geom})
+	}
+	return table
+}
+
+func BenchmarkGeoGridPointBuild(b *testing.B) {
+	table := geoSearchBenchmarkPointTable()
+	b.ReportAllocs()
+	for b.Loop() {
+		idx, err := buildGeoGridIndex(b.Context(), table, 1)
+		if err != nil || len(idx.centroids) != len(table.Rows) {
+			b.Fatalf("build failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkGeoSearchNearest(b *testing.B) {
+	db := storage.NewDB()
+	defer db.Close()
+	table := geoSearchBenchmarkPointTable()
+	if err := db.Put("default", table); err != nil {
+		b.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		sql  string
+	}{
+		{"radius-sort", `SELECT id, GEO_DISTANCE(GEO_POINT(11.3,49.1),geom) AS meters
+			FROM GEO_SEARCH('search_points','geom','radius',11.3,49.1,125000) ORDER BY meters,id LIMIT 20`},
+		{"nearest", `SELECT id, _geo_distance_m AS meters
+			FROM GEO_SEARCH('search_points','geom','nearest',11.3,49.1,125000,20) ORDER BY _geo_rank`},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			stmt := mustParse(tc.sql)
+			query := func() {
+				rs, err := Execute(b.Context(), db, "default", stmt)
+				if err != nil || len(rs.Rows) != 20 {
+					b.Fatalf("query failed: %v", err)
+				}
+			}
+			query() // Ensure a warm index in both variants.
+			b.ReportAllocs()
+			for b.Loop() {
+				query()
+			}
+		})
+	}
+}
 
 func geoSearchIDSet(t *testing.T, db *storage.DB, sql string) map[int]bool {
 	t.Helper()

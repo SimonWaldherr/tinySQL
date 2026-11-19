@@ -33,6 +33,8 @@ func TestRetrievalRowsMatchCopyingQualification(t *testing.T) {
 	execSQL(t, db, `INSERT INTO retrieval_owned VALUES (1,'a',0,'alpha opening','[1,0]'),(2,'a',1,'alpha middle','[0.8,0.2]'),(3,'a',2,'alpha end','[0,1]')`)
 	execSQL(t, db, `CREATE TABLE retrieval_hits (doc TEXT, chunk INT)`)
 	execSQL(t, db, `INSERT INTO retrieval_hits VALUES ('a',1)`)
+	execSQL(t, db, `CREATE TABLE retrieval_points (id INT, geom GEOMETRY)`)
+	execSQL(t, db, `INSERT INTO retrieval_points VALUES (1, ST_MAKEPOINT(12,48)), (2, ST_MAKEPOINT(13,48))`)
 	for _, call := range []string{
 		`VEC_SEARCH('retrieval_owned','embedding','[1,0]',3)`,
 		`VEC_SEARCH_FILTERED('retrieval_owned','embedding','[1,0]',3,'{"pre_filter":{"equals":{"doc":"a"}}}')`,
@@ -43,6 +45,7 @@ func TestRetrievalRowsMatchCopyingQualification(t *testing.T) {
 		`RAG_CONTEXT('retrieval_owned','doc','chunk','a',1,1,1)`,
 		`RAG_CONTEXT_FROM('retrieval_owned','doc','chunk','retrieval_hits','doc','chunk',1,1)`,
 		`RAG_SEARCH('retrieval_owned','embedding','[1,0]',3,'{"text_columns":["body"],"text_query":"alpha","key_columns":["id"],"expand_before":1,"expand_after":1,"doc_id_column":"doc","chunk_index_column":"chunk"}')`,
+		`GEO_SEARCH('retrieval_points','geom','nearest',12,48,100000,2)`,
 	} {
 		for _, alias := range []string{"", "r", "Über"} {
 			s := mustParse("SELECT * FROM " + call).(*Select)

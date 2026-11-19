@@ -73,9 +73,11 @@ func TestVectorTopKBatchMatchesRangeScan(t *testing.T) {
 			cache := segmentScanCache(rows, boundaries, norms)
 			if layout == "overrides" {
 				cache.overrides = map[int]vecColumnOverride{
-					0: {vector: []float64{2, 1}, norm: math.Sqrt(5), valid: true},
-					1: {},
+					0:    {vector: []float64{2, 1}, norm: math.Sqrt(5), valid: true},
+					1:    {},
+					1024: {vector: []float64{1, 2}, norm: math.Sqrt(5), valid: true},
 				}
+				cache.overrideRows = []int{0, 1, 1024}
 			}
 			for _, metric := range []string{"cosine", "l2", "manhattan", "dot"} {
 				t.Run(fmt.Sprintf("%s/norms%t/%s", layout, norms, metric), func(t *testing.T) {

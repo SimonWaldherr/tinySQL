@@ -324,7 +324,7 @@ func TestFilePersistence(t *testing.T) {
 	}
 
 	// Save to file
-	tmpfile := "persist_test.dat"
+	tmpfile := filepath.Join(t.TempDir(), "persist.dat")
 	if err = tsql.SaveToFile(db, tmpfile); err != nil {
 		t.Fatalf("Failed to save DB: %v", err)
 	}
@@ -357,13 +357,6 @@ func TestFilePersistence(t *testing.T) {
 	if name, ok := tsql.GetVal(rs.Rows[1], "persist.name"); !ok || name != "Beta" {
 		t.Fatalf("Expected Beta, got %v", name)
 	}
-
-	// Clean up. t.Cleanup runs after the deferred db2.Close(), which must
-	// release the WAL handle first for the removal to succeed on Windows.
-	t.Cleanup(func() {
-		os.Remove(tmpfile)
-		os.Remove(tmpfile + ".wal")
-	})
 }
 
 // TestJoinOperations tests basic multi-table functionality
@@ -1148,14 +1141,7 @@ func TestQueryCompilationPerformance(t *testing.T) {
 //nolint:gocyclo // Persistence regression test exercises many branches end-to-end.
 func TestGOBPersistenceWithNewDataTypes(t *testing.T) {
 	ctx := context.Background()
-	tempFile := "/tmp/tinysql_test.gob"
-
-	// Clean up temp files after test (t.Cleanup runs after deferred Closes,
-	// so the WAL handle is released before removal — required on Windows).
-	t.Cleanup(func() {
-		os.Remove(tempFile)
-		os.Remove(tempFile + ".wal")
-	})
+	tempFile := filepath.Join(t.TempDir(), "tinysql.gob")
 
 	// === PHASE 1: Create database with new data types and populate it ===
 	db := tsql.NewDB()

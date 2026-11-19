@@ -68,14 +68,14 @@ func BenchmarkGeoGridOverflowCandidates(b *testing.B) {
 		cellSizeLon: 1, cellSizeLat: 1,
 		valid:     make([]bool, numOverflow),
 		bboxes:    make([]geoEditBBox, numOverflow),
-		centroids: make([]geoPoint, numOverflow),
+		centroids: make([]geoGridCentroid, numOverflow),
 	}
 	for i := 0; i < numOverflow; i++ {
 		lon := -180 + float64(i%360)
 		lat := -90 + float64(i%180)
 		idx.valid[i] = true
 		idx.bboxes[i] = geoEditBBox{MinX: lon, MinY: lat, MaxX: lon + 0.5, MaxY: lat + 0.5, Set: true}
-		idx.centroids[i] = geoPoint{Lon: lon + 0.25, Lat: lat + 0.25}
+		idx.centroids[i] = geoGridCentroid{Lon: lon + 0.25, Lat: lat + 0.25}
 		idx.overflow = append(idx.overflow, int32(i))
 	}
 	b.ReportAllocs()

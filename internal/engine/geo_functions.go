@@ -1346,12 +1346,16 @@ func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
 // bit-for-bit identical for every existing caller. Only cos(lat1Rad), a
 // pure function of lat1 alone with no reassociation risk, is hoisted.
 func haversineMetersFromOrigin(lat1, cosLat1, lon1, lat2, lon2 float64) float64 {
-	lat2Rad := lat2 * math.Pi / 180
+	return haversineMetersWithCosines(lat1, cosLat1, lon1, lat2, math.Cos(lat2*math.Pi/180), lon2)
+}
+
+// haversineMetersWithCosines also reuses cos(lat2) from an indexed centroid.
+func haversineMetersWithCosines(lat1, cosLat1, lon1, lat2, cosLat2, lon2 float64) float64 {
 	dLat := (lat2 - lat1) * math.Pi / 180
 	dLon := (lon2 - lon1) * math.Pi / 180
 	sinLat := math.Sin(dLat / 2)
 	sinLon := math.Sin(dLon / 2)
-	a := sinLat*sinLat + cosLat1*math.Cos(lat2Rad)*sinLon*sinLon
+	a := sinLat*sinLat + cosLat1*cosLat2*sinLon*sinLon
 	if a > 1 {
 		a = 1
 	}

@@ -33,6 +33,7 @@ import (
 type ragSearchOptions struct {
 	Metric           string   `json:"metric"`
 	Index            string   `json:"index"`
+	MaxDistance      *float64 `json:"max_distance"`
 	TextColumn       string   `json:"text_column"`
 	TextColumns      []string `json:"text_columns"`
 	TextQuery        string   `json:"text_query"`
@@ -129,6 +130,9 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 			return nil, fmt.Errorf("RAG_SEARCH: unknown index %q", opts.Index)
 		}
 	}
+	if err := validateVecMaxDistance(metric, opts.MaxDistance); err != nil {
+		return nil, fmt.Errorf("RAG_SEARCH: %w", err)
+	}
 
 	k := vecArgsParsed.k
 	textColumns := ragSearchTextColumns(&opts)
@@ -193,6 +197,7 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		if len(candidates) > k {
 			candidates = candidates[:k]
 		}
+		candidates = trimVecDistance(candidates, opts.MaxDistance)
 		if contextExpansion {
 			// Context expansion consumes only a hit's document, chunk and
 			// rank. Keeping this compact avoids building and immediately
@@ -301,6 +306,7 @@ func ragSearchExecute(ctx context.Context, env ExecEnv, row Row, vecArgsParsed v
 		if rrfK <= 0 {
 			rrfK = ragSearchDefaultRRFK
 		}
+		vecCandidates = trimVecDistance(vecCandidates, opts.MaxDistance)
 		fused := ragFuseNativeCandidates(table, vecCandidates, ftsCandidates, rrfK, k)
 		if contextExpansion {
 			// As in the vector-only path, expansion needs the physical hit

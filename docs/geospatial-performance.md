@@ -33,6 +33,35 @@ row, broad-window candidate selection changed from 105–107 µs to about 1.38 �
 a small window remained about 64 ns. These measurements exclude index building,
 exact distance checks, and SQL result materialization.
 
+### Nearest features within a radius
+
+```sql
+SELECT name, _geo_distance_m
+FROM GEO_SEARCH('pois', 'geometry', 'nearest', 11.575, 48.137, 5000, 20)
+ORDER BY _geo_rank;
+```
+
+`nearest` ranks up to 20 geometries within an inclusive 5,000-meter
+radius in this example. Distance is measured on a sphere to each point
+or geometry centroid. Equal distances follow the source row order.
+The spatial grid narrows the candidates and a bounded heap keeps the
+closest matches, so result rows are built only for the winners.
+
+`BenchmarkGeoSearchNearest` uses 20,000 points and requests the 20 closest
+within 125 km. The warm query allocated 64 KB with `nearest` versus
+7.16 MB for `radius` followed by `ORDER BY GEO_DISTANCE(...)` and `LIMIT`.
+`BenchmarkGeoGridPointBuild` measures cold grid construction for the same
+layer. Decoding compact GeoJSON points directly reduced allocation from
+10.69 MB to 1.89 MB per build. Figures are medians of five runs on
+an Apple M2 Max with Go 1.27.4 and `GOMAXPROCS=2`.
+
+Warm radius queries reuse the cosine of each indexed centroid's latitude.
+`GEO_SEARCH` also qualifies its own result maps directly. In a follow-up
+using the same nearest benchmark, allocations fell from 161 to 120 per
+query and allocated bytes from 64,171 to 57,292. For a viewport returning
+9,821 points, `BenchmarkGeoSearchWarm` fell from 10.26 to 6.88 MB per query.
+The cold point build retained 7,701 allocations.
+
 For wider warm-query measurements and their limits, see
 [retrieval performance](retrieval-performance.md). Reproduce the focused checks
 with:

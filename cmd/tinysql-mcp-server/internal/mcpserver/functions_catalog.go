@@ -29,14 +29,20 @@ VEC_TOP_K(table, column, query_vector, k [, metric])
     Alias for VEC_SEARCH.
 
 VEC_SEARCH_FILTERED(table, column, query_vector, k, options_json)
-    Exact vector k-NN restricted BEFORE ranking by options_json.pre_filter.
-    pre_filter accepts either stable allowed_row_ids (with optional id_column;
-    a single-column primary key is the default) and/or equals metadata:
+    Vector k-NN restricted before ranking by options_json.pre_filter.
+    A single-column primary key is used if id_column is omitted.
       {"pre_filter":{"id_column":"chunk_id","allowed_row_ids":["c1"],
                        "equals":{"tenant_id":"acme"}}}
-    The restrictions are intersected. A matching secondary-index prefix is
-    used when available; filtered searches intentionally use exact ranking so
-    an approximate global ANN frontier cannot omit an allowed nearest row.
+    Intersects stable allowed_row_ids, equals metadata, and an optional
+    spatial filter. Specify spatial.geometry_column and either bbox,
+    center with radius_meters, or a closed GeoJSON Polygon or MultiPolygon
+    in spatial.polygon. Polygon mode tests each centroid and includes edges.
+    Uses exact ranking by default and can build HNSW over the eligible rows.
+    Optional max_distance is inclusive in the units of _vec_distance.
+
+GEO_SEARCH(table, geom_col, 'nearest', lon, lat, radius_m, k)
+    Returns up to k rows whose geometry centroids are within the radius.
+    Columns _geo_distance_m and _geo_rank give the distance and position.
 
 VEC_WARM(table, column [, metric [, index]])
     Eagerly builds the vector column cache and, if requested, the IVF/HNSW
@@ -97,6 +103,8 @@ RAG_SEARCH(table, vector_column, query_vector, k [, options_json])
       candidate_k          candidates fetched per pass before fusion/truncation
                            to k (default k*4)
       rrf_k                RRF constant (default 60)
+      max_distance         inclusive distance bound for vector hits before
+                           fusion. Text hits can still qualify independently.
       expand_before,
       expand_after         }  set either to enable RAG_CONTEXT_FROM-style
       doc_id_column,       }  neighbor-chunk expansion of the final hit set

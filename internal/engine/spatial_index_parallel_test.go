@@ -51,7 +51,7 @@ func TestSpatialIndexParallelBuildMatchesSequential(t *testing.T) {
 			return &geoGridIndex{
 				table:     table,
 				valid:     make([]bool, n),
-				centroids: make([]geoPoint, n),
+				centroids: make([]geoGridCentroid, n),
 				bboxes:    make([]geoEditBBox, n),
 			}
 		}
@@ -72,7 +72,8 @@ func TestSpatialIndexParallelBuildMatchesSequential(t *testing.T) {
 		}
 		for i := range seq.centroids {
 			if math.Float64bits(seq.centroids[i].Lon) != math.Float64bits(par.centroids[i].Lon) ||
-				math.Float64bits(seq.centroids[i].Lat) != math.Float64bits(par.centroids[i].Lat) {
+				math.Float64bits(seq.centroids[i].Lat) != math.Float64bits(par.centroids[i].Lat) ||
+				math.Float64bits(seq.centroids[i].cosLat) != math.Float64bits(par.centroids[i].cosLat) {
 				t.Fatalf("n=%d: centroid of row %d differs", n, i)
 			}
 		}

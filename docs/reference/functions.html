@@ -966,6 +966,12 @@ ORDER BY distance;</code></pre>
 SELECT * FROM VEC_SEARCH(&#39;vec_demo_docs&#39;, &#39;embedding&#39;, VEC_FROM_JSON(&#39;[1.0, 0.0, 0.0]&#39;), 3);</code></pre>
 <pre><code>-- Search with L2 distance metric
 SELECT * FROM VEC_SEARCH(&#39;vec_demo_docs&#39;, &#39;embedding&#39;, VEC_FROM_JSON(&#39;[1.0, 0.0, 0.0]&#39;), 3, &#39;l2&#39;);</code></pre>
+<pre><code>-- VEC_SEARCH_FILTERED can apply a distance limit before returning rows.
+-- The limit is inclusive and uses the units of _vec_distance.
+SELECT title, _vec_distance FROM VEC_SEARCH_FILTERED(
+    &#39;vec_demo_docs&#39;, &#39;embedding&#39;, &#39;[1,0,0]&#39;, 5,
+    &#39;{&#34;metric&#34;:&#34;l2&#34;,&#34;max_distance&#34;:0.25,&#34;pre_filter&#34;:{&#34;id_column&#34;:&#34;id&#34;,&#34;allowed_row_ids&#34;:[1,2,3,4,5]}}&#39;
+) ORDER BY _vec_rank;</code></pre>
 <pre><code>-- Search with cached approximate ANN indexes for larger RAG tables
 SELECT * FROM VEC_SEARCH(&#39;vec_demo_docs&#39;, &#39;embedding&#39;, VEC_FROM_JSON(&#39;[1.0, 0.0, 0.0]&#39;), 3, &#39;cosine&#39;, &#39;hnsw&#39;);
 SELECT * FROM VEC_SEARCH(&#39;vec_demo_docs&#39;, &#39;embedding&#39;, VEC_FROM_JSON(&#39;[1.0, 0.0, 0.0]&#39;), 3, &#39;cosine&#39;, &#39;ivf&#39;);</code></pre>
@@ -1265,13 +1271,16 @@ FROM geo_region_demo GROUP BY region ORDER BY region;</code></pre>
 -- here, a population-weighted centroid of already-area-weighted per-row centroids.
 SELECT region, GEO_CENTROID_AGG(footprint, population) AS weighted_centroid
 FROM geo_region_demo GROUP BY region ORDER BY region;</code></pre>
-<pre><code>-- GEO_SEARCH: an indexed bbox/radius search over a table, backed by a lazy,
--- per-table grid index invalidated automatically on writes. Exact for Point
--- columns; for polygon/line columns it indexes by centroid (a large shape
--- whose edge -- not centroid -- clips into the window is a false negative;
--- use GEO_INTERSECTS for exact shape overlap).
+<pre><code>-- GEO_SEARCH uses a spatial grid. Bbox and radius modes test the geometry
+-- centroid. Use bbox_intersects for extent overlap, or ST_INTERSECTS for
+-- exact geometry overlap.
 SELECT region FROM GEO_SEARCH(&#39;geo_region_demo&#39;, &#39;footprint&#39;, &#39;bbox&#39;, -1, -1, 3, 3);
 SELECT region FROM GEO_SEARCH(&#39;geo_region_demo&#39;, &#39;footprint&#39;, &#39;radius&#39;, 0.5, 0.5, 200000);</code></pre>
+<pre><code>-- Nearest mode returns up to k centroids within the inclusive radius.
+-- The radius and _geo_distance_m use meters and _geo_rank starts at 1.
+SELECT region, _geo_distance_m, _geo_rank FROM GEO_SEARCH(
+    &#39;geo_region_demo&#39;, &#39;footprint&#39;, &#39;nearest&#39;, 0.5, 0.5, 200000, 2
+) ORDER BY _geo_rank;</code></pre>
 <pre><code>DROP TABLE geo_region_demo;</code></pre>
 <pre><code>-- EQUAL_INTERVAL / NATURAL_BREAKS: choropleth classification window
 -- functions, bucketing a KPI column into N legend classes. Quantile

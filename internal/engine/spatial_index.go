@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -74,6 +75,21 @@ type geoGridColumnCell struct {
 	rows []int32
 }
 
+// Grid centroids are planar coordinates. Cache the latitude cosine alongside
+// them for distance queries in the space a geoPoint uses for optional Z.
+type geoGridCentroid struct {
+	Lon, Lat float64
+	cosLat   float64
+}
+
+func (p geoGridCentroid) point() geoPoint {
+	return geoPoint{Lon: p.Lon, Lat: p.Lat}
+}
+
+func (p geoGridCentroid) distanceFrom(lat, cosLat, lon float64) float64 {
+	return haversineMetersWithCosines(lat, cosLat, lon, p.Lat, p.cosLat, p.Lon)
+}
+
 type geoGridIndex struct {
 	columns     []geoGridColumn
 	table       *storage.Table
@@ -87,13 +103,17 @@ type geoGridIndex struct {
 	bounds    geoEditBBox
 	cells     map[geoCellID][]int32
 	overflow  []int32
-	centroids []geoPoint
+	centroids []geoGridCentroid
 	// bboxes retains the already-computed per-row extent. GIS/RAG viewport
 	// filters can therefore perform an exact bbox residual check without
 	// reparsing GeoJSON after the grid has narrowed the candidate set.
 	bboxes      []geoEditBBox
 	valid       []bool
 	uniqueCells bool // no row occurs in multiple cells; overflow rows are disjoint
+	// Polygon centroids can fall outside their extent, for example when
+	// subtracting holes whose signed areas almost cancel the exterior.
+	// Keep these rows available to centroid queries separately.
+	centroidOutliers []int32
 }
 
 var (
@@ -241,35 +261,50 @@ func (idx *geoGridIndex) scanRange(ctx context.Context, table *storage.Table, co
 		if colIdx >= len(row) || row[colIdx] == nil {
 			continue
 		}
-		object, err := geoSimplifyObject(row[colIdx])
-		if err != nil {
-			continue // not parseable geometry: excluded from the index, not a build failure
-		}
-		bbox := geoEditBBox{}
-		if err := collectGeoBBox(object, &bbox); err != nil || !bbox.Set {
-			continue
-		}
-		acc := geoCentroidAccumulator{}
-		var cx, cy float64
-		if err := collectGeoCentroid(object, &acc); err == nil && acc.Weight != 0 {
-			cx, cy = acc.X/acc.Weight, acc.Y/acc.Weight
-		} else if acc.FallbackCount > 0 {
-			cx += acc.FallbackSumX
-			cy += acc.FallbackSumY
-			cx /= float64(acc.FallbackCount)
-			cy /= float64(acc.FallbackCount)
-		} else {
+		bbox, centroid, ok := geoGridGeometry(row[colIdx])
+		if !ok {
 			continue
 		}
 
 		idx.valid[i] = true
-		idx.centroids[i] = geoPoint{Lon: cx, Lat: cy}
+		idx.centroids[i] = geoGridCentroid{
+			Lon: centroid.Lon, Lat: centroid.Lat, cosLat: math.Cos(centroid.Lat * math.Pi / 180),
+		}
 		idx.bboxes[i] = bbox
 		union.add(geoEditPoint{X: bbox.MinX, Y: bbox.MinY})
 		union.add(geoEditPoint{X: bbox.MaxX, Y: bbox.MaxY})
 		validCount++
 	}
 	return union, validCount, nil
+}
+
+func geoGridGeometry(value any) (geoEditBBox, geoPoint, bool) {
+	// GEOMETRY points use sorted JSON keys. The suffix check lets other
+	// geometry types go straight to the general decoder.
+	if text, ok := value.(string); ok && strings.HasSuffix(text, `],"type":"Point"}`) {
+		if p, ok := decodeGeoPointFast(text); ok {
+			box := geoEditBBox{MinX: p.Lon, MaxX: p.Lon, MinY: p.Lat, MaxY: p.Lat, Set: true}
+			// Match the accumulator, including its treatment of signed zero.
+			return box, geoPoint{Lon: p.Lon + 0, Lat: p.Lat + 0}, true
+		}
+	}
+	object, err := geoSimplifyObject(value)
+	if err != nil {
+		return geoEditBBox{}, geoPoint{}, false
+	}
+	box := geoEditBBox{}
+	if err := collectGeoBBox(object, &box); err != nil || !box.Set {
+		return geoEditBBox{}, geoPoint{}, false
+	}
+	acc := geoCentroidAccumulator{}
+	if err := collectGeoCentroid(object, &acc); err == nil && acc.Weight != 0 {
+		return box, geoPoint{Lon: acc.X / acc.Weight, Lat: acc.Y / acc.Weight}, true
+	}
+	if acc.FallbackCount > 0 {
+		n := float64(acc.FallbackCount)
+		return box, geoPoint{Lon: (acc.FallbackSumX + 0) / n, Lat: (acc.FallbackSumY + 0) / n}, true
+	}
+	return geoEditBBox{}, geoPoint{}, false
 }
 
 // buildGeoGridIndex makes one pass to find every row's bbox/centroid (via
@@ -281,7 +316,7 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 	idx := &geoGridIndex{table: table, version: table.Version, uniqueCells: true}
 	n := len(table.Rows)
 	idx.valid = make([]bool, n)
-	idx.centroids = make([]geoPoint, n)
+	idx.centroids = make([]geoGridCentroid, n)
 	idx.bboxes = make([]geoEditBBox, n)
 	union, validCount, err := idx.scanRows(ctx, table, colIdx)
 	if err != nil {
@@ -320,6 +355,10 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 			continue
 		}
 		bbox := idx.bboxes[i]
+		p := idx.centroids[i]
+		if (p.Lon < bbox.MinX || p.Lon > bbox.MaxX || p.Lat < bbox.MinY || p.Lat > bbox.MaxY) && geoSearchFinite(p.Lon, p.Lat) {
+			idx.centroidOutliers = append(idx.centroidOutliers, int32(i))
+		}
 		minCX := int32(math.Floor(bbox.MinX / cellSizeLon))
 		maxCX := int32(math.Floor(bbox.MaxX / cellSizeLon))
 		minCY := int32(math.Floor(bbox.MinY / cellSizeLat))
@@ -520,6 +559,20 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 	return out
 }
 
+func (idx *geoGridIndex) candidatesCentroidBBox(minLon, minLat, maxLon, maxLat float64) []int32 {
+	rows := idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
+	var outliers []int32
+	for _, rowID := range idx.centroidOutliers {
+		if geoPointWithinBBox(idx.centroids[rowID].point(), minLon, minLat, maxLon, maxLat) {
+			outliers = append(outliers, rowID)
+		}
+	}
+	if len(outliers) == 0 {
+		return rows
+	}
+	return geoMergeCandidateRows(rows, outliers)
+}
+
 // candidatesRadius bounds a spherical cap using the same Earth radius as
 // haversineMeters. A linear meters-per-degree approximation can under-include
 // boundary points, and any cap touching a pole must cover all longitudes.
@@ -527,36 +580,36 @@ func (idx *geoGridIndex) candidatesRadius(centerLon, centerLat, radiusMeters flo
 	// GEO_SEARCH historically accepts any finite center. Outside WGS84, keep
 	// the candidate pass conservative and let the existing distance test decide.
 	if centerLon < -180 || centerLon > 180 || centerLat < -90 || centerLat > 90 {
-		return idx.candidatesBBox(-math.MaxFloat64, -math.MaxFloat64, math.MaxFloat64, math.MaxFloat64)
+		return idx.candidatesCentroidBBox(-math.MaxFloat64, -math.MaxFloat64, math.MaxFloat64, math.MaxFloat64)
 	}
 	// Round the bounds outward so floating-point error cannot exclude a point
 	// accepted by the residual haversine comparison at the circle boundary.
 	angle := radiusMeters/geoEarthRadiusMeters + 1e-12
 	if angle >= math.Pi {
-		return idx.candidatesBBox(-180, -90, 180, 90)
+		return idx.candidatesCentroidBBox(-180, -90, 180, 90)
 	}
 	padLat := angle * 180 / math.Pi
 	minLat := math.Max(-90, centerLat-padLat)
 	maxLat := math.Min(90, centerLat+padLat)
 	if minLat <= -90 || maxLat >= 90 {
-		return idx.candidatesBBox(-180, minLat, 180, maxLat)
+		return idx.candidatesCentroidBBox(-180, minLat, 180, maxLat)
 	}
 	padLon := math.Asin(math.Min(1, math.Sin(angle)/math.Cos(centerLat*math.Pi/180))) * 180 / math.Pi
 	minLon, maxLon := centerLon-padLon, centerLon+padLon
 
 	if minLon < -180 {
 		return geoMergeCandidateRows(
-			idx.candidatesBBox(-180, minLat, maxLon, maxLat),
-			idx.candidatesBBox(minLon+360, minLat, 180, maxLat),
+			idx.candidatesCentroidBBox(-180, minLat, maxLon, maxLat),
+			idx.candidatesCentroidBBox(minLon+360, minLat, 180, maxLat),
 		)
 	}
 	if maxLon > 180 {
 		return geoMergeCandidateRows(
-			idx.candidatesBBox(minLon, minLat, 180, maxLat),
-			idx.candidatesBBox(-180, minLat, maxLon-360, maxLat),
+			idx.candidatesCentroidBBox(minLon, minLat, 180, maxLat),
+			idx.candidatesCentroidBBox(-180, minLat, maxLon-360, maxLat),
 		)
 	}
-	return idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
+	return idx.candidatesCentroidBBox(minLon, minLat, maxLon, maxLat)
 }
 
 // geoMergeCandidateRows returns a private, deduplicated union. Candidate order

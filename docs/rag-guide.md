@@ -564,6 +564,30 @@ versioned spatial grid is shared with `GEO_SEARCH`, coalesces concurrent
 cold builds, and caches the final combined row set by table version and filter
 JSON. Invalid spatial input is rejected before a cold grid build.
 
+For administrative districts and other irregular regions, use a GeoJSON
+`Polygon` or `MultiPolygon` as `spatial.polygon`:
+
+```json
+{
+  "pre_filter": {
+    "equals": {"visibility": "published"},
+    "spatial": {
+      "geometry_column": "location",
+      "polygon": {
+        "type": "Polygon",
+        "coordinates": [[[11,48],[12,48],[11.5,49],[11,48]]]
+      }
+    }
+  }
+}
+```
+
+A geometry qualifies if its centroid lies in a polygon part or on its
+boundary. Hole interiors are excluded and their edges are included. Use one
+spatial selector per request. Polygon rings must be closed and use WGS84
+longitude/latitude. Evaluation is planar in those coordinates. Split shapes
+at the antimeridian as described in [RFC 7946](https://www.rfc-editor.org/rfc/rfc7946.html#section-3.1.9).
+
 For standalone retrieval, use the intentionally explicit functions below. The
 separate names prevent their security boundary from being confused with a
 post-retrieval `WHERE`:
@@ -596,6 +620,15 @@ FROM VEC_SEARCH_FILTERED(
     '{"index":"hnsw","pre_filter":{"equals":{"tenant_id":"acme"}}}'
 );
 ```
+
+Set top-level `"max_distance"` in `VEC_SEARCH_FILTERED`, `RAG_SEARCH`, or
+`HYBRID_SEARCH` to drop vector hits whose `_vec_distance` exceeds the bound.
+A value of `null` disables the bound. Distances use the selected metric's
+output units, including Euclidean distance for `l2` and negated inner product
+for `dot`. The bound is applied to the ranked vector candidates before fusion
+or context expansion. Lexical hits and authorized context neighbors can still
+appear in a hybrid or expanded result. ANN traversal uses the selected
+index and its usual candidate budget.
 
 The local graph is invalidated with the source table and is not persisted, so
 use it for repeatedly queried, high-cardinality scopes rather than one-off ACL

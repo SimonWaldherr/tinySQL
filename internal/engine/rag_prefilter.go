@@ -11,6 +11,7 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,21 +42,18 @@ type ragPreFilterOptions struct {
 	IDColumn      string         `json:"id_column"`
 	AllowedRowIDs []any          `json:"allowed_row_ids"`
 	Equals        map[string]any `json:"equals"`
-	// Spatial restricts retrieval to a WGS84 viewport or radius before vector
-	// and lexical ranking. This is useful for georeferenced documents, DTK/DOP
-	// catalog entries, POIs, incidents, and other location-aware RAG corpora.
+	// Spatial restricts georeferenced documents before vector and lexical ranking.
 	Spatial *ragSpatialFilterOptions `json:"spatial"`
 }
 
-// ragSpatialFilterOptions accepts exactly one of bbox or center+radius_meters.
-// bbox is [west,south,east,north]; radius centers are [longitude,latitude].
-// Bbox mode matches every geometry whose extent intersects the viewport,
-// whereas radius mode uses the geometry centroid and a great-circle distance.
+// BBox matches overlapping geometry extents. Radius and Polygon match
+// centroids. Only one of the three spatial selectors may be supplied.
 type ragSpatialFilterOptions struct {
-	GeometryColumn string    `json:"geometry_column"`
-	BBox           []float64 `json:"bbox"`
-	Center         []float64 `json:"center"`
-	RadiusMeters   float64   `json:"radius_meters"`
+	GeometryColumn string          `json:"geometry_column"`
+	BBox           []float64       `json:"bbox"`
+	Center         []float64       `json:"center"`
+	RadiusMeters   float64         `json:"radius_meters"`
+	Polygon        json.RawMessage `json:"polygon,omitempty"`
 }
 
 // ragRowFilter is an immutable, sorted physical-row set shared by the vector
@@ -103,9 +101,10 @@ func (f *ragRowFilter) int32Rows() []int32 {
 const ragRowFilterCacheMaxEntries = 256
 
 type ragRowFilterCacheKey struct {
-	table   *storage.Table
-	version int
-	spec    string
+	table       *storage.Table
+	version     int
+	spec        string
+	polygonSpec [sha256.Size]byte
 }
 
 var (
@@ -141,6 +140,11 @@ func ragParseSearchOptions(raw string) (ragSearchOptions, error) {
 			return opts, fmt.Errorf("multiple JSON values")
 		}
 		return opts, err
+	}
+	// Every JSON null contains these exact bytes. A match inside a string
+	// is harmless: only the presence check below decides what to reject.
+	if !strings.Contains(raw, "null") {
+		return opts, nil
 	}
 	// A missing pre_filter keeps RAG_SEARCH's legacy unrestricted behavior,
 	// but an explicitly supplied null must never silently turn an intended ACL
@@ -318,12 +322,21 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 	}
 	bboxMode := opts.BBox != nil
 	radiusMode := opts.Center != nil || opts.RadiusMeters != 0
-	if bboxMode == radiusMode {
-		return nil, fmt.Errorf("pre_filter.spatial requires exactly one of bbox or center with radius_meters")
+	polygonMode := opts.Polygon != nil
+	if (!bboxMode && !radiusMode && !polygonMode) ||
+		(bboxMode && (radiusMode || polygonMode)) || (radiusMode && polygonMode) {
+		return nil, fmt.Errorf("pre_filter.spatial requires exactly one of bbox, center with radius_meters, or polygon")
 	}
+	var polygon *geoPolygonEntry
 	var west, south, east, north, lon, lat float64
 	crossesAntimeridian := false
-	if bboxMode {
+	switch {
+	case polygonMode:
+		polygon, err = ragParseSpatialPolygon(opts.Polygon)
+		if err != nil {
+			return nil, fmt.Errorf("pre_filter.spatial.polygon: %w", err)
+		}
+	case bboxMode:
 		if len(opts.BBox) != 4 || !geoSearchFinite(opts.BBox...) {
 			return nil, fmt.Errorf("pre_filter.spatial.bbox must contain four finite numbers [west,south,east,north]")
 		}
@@ -332,7 +345,7 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 			return nil, fmt.Errorf("pre_filter.spatial.bbox requires -180 <= west/east <= 180 and -90 <= south <= north <= 90")
 		}
 		crossesAntimeridian = west > east
-	} else {
+	default:
 		if len(opts.Center) != 2 || !geoSearchFinite(opts.Center...) {
 			return nil, fmt.Errorf("pre_filter.spatial.center must contain two finite numbers [longitude,latitude]")
 		}
@@ -357,7 +370,14 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 
 	var candidates []int32
 	var matches func(int32) bool
-	if bboxMode {
+	switch {
+	case polygonMode:
+		candidates = idx.candidatesCentroidBBox(polygon.minX, polygon.minY, polygon.maxX, polygon.maxY)
+		matches = func(rowIdx int32) bool {
+			point := idx.centroids[rowIdx].point()
+			return !polygon.outsideBounds(point) && pointIntersectsMultiPolygon(point, polygon.mp)
+		}
+	case bboxMode:
 		if crossesAntimeridian {
 			candidates = append(idx.candidatesBBox(west, south, 180, north), idx.candidatesBBox(-180, south, east, north)...)
 		} else {
@@ -376,7 +396,7 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 			}
 			return box.MaxX >= west && box.MinX <= east
 		}
-	} else {
+	default:
 		candidates = idx.candidatesRadius(lon, lat, opts.RadiusMeters)
 		// cos(lat) is loop-invariant across every candidate this filter
 		// re-verifies, so it is computed once here instead of once per
@@ -386,13 +406,17 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 			if rowIdx < 0 || int(rowIdx) >= len(idx.centroids) || !idx.valid[rowIdx] {
 				return false
 			}
-			point := idx.centroids[rowIdx]
-			return haversineMetersFromOrigin(lat, cosLat, lon, point.Lat, point.Lon) <= opts.RadiusMeters
+			return idx.centroids[rowIdx].distanceFrom(lat, cosLat, lon) <= opts.RadiusMeters
 		}
 	}
 
 	rows := make([]int, 0, len(candidates))
-	for _, rowIdx := range candidates {
+	for i, rowIdx := range candidates {
+		if i&255 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
 		if matches(rowIdx) {
 			rows = append(rows, int(rowIdx))
 		}
@@ -407,7 +431,39 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 	return slices.Compact(rows), nil
 }
 
+func ragParseSpatialPolygon(raw json.RawMessage) (*geoPolygonEntry, error) {
+	polygon, err := geoMultiPolygonFromValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	for _, part := range polygon.Polygons {
+		for _, ring := range part.Rings {
+			if !geoPointsEqualExact(ring[0], ring[len(ring)-1]) {
+				return nil, fmt.Errorf("polygon rings must be closed")
+			}
+			for _, point := range ring {
+				if !(point.Lon >= -180 && point.Lon <= 180 && point.Lat >= -90 && point.Lat <= 90) {
+					return nil, fmt.Errorf("polygon coordinates must be WGS84 longitude/latitude")
+				}
+			}
+		}
+	}
+	polygon.prepareEdgeBlocks()
+	return newGeoPolygonEntry("", polygon), nil
+}
+
 func ragRowFilterCacheKeyFor(table *storage.Table, opts *ragPreFilterOptions) (ragRowFilterCacheKey, bool) {
+	key := ragRowFilterCacheKey{table: table, version: table.Version}
+	if opts.Spatial != nil && opts.Spatial.Polygon != nil {
+		// Hash the geometry as supplied. Cache keys stay small and a warm
+		// query avoids marshaling the border into a second JSON document.
+		key.polygonSpec = sha256.Sum256(opts.Spatial.Polygon)
+		spatial := *opts.Spatial
+		spatial.Polygon = nil
+		filter := *opts
+		filter.Spatial = &spatial
+		opts = &filter
+	}
 	// encoding/json sorts map keys, so semantically identical equality objects
 	// share one cache entry regardless of their input-key order. If an internal
 	// caller supplied a non-JSON-marshallable value, keep the normal exact path
@@ -416,7 +472,8 @@ func ragRowFilterCacheKeyFor(table *storage.Table, opts *ragPreFilterOptions) (r
 	if err != nil {
 		return ragRowFilterCacheKey{}, false
 	}
-	return ragRowFilterCacheKey{table: table, version: table.Version, spec: string(raw)}, true
+	key.spec = string(raw)
+	return key, true
 }
 
 func ragAllowedIDColumn(table *storage.Table, requested string) (string, int, error) {
@@ -1367,8 +1424,8 @@ func ragFilterSource(source ragSource, filter *ragRowFilter) ragSource {
 // without overloading VEC_SEARCH's legacy positional metric/index arguments.
 //
 // VEC_SEARCH_FILTERED(table, column, query_vector, k, options_json)
-// options_json accepts metric, index (documented but filter-safe searches use
-// exact flat ranking), and a required pre_filter object.
+// options_json accepts metric, index, max_distance, and a required pre_filter
+// object.
 type VecSearchFilteredTableFunc struct{}
 
 func (f *VecSearchFilteredTableFunc) Name() string { return "VEC_SEARCH_FILTERED" }
@@ -1407,6 +1464,9 @@ func (f *VecSearchFilteredTableFunc) Execute(ctx context.Context, args []Expr, e
 			return nil, fmt.Errorf("%s: unknown index %q", f.Name(), opts.Index)
 		}
 	}
+	if err := validateVecMaxDistance(a.metric, opts.MaxDistance); err != nil {
+		return nil, fmt.Errorf("%s: %w", f.Name(), err)
+	}
 	table, tenant, err := ragGetSourceTable(env, a.tableName)
 	if err != nil {
 		return nil, fmt.Errorf("%s: table %q not found: %w", f.Name(), a.tableName, err)
@@ -1419,7 +1479,7 @@ func (f *VecSearchFilteredTableFunc) Execute(ctx context.Context, args []Expr, e
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", f.Name(), err)
 	}
-	return materializeVecCandidates(table, rows, a.metric), nil
+	return materializeVecCandidates(table, trimVecDistance(rows, opts.MaxDistance), a.metric), nil
 }
 
 // FTSSearchFilteredTableFunc exposes FTS pre-filtering without making the

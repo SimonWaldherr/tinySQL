@@ -6,6 +6,8 @@ import (
 	"math"
 	"slices"
 	"strings"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // GeoSearchTableFunc implements GEO_SEARCH(table, geom_col, mode, ...), a
@@ -20,6 +22,8 @@ import (
 // polygon/line columns it answers "is this shape's bounding area within the
 // query window." Use bbox_intersects for GIS layers whose polygon/line extent
 // must overlap the viewport; bbox retains the legacy centroid-within behavior.
+// The nearest mode orders centroids by distance within a radius and returns
+// at most k rows.
 // True shape-overlap search belongs to ST_INTERSECTS (geo_relate.go) run as an
 // ordinary per-row filter after bbox_intersects has narrowed the candidates.
 type GeoSearchTableFunc struct{}
@@ -93,6 +97,9 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 
 	var selectCandidates func(*geoGridIndex) []int32
 	var residual func(idx *geoGridIndex, rowIdx int32) bool
+	var nearestLimit int
+	var radiusMeters float64
+	var radiusDistance func(geoGridCentroid) float64
 	switch mode {
 	case "bbox", "bbox_intersects":
 		if len(args) != 7 {
@@ -122,10 +129,10 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		}
 		if mode == "bbox" {
 			selectCandidates = func(idx *geoGridIndex) []int32 {
-				return idx.candidatesBBox(minLon, minLat, maxLon, maxLat)
+				return idx.candidatesCentroidBBox(minLon, minLat, maxLon, maxLat)
 			}
 			residual = func(idx *geoGridIndex, rowIdx int32) bool {
-				return geoPointWithinBBox(idx.centroids[rowIdx], minLon, minLat, maxLon, maxLat)
+				return geoPointWithinBBox(idx.centroids[rowIdx].point(), minLon, minLat, maxLon, maxLat)
 			}
 		} else {
 			if minLat > maxLat {
@@ -152,8 +159,20 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 				return box.MaxX >= minLon && box.MinX <= maxLon
 			}
 		}
-	case "radius":
-		if len(args) != 6 {
+	case "radius", "nearest":
+		if mode == "nearest" {
+			if len(args) != 7 {
+				return nil, fmt.Errorf("GEO_SEARCH nearest mode requires (table, geom_col, 'nearest', centerLon, centerLat, radiusMeters, k)")
+			}
+			k, err := evalGeoSearchFloatArg(env, args, row, 6)
+			if err != nil {
+				return nil, err
+			}
+			if !(k > 0 && k <= math.MaxInt32 && k == math.Trunc(k)) {
+				return nil, fmt.Errorf("GEO_SEARCH: k must be a positive integer no greater than %d", math.MaxInt32)
+			}
+			nearestLimit = int(k)
+		} else if len(args) != 6 {
 			return nil, fmt.Errorf("GEO_SEARCH radius mode requires (table, geom_col, 'radius', centerLon, centerLat, radiusMeters)")
 		}
 		centerLon, err := evalGeoSearchFloatArg(env, args, row, 3)
@@ -164,7 +183,7 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		if err != nil {
 			return nil, err
 		}
-		radiusMeters, err := evalGeoSearchFloatArg(env, args, row, 5)
+		radiusMeters, err = evalGeoSearchFloatArg(env, args, row, 5)
 		if err != nil {
 			return nil, err
 		}
@@ -174,6 +193,9 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		if !geoSearchFinite(centerLon, centerLat) {
 			return nil, fmt.Errorf("GEO_SEARCH: radius center must contain finite coordinates")
 		}
+		if mode == "nearest" && (math.Abs(centerLon) > 180 || math.Abs(centerLat) > 90) {
+			return nil, fmt.Errorf("GEO_SEARCH: nearest requires a WGS84 center")
+		}
 		selectCandidates = func(idx *geoGridIndex) []int32 {
 			return idx.candidatesRadius(centerLon, centerLat, radiusMeters)
 		}
@@ -182,12 +204,14 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 		// of once per candidate inside haversineMeters — see
 		// haversineMetersFromOrigin.
 		cosCenterLat := math.Cos(centerLat * math.Pi / 180)
+		radiusDistance = func(p geoGridCentroid) float64 {
+			return p.distanceFrom(centerLat, cosCenterLat, centerLon)
+		}
 		residual = func(idx *geoGridIndex, rowIdx int32) bool {
-			p := idx.centroids[rowIdx]
-			return haversineMetersFromOrigin(centerLat, cosCenterLat, centerLon, p.Lat, p.Lon) <= radiusMeters
+			return radiusDistance(idx.centroids[rowIdx]) <= radiusMeters
 		}
 	default:
-		return nil, fmt.Errorf("GEO_SEARCH: unknown mode %q (supported: bbox, bbox_intersects, radius)", modeStr)
+		return nil, fmt.Errorf("GEO_SEARCH: unknown mode %q (supported: bbox, bbox_intersects, radius, nearest)", modeStr)
 	}
 
 	// Parse and validate the complete query before paying a possible cold grid
@@ -196,15 +220,38 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	if searchCtx == nil {
 		searchCtx = env.ctx
 	}
+	if err := checkCtx(searchCtx); err != nil {
+		return nil, err
+	}
 	idx, err := getGeoGridIndex(searchCtx, tenant, table, colIdx)
 	if err != nil {
 		return nil, fmt.Errorf("GEO_SEARCH: %w", err)
 	}
 	candidates := selectCandidates(idx)
+	if nearestLimit > 0 {
+		nearest, err := geoSearchTopK(searchCtx, idx, candidates, nearestLimit, radiusMeters, radiusDistance)
+		if err != nil {
+			return nil, err
+		}
+		cols := geoSearchColumns(table, 2)
+		cols = append(cols, "_geo_distance_m")
+		result := &ResultSet{Cols: cols, Rows: make([]Row, len(nearest))}
+		for i, hit := range nearest {
+			r := geoSearchResultRow(table, hit.rowIdx, len(cols), i+1)
+			r["_geo_distance_m"] = hit.distance
+			result.Rows[i] = r
+		}
+		return result, nil
+	}
 
 	// Candidates are query-local; compact matches into the same allocation.
 	matched := candidates[:0]
-	for _, rowIdx := range candidates {
+	for i, rowIdx := range candidates {
+		if i&255 == 0 {
+			if err := checkCtx(searchCtx); err != nil {
+				return nil, err
+			}
+		}
 		if rowIdx < 0 || int(rowIdx) >= len(idx.valid) || !idx.valid[rowIdx] {
 			continue
 		}
@@ -214,27 +261,52 @@ func (f *GeoSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 	}
 	slices.Sort(matched)
 
-	resultCols := make([]string, 0, len(table.Cols)+1)
-	for _, c := range table.Cols {
-		resultCols = append(resultCols, c.Name)
-	}
-	resultCols = append(resultCols, "_geo_rank")
-
+	resultCols := geoSearchColumns(table, 1)
 	resultRows := make([]Row, 0, len(matched))
 	for rank, rowIdx := range matched {
 		if int(rowIdx) >= len(table.Rows) {
 			continue
 		}
-		r := make(Row, len(resultCols))
-		for ci, c := range table.Cols {
-			if ci < len(table.Rows[rowIdx]) {
-				r[c.Name] = table.Rows[rowIdx][ci]
-			}
-		}
-		r["_geo_rank"] = rank + 1
-		resultRows = append(resultRows, r)
+		resultRows = append(resultRows, geoSearchResultRow(table, int(rowIdx), len(resultCols), rank+1))
 	}
 	return &ResultSet{Cols: resultCols, Rows: resultRows}, nil
+}
+
+func geoSearchTopK(ctx context.Context, idx *geoGridIndex, candidates []int32, k int, radiusMeters float64, distance func(geoGridCentroid) float64) ([]vecScoredRow, error) {
+	heap := newScoredHeap(k, len(candidates))
+	for i, rowID := range candidates {
+		if i&255 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
+		p := idx.centroids[rowID]
+		if !(math.Abs(p.Lon) <= 180 && math.Abs(p.Lat) <= 90) {
+			continue
+		}
+		if meters := distance(p); meters <= radiusMeters {
+			pushTopK(heap, int(rowID), meters, k)
+		}
+	}
+	return topKFromHeap(heap, k), nil
+}
+
+func geoSearchColumns(table *storage.Table, extra int) []string {
+	cols := make([]string, 0, len(table.Cols)+extra)
+	for _, c := range table.Cols {
+		cols = append(cols, c.Name)
+	}
+	return append(cols, "_geo_rank")
+}
+
+func geoSearchResultRow(table *storage.Table, rowID, numCols, rank int) Row {
+	values := table.Rows[rowID]
+	r := make(Row, numCols)
+	for ci, c := range table.Cols[:min(len(table.Cols), len(values))] {
+		r[c.Name] = values[ci]
+	}
+	r["_geo_rank"] = rank
+	return r
 }
 
 func geoSearchFinite(values ...float64) bool {

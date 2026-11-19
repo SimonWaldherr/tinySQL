@@ -1156,6 +1156,13 @@ SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0,
 -- Search with L2 distance metric
 SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'l2');
 
+-- VEC_SEARCH_FILTERED can apply a distance limit before returning rows.
+-- The limit is inclusive and uses the units of _vec_distance.
+SELECT title, _vec_distance FROM VEC_SEARCH_FILTERED(
+    'vec_demo_docs', 'embedding', '[1,0,0]', 5,
+    '{"metric":"l2","max_distance":0.25,"pre_filter":{"id_column":"id","allowed_row_ids":[1,2,3,4,5]}}'
+) ORDER BY _vec_rank;
+
 -- Search with cached approximate ANN indexes for larger RAG tables
 SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'cosine', 'hnsw');
 SELECT * FROM VEC_SEARCH('vec_demo_docs', 'embedding', VEC_FROM_JSON('[1.0, 0.0, 0.0]'), 3, 'cosine', 'ivf');
@@ -1524,13 +1531,17 @@ FROM geo_region_demo GROUP BY region ORDER BY region;
 SELECT region, GEO_CENTROID_AGG(footprint, population) AS weighted_centroid
 FROM geo_region_demo GROUP BY region ORDER BY region;
 
--- GEO_SEARCH: an indexed bbox/radius search over a table, backed by a lazy,
--- per-table grid index invalidated automatically on writes. Exact for Point
--- columns; for polygon/line columns it indexes by centroid (a large shape
--- whose edge -- not centroid -- clips into the window is a false negative;
--- use GEO_INTERSECTS for exact shape overlap).
+-- GEO_SEARCH uses a spatial grid. Bbox and radius modes test the geometry
+-- centroid. Use bbox_intersects for extent overlap, or ST_INTERSECTS for
+-- exact geometry overlap.
 SELECT region FROM GEO_SEARCH('geo_region_demo', 'footprint', 'bbox', -1, -1, 3, 3);
 SELECT region FROM GEO_SEARCH('geo_region_demo', 'footprint', 'radius', 0.5, 0.5, 200000);
+
+-- Nearest mode returns up to k centroids within the inclusive radius.
+-- The radius and _geo_distance_m use meters and _geo_rank starts at 1.
+SELECT region, _geo_distance_m, _geo_rank FROM GEO_SEARCH(
+    'geo_region_demo', 'footprint', 'nearest', 0.5, 0.5, 200000, 2
+) ORDER BY _geo_rank;
 
 DROP TABLE geo_region_demo;
 

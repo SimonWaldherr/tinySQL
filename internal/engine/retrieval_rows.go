@@ -10,7 +10,8 @@ func aliasRetrievalRows(fn TableFunction, result *ResultSet, alias string) []Row
 	case *VecSearchTableFunc, *VecSearchFilteredTableFunc,
 		*FTSSearchTableFunc, *FTSSearchFilteredTableFunc,
 		*RAGSearchTableFunc, *HybridSearchTableFunc,
-		*RAGContextTableFunc, *RAGContextFromTableFunc:
+		*RAGContextTableFunc, *RAGContextFromTableFunc,
+		*GeoSearchTableFunc:
 	default:
 		return aliasRows(result.Rows, alias)
 	}

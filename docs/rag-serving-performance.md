@@ -52,6 +52,24 @@ building its row lookup map when the text branch returns zero or one hit.
 With 256 vector candidates and 24 results, this saved 9,512 B/op in both
 cases in `BenchmarkRAGFuseCandidates`.
 
+Use `max_distance` when the caller needs to discard distant hits. The
+retriever removes those candidates before allocating SQL rows for them.
+In `BenchmarkVectorMaxDistance`, the exact search ranks 512 vectors of
+96 dimensions, with `k=128` and two hits inside the cutoff. Compared with
+the equivalent outer `WHERE`, the inclusive bound reduced bytes per
+query from 247,490 to 10,601 and allocations from 1,073 to 65. These are
+medians of five warmed SQL runs on the same machine.
+
+Repeated polygon-filtered queries hash the GeoJSON as supplied when they
+build a cache key. The remaining metadata is encoded separately. The
+options parser also skips its second pass when the input cannot contain
+an explicit JSON null.
+
+In `BenchmarkRetrievalSpatialPolygonWarm`, six hits are selected from
+1,024 rows. The polygon has 3,000 vertices. Across five paired runs the
+median dropped from 6.55 to 2.82 ms and from 490,026 to 207,585 B/op.
+Timings varied between runs, while the allocation reduction was consistent.
+
 ## Final hit rows
 
 The built-in vector, FTS, hybrid, and context retrievers allocate fresh result
@@ -393,6 +411,12 @@ Append-only column-cache views now share immutable UPDATE-override maps.
 Applying another UPDATE copies the map before writing; computing previously
 missing cosine norms also produces a private map. Existing cache views and
 filtered graphs retain their original vectors and norm values.
+
+Exact flat scans use the ordered override row IDs to read each packed segment
+in contiguous stretches. Only a changed row needs an override lookup.
+`BenchmarkVecSegmentedFlatScan` covers 65,536 vectors in eight segments with a
+single update. At 64 dimensions the median went from 6.46 to 4.62 ms at 320
+B/op and one allocation in both runs. The timing samples varied considerably.
 
 IVF construction counts admitted row IDs before allocating their temporary
 list when the cache has complete adjacent segments and no overrides. Sparse
