@@ -148,3 +148,35 @@ unchanged RETURNING matches, mutable defaults across 64-row blocks, custom
 conversion effects and error precedence. The JavaScript smoke checks cover
 indexed UPDATE, unchanged RETURNING, rollback and a 131-row defaulted INSERT in
 the Browser/Node full and minimal profiles.
+
+## Conflict updates and CHECK validation (2026-11-19)
+
+On repeated imports, UPSERT now reuses the binding map for the current and
+`excluded` rows. Triggers and `RETURNING` still receive independent row images.
+A table owns the parsed checks and column bindings used to validate its rows.
+Dropping the table releases that state. A rejected CREATE stores no CHECK
+expression in a process-wide cache.
+
+Median of five serial in-memory runs against `8e1d88e`, Apple M2 Max, Go 1.27.4,
+`GOMAXPROCS=2`. Each UPSERT uses one parsed statement and 256 existing primary
+keys. The CHECK benchmark measures one warm row with two checks.
+
+| Operation | Time before → after | Bytes/op before → after | Allocs/op before → after |
+| --- | ---: | ---: | ---: |
+| Update 256 conflicting rows | 194.0 → 115.5 µs | 332,122 → 70,689 | 2,570 → 798 |
+| Skip 256 updates via WHERE | 150.2 → 78.5 µs | 313,694 → 52,132 | 2,093 → 305 |
+| Ignore 256 conflicts | 35.9 → 32.3 µs | 33,828 → 15,377 | 777 → 265 |
+| Validate two CHECKs on one row | 318.4 → 122.1 ns | 280 → 0 | 3 → 0 |
+
+The existing driver benchmarks on 10,000 rows serve as controls. Primary-key
+lookup used 25 allocations (previously 26) and took 1.63 µs (previously
+1.77 µs). Grouped aggregation took 190 → 188 µs. Warm flat cosine top-10 over
+128-dimensional vectors took 188 → 191 µs. A small write transaction varied
+from 7.07 → 8.22 µs in the 200 ms samples. Four interleaved one-second samples
+per version yielded a median of 7.50 → 7.49 µs, with 106 allocations in both.
+These timings exclude durable I/O.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' -bench '^BenchmarkUpsertBatch$' -benchmem -benchtime=250ms -count=5
+GOMAXPROCS=2 go test ./internal/engine -run '^$' -bench '^BenchmarkCheckConstraintRow$' -benchmem -benchtime=300ms -count=5
+```

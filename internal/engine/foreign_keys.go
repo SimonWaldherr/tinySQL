@@ -120,13 +120,11 @@ func fkOnDeleteCheckAllColumns(env ExecEnv, t *storage.Table, deletedRows [][]an
 	return nil
 }
 
-// fkOnUpdateCheckColumn must be called BEFORE committing a value change in
-// parentColIdx from oldVal to newVal for one or more rows of t (UPDATE). Like
-// fkOnDeleteCheckAllColumns, it performs no mutation and returns an error if
-// a RESTRICT/NO ACTION reference blocks the change; otherwise it applies any
-// CASCADE/SET NULL updates on referencing tables and returns nil.
+// fkOnUpdateCheckColumn applies the referential actions for changed parent
+// keys. A restriction can fail after another referencing table has already
+// been updated, so the caller needs a rollback point for the whole statement.
 func fkOnUpdateCheckColumn(env ExecEnv, t *storage.Table, parentColIdx int, changes map[any]fkChange) error {
-	if len(changes) == 0 || !tenantHasAnyForeignKeys(env) {
+	if len(changes) == 0 {
 		return nil
 	}
 	refs := findReferencingForeignKeys(env, t.Name, t.Cols[parentColIdx].Name, true)
@@ -355,11 +353,12 @@ func cascadeForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 		before := append([]any(nil), child.Rows[update.rowID]...)
 		after := append([]any(nil), before...)
 		after[ref.childColIdx] = update.newVal
-		// The parent row is deliberately updated after this referential action,
-		// so validating this one foreign-key column against the current parent
-		// state would incorrectly reject a valid ON UPDATE CASCADE. All other
-		// constraints are unchanged; materialized unique indexes still need the
-		// usual duplicate check.
+		// Ordinary UPDATE applies cascades while the parent still holds its
+		// old key. Validate the child's CHECK and unique indexes here without
+		// looking up the new foreign-key value in that intermediate state.
+		if err := validateCheckConstraints(env, child, after); err != nil {
+			return err
+		}
 		if err := child.CheckSecondaryIndexConstraints(after, update.rowID); err != nil {
 			return err
 		}

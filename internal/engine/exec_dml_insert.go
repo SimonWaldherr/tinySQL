@@ -105,23 +105,20 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// buildTableRow allocates a map(2*len(cols)); resolve both timing lists
 	// once before the row loop and skip that map entirely when neither triggers
 	// nor RETURNING needs it.
-	needsRow := hasBefore || hasAfter || len(s.Returning) > 0 || (onConflictPrep != nil && !s.OnConflict.DoNothing)
-	// Both of these are for RETURNING and trigger rows only. Building them
-	// unconditionally charged every plain INSERT a slice sized to its row count
-	// plus one string concatenation per column, none of which anything read.
+	needsInsertRow := hasBefore || hasAfter || len(s.Returning) > 0
+	canUpdate := onConflictPrep != nil && !onConflictPrep.clause.DoNothing
 	var returningRows []Row
 	if len(s.Returning) > 0 {
 		returningRows = make([]Row, 0, rowCount)
 	}
 	var keys tableRowKeys
-	if needsRow {
+	if needsInsertRow || canUpdate {
 		keys = newTableRowKeys(t.Cols, strings.ToLower(s.Table)+".")
 	}
-	// Only safe without triggers: a trigger body can run DDL between rows, so
-	// a parent table resolved for row 1 need not still be the table row 2
-	// should be checked against. See fkTargetCache.
+	// Triggers and cascading conflict updates can change the FK target
+	// between rows. See fkTargetCache.
 	var fks *fkTargetCache
-	if !hasBefore && !hasAfter {
+	if !hasBefore && !hasAfter && !canUpdate {
 		fks = &fkTargetCache{}
 	}
 	// The index set cannot change mid-statement, so its sorted name list is
@@ -146,9 +143,8 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	inserted := 0
 	updated := 0
 	// Reserve row headers once when every input row will be appended on
-	// success. Triggers can mutate the table, and DO NOTHING may skip most
-	// inputs, so those paths retain incremental growth.
-	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && rowCount > 1 {
+	// success. A trigger or ON CONFLICT can change how many rows are appended.
+	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && onConflictPrep == nil && rowCount > 1 {
 		t.Rows = slices.Grow(t.Rows, rowCount)
 	}
 	arena := dmlRowArena{rowsPerBlock: min(rowCount, 64)}
@@ -211,7 +207,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 			return nil, err
 		}
 		var newRow Row
-		if needsRow {
+		if needsInsertRow {
 			if len(s.Returning) > 0 {
 				newRow = buildTableRow(keys, row)
 			} else {
@@ -288,22 +284,20 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	if err != nil {
 		return nil, err
 	}
-	needsRow := hasBefore || hasAfter || len(s.Returning) > 0 || (onConflictPrep != nil && !s.OnConflict.DoNothing)
-	// See executeInsertAllColumns: neither is read unless a trigger or a
-	// RETURNING clause asks for the row map.
+	needsInsertRow := hasBefore || hasAfter || len(s.Returning) > 0
+	canUpdate := onConflictPrep != nil && !onConflictPrep.clause.DoNothing
 	var returningRows []Row
 	if len(s.Returning) > 0 {
 		returningRows = make([]Row, 0, rowCount)
 	}
 	var keys tableRowKeys
-	if needsRow {
+	if needsInsertRow || canUpdate {
 		keys = newTableRowKeys(t.Cols, strings.ToLower(s.Table)+".")
 	}
-	// Only safe without triggers: a trigger body can run DDL between rows, so
-	// a parent table resolved for row 1 need not still be the table row 2
-	// should be checked against. See fkTargetCache.
+	// Triggers and cascading conflict updates can change the FK target
+	// between rows. See fkTargetCache.
 	var fks *fkTargetCache
-	if !hasBefore && !hasAfter {
+	if !hasBefore && !hasAfter && !canUpdate {
 		fks = &fkTargetCache{}
 	}
 	// The index set cannot change mid-statement, so its sorted name list is
@@ -332,9 +326,8 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	inserted := 0
 	updated := 0
 	// Reserve row headers once when every input row will be appended on
-	// success. Triggers can mutate the table, and DO NOTHING may skip most
-	// inputs, so those paths retain incremental growth.
-	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && rowCount > 1 {
+	// success. A trigger or ON CONFLICT can change how many rows are appended.
+	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && onConflictPrep == nil && rowCount > 1 {
 		t.Rows = slices.Grow(t.Rows, rowCount)
 	}
 	arena := dmlRowArena{rowsPerBlock: min(rowCount, 64)}
@@ -408,7 +401,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			return nil, err
 		}
 		var newRow Row
-		if needsRow {
+		if needsInsertRow {
 			if len(s.Returning) > 0 {
 				newRow = buildTableRow(keys, row)
 			} else {
@@ -842,7 +835,8 @@ func validateOneRowConstraint(env ExecEnv, t *storage.Table, row []any, excludeR
 //     invalidateConstraintIndexes drops the cache outright and the next
 //     check rebuilds it from scratch.
 type constraintIndexSet struct {
-	cols map[int]*constraintIndexEntry
+	checks *tableCheckPlan
+	cols   map[int]*constraintIndexEntry
 }
 
 type constraintIndexEntry struct {

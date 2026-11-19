@@ -3,17 +3,11 @@ package engine
 import (
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
-var parsedCheckExprCache sync.Map // string -> Expr
-
-func parseCheckExprCached(exprText string) (Expr, error) {
-	if cached, ok := parsedCheckExprCache.Load(exprText); ok {
-		return cached.(Expr), nil
-	}
+func parseCheckExpr(exprText string) (Expr, error) {
 	p := NewParser(exprText)
 	expr, err := p.parseExpr()
 	if err != nil {
@@ -22,7 +16,6 @@ func parseCheckExprCached(exprText string) (Expr, error) {
 	if p.cur.Typ != tEOF {
 		return nil, p.errf("unexpected token %q in CHECK constraint", p.cur.Val)
 	}
-	parsedCheckExprCache.Store(exprText, expr)
 	return expr, nil
 }
 
@@ -199,7 +192,7 @@ func validateCheckExprColumns(tableName string, cols []storage.Column, expr Expr
 
 func validateCheckConstraintSchema(tableName string, cols []storage.Column, checks []storage.CheckConstraint) error {
 	for _, ck := range checks {
-		expr, err := parseCheckExprCached(ck.Expr)
+		expr, err := parseCheckExpr(ck.Expr)
 		if err != nil {
 			return fmt.Errorf("invalid CHECK constraint %q: %w", ck.Expr, err)
 		}
@@ -213,45 +206,102 @@ func validateCheckConstraintSchema(tableName string, cols []storage.Column, chec
 	return nil
 }
 
+// A table owns its parsed checks alongside its other derived constraint state.
+// The source strings and column names also cover callers that edit the exported
+// schema in place. Transaction clones and restored tables can rebuild the plan.
+type tableCheckPlan struct {
+	tableName string
+	columns   []string
+	checks    []compiledCheck
+	colIndex  map[string]int
+	keys      tableRowKeys
+}
+
+type compiledCheck struct {
+	source string
+	expr   Expr
+	raw    bool
+}
+
+func (p *tableCheckPlan) matches(t *storage.Table) bool {
+	if p == nil || p.tableName != t.Name || len(p.columns) != len(t.Cols) || len(p.checks) != len(t.CheckConstraints) {
+		return false
+	}
+	for i, col := range t.Cols {
+		if p.columns[i] != col.Name {
+			return false
+		}
+	}
+	for i, ck := range t.CheckConstraints {
+		if p.checks[i].source != ck.Expr {
+			return false
+		}
+	}
+	return true
+}
+
+func tableChecks(t *storage.Table) (*tableCheckPlan, error) {
+	t.DerivedLock()
+	defer t.DerivedUnlock()
+	set := constraintIndexSetOf(t, true)
+	if set.checks.matches(t) {
+		return set.checks, nil
+	}
+	p := &tableCheckPlan{
+		tableName: t.Name,
+		columns:   make([]string, len(t.Cols)),
+		checks:    make([]compiledCheck, len(t.CheckConstraints)),
+	}
+	for i, col := range t.Cols {
+		p.columns[i] = col.Name
+	}
+	for i, ck := range t.CheckConstraints {
+		expr, err := parseCheckExpr(ck.Expr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CHECK constraint %q: %w", ck.Expr, err)
+		}
+		raw := isSimpleRawExpr(expr)
+		p.checks[i] = compiledCheck{source: ck.Expr, expr: expr, raw: raw}
+		if raw && p.colIndex == nil {
+			p.colIndex = simpleColumnIndex(t, t.Name)
+		}
+		if !raw && p.keys.key == nil {
+			p.keys = newTableRowKeys(t.Cols, strings.ToLower(t.Name)+".")
+		}
+	}
+	set.checks = p
+	return p, nil
+}
+
 // validateCheckConstraints enforces SQL three-valued CHECK semantics on row:
 // TRUE and NULL (UNKNOWN) pass; FALSE fails with an error.
 func validateCheckConstraints(env ExecEnv, t *storage.Table, row []any) error {
 	if len(t.CheckConstraints) == 0 {
 		return nil
 	}
+	checks, err := tableChecks(t)
+	if err != nil {
+		return err
+	}
+	plan := simpleSelectPlan{table: t, colIndex: checks.colIndex, now: env.now}
 	var rowMap Row
-	var keys tableRowKeys
-	var colIndex map[string]int
-	for _, ck := range t.CheckConstraints {
-		expr, err := parseCheckExprCached(ck.Expr)
-		if err != nil {
-			return fmt.Errorf("invalid CHECK constraint %q: %w", ck.Expr, err)
-		}
+	for i, ck := range checks.checks {
 		var val any
-		if isSimpleRawExpr(expr) {
-			if colIndex == nil {
-				colIndex = simpleColumnIndex(t, t.Name)
-			}
-			plan := simpleSelectPlan{
-				table:    t,
-				colIndex: colIndex,
-				now:      env.now,
-			}
-			val, err = evalRawExpr(&plan, row, expr)
+		if ck.raw {
+			val, err = evalRawExpr(&plan, row, ck.expr)
 		} else {
 			if rowMap == nil {
-				keys = newTableRowKeys(t.Cols, strings.ToLower(t.Name)+".")
-				rowMap = buildTableRow(keys, row)
+				rowMap = buildTableRow(checks.keys, row)
 			}
-			val, err = evalExpr(env, expr, rowMap)
+			val, err = evalExpr(env, ck.expr, rowMap)
 		}
 		if err != nil {
 			return err
 		}
 		if toTri(val) == tvFalse {
-			label := ck.Expr
-			if ck.Name != "" {
-				label = ck.Name
+			label := t.CheckConstraints[i].Name
+			if label == "" {
+				label = ck.source
 			}
 			return fmt.Errorf("CHECK constraint failed: %s", label)
 		}

@@ -58,8 +58,13 @@ func checkPermission(ctx context.Context, db *storage.DB, stmt Statement) error 
 	if !needsCheck {
 		return nil
 	}
-	if !db.Catalog().HasPermission(user, perm, schema, table) {
+	catalog := db.Catalog()
+	if !catalog.HasPermission(user, perm, schema, table) {
 		return fmt.Errorf("access denied: user %q lacks %s permission on %s.%s", user, perm, schema, table)
+	}
+	// A conflict can update an existing row, including one inserted earlier in the same batch.
+	if ins, ok := stmt.(*Insert); ok && ins.OnConflict != nil && !ins.OnConflict.DoNothing && !catalog.HasPermission(user, storage.PermUpdate, schema, table) {
+		return fmt.Errorf("access denied: user %q lacks %s permission on %s.%s", user, storage.PermUpdate, schema, table)
 	}
 	return nil
 }

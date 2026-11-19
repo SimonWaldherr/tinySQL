@@ -18,7 +18,9 @@ type preparedOnConflict struct {
 	target       conflictTarget
 	assignments  []upsertAssign
 	changedCols  []int
-	excludedKeys tableRowKeys
+	excludedKeys []string
+	evalRow      Row
+	pointRow     [1]int
 }
 
 type upsertAssign struct {
@@ -78,7 +80,6 @@ func prepareOnConflict(t *storage.Table, oc *OnConflictClause) (*preparedOnConfl
 		}
 		prep.assignments = assigns
 		prep.changedCols = changedCols
-		prep.excludedKeys = newTableRowKeys(t.Cols, "excluded.")
 	}
 	return prep, nil
 }
@@ -151,7 +152,7 @@ func (p *preparedOnConflict) findConflictRow(t *storage.Table, row []any) (int, 
 		if colIdx < 0 || colIdx >= len(row) || isNull(row[colIdx]) {
 			return -1, false, nil
 		}
-		rows := lookupConstraintIndexRows(getConstraintIndex(t, colIdx), row[colIdx])
+		rows := lookupConstraintIndexRowsInto(getConstraintIndex(t, colIdx), row[colIdx], p.pointRow[:0])
 		if len(rows) > 0 {
 			return rows[0], true, nil
 		}
@@ -174,13 +175,19 @@ func applyOnConflictUpdate(
 	beforeUpdateRunner, afterUpdateRunner *triggerListRunner,
 ) (bool, Row, error) {
 	before := t.Rows[conflictRowID]
-	evalRow := buildTableRow(keys, before)
-	for i := range t.Cols {
-		if i < len(proposedRow) {
-			evalRow[prep.excludedKeys.prefix[i]] = proposedRow[i]
-		} else {
-			evalRow[prep.excludedKeys.prefix[i]] = nil
+	// WHERE and SET consume the bindings synchronously. RETURNING and triggers
+	// get their own row maps below.
+	if prep.evalRow == nil {
+		prep.evalRow = make(Row, len(keys.key)*3)
+		prep.excludedKeys = make([]string, len(keys.key))
+		for i, name := range keys.key {
+			prep.excludedKeys[i] = "excluded." + name
 		}
+	}
+	evalRow := prep.evalRow
+	fillTableRow(evalRow, keys, before)
+	for i, key := range prep.excludedKeys {
+		evalRow[key] = proposedRow[i]
 	}
 	if prep.clause.Where != nil {
 		v, err := evalExpr(env, prep.clause.Where, evalRow)
@@ -211,8 +218,10 @@ func applyOnConflictUpdate(
 		return false, nil, err
 	}
 	var oldRowMap, newRowMap Row
-	if beforeUpdateRunner != nil || afterUpdateRunner != nil || len(s.Returning) > 0 {
+	if beforeUpdateRunner != nil || afterUpdateRunner != nil {
 		oldRowMap = buildTableRow(keys, before)
+	}
+	if oldRowMap != nil || len(s.Returning) > 0 {
 		newRowMap = buildTableRow(keys, nextRow)
 	}
 	if beforeUpdateRunner != nil {
@@ -230,6 +239,20 @@ func applyOnConflictUpdate(
 	}
 	if err := wal.logUpdate(env, conflictRowID, before, nextRow, t.Cols); err != nil {
 		return false, nil, err
+	}
+	// Install and log the parent first. A self-referencing cascade may
+	// update another column in this very row; its write must survive both
+	// this assignment and WAL replay.
+	if planTenantHasForeignKeys(env, s) {
+		for _, col := range prep.changedCols {
+			if isNull(before[col]) || rawEqual(before[col], nextRow[col]) {
+				continue
+			}
+			changes := map[any]fkChange{comparableKeyPart(before[col]): {newVal: nextRow[col]}}
+			if err := fkOnUpdateCheckColumn(env, t, col, changes); err != nil {
+				return false, nil, err
+			}
+		}
 	}
 	if afterUpdateRunner != nil {
 		if err := afterUpdateRunner.fire(env, newRowMap, oldRowMap); err != nil {

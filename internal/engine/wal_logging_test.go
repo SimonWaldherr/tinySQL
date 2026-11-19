@@ -139,15 +139,16 @@ func TestAdvancedWALRecoveryIncludesForeignKeyReferentialActions(t *testing.T) {
 		live := storage.NewDB()
 		live.AttachAdvancedWAL(wal)
 		execSQL(t, live, `CREATE TABLE parent (id INT PRIMARY KEY)`)
-		execSQL(t, live, `CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id) ON DELETE SET NULL)`)
-		execSQL(t, live, `INSERT INTO parent VALUES (1)`)
-		execSQL(t, live, `INSERT INTO child VALUES (10, 1)`)
+		execSQL(t, live, `CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id) ON DELETE SET NULL ON UPDATE CASCADE)`)
+		execSQL(t, live, `INSERT INTO parent VALUES (1), (2)`)
+		execSQL(t, live, `INSERT INTO child VALUES (10, 1), (20, 2)`)
+		execSQL(t, live, `INSERT INTO parent VALUES (2) ON CONFLICT (id) DO UPDATE SET id = 3`)
 		execSQL(t, live, `DELETE FROM parent WHERE id = 1`)
 	}()
 
 	recovered := storage.NewDB()
 	execSQL(t, recovered, `CREATE TABLE parent (id INT PRIMARY KEY)`)
-	execSQL(t, recovered, `CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id) ON DELETE SET NULL)`)
+	execSQL(t, recovered, `CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id) ON DELETE SET NULL ON UPDATE CASCADE)`)
 	wal, err := storage.OpenAdvancedWAL(storage.AdvancedWALConfig{Path: walPath})
 	if err != nil {
 		t.Fatal(err)
@@ -160,5 +161,9 @@ func TestAdvancedWALRecoveryIncludesForeignKeyReferentialActions(t *testing.T) {
 	rs := execSQL(t, recovered, `SELECT parent_id FROM child WHERE id = 10`)
 	if len(rs.Rows) != 1 || rs.Rows[0]["parent_id"] != nil {
 		t.Fatalf("recovered ON DELETE SET NULL action = %#v", rs.Rows)
+	}
+	rs = execSQL(t, recovered, `SELECT parent_id FROM child WHERE id = 20`)
+	if len(rs.Rows) != 1 || expectAsInt(t, rs.Rows[0]["parent_id"]) != 3 {
+		t.Fatalf("recovered upsert cascade = %#v", rs.Rows)
 	}
 }

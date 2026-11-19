@@ -198,6 +198,95 @@ func TestForeignKeyOnUpdateDefaultRestricts(t *testing.T) {
 	}
 }
 
+func TestUpsertUpdatesReferencedKey(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		action string
+		child  any
+	}{
+		{"restrict", "", 1},
+		{"cascade", " ON UPDATE CASCADE", 2},
+		{"set_null", " ON UPDATE SET NULL", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := storage.NewDB()
+			defer db.Close()
+			execSQL(t, db, "CREATE TABLE parent (id INT PRIMARY KEY, code TEXT UNIQUE)")
+			execSQL(t, db, "CREATE TABLE child (pid INT REFERENCES parent(id)"+tc.action+")")
+			execSQL(t, db, "INSERT INTO parent VALUES (1, 'p')")
+			execSQL(t, db, "INSERT INTO child VALUES (1)")
+			s := mustParse("INSERT INTO parent VALUES (2, 'p') ON CONFLICT (code) DO UPDATE SET id = excluded.id")
+			_, err := Execute(t.Context(), db, "default", s)
+			wantParent := 2
+			if tc.name == "restrict" {
+				wantParent = 1
+				if err == nil {
+					t.Fatal("updating a referenced parent key should fail")
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			parent := execSQL(t, db, "SELECT id FROM parent")
+			child := execSQL(t, db, "SELECT pid FROM child")
+			if len(parent.Rows) != 1 || parent.Rows[0]["id"] != wantParent ||
+				len(child.Rows) != 1 || child.Rows[0]["pid"] != tc.child {
+				t.Fatalf("parent=%v child=%v, want %v/%v", parent.Rows, child.Rows, wantParent, tc.child)
+			}
+		})
+	}
+}
+
+func TestUpsertRollsBackCascadeOnChildCheckFailure(t *testing.T) {
+	db := storage.NewDB()
+	defer db.Close()
+	execSQL(t, db, "CREATE TABLE parent (id INT PRIMARY KEY, code TEXT UNIQUE)")
+	execSQL(t, db, "CREATE TABLE child (pid INT REFERENCES parent(id) ON UPDATE CASCADE, CHECK (pid < 10))")
+	execSQL(t, db, "CREATE INDEX ix_child ON child(pid)")
+	execSQL(t, db, "INSERT INTO parent VALUES (1, 'a'), (2, 'b')")
+	execSQL(t, db, "INSERT INTO child VALUES (1), (2)")
+	stmt := mustParse("INSERT INTO parent VALUES (3, 'a'), (10, 'b') ON CONFLICT (code) DO UPDATE SET id = excluded.id")
+	if _, err := Execute(t.Context(), db, "default", stmt); err == nil {
+		t.Fatal("cascade should have failed the second child's CHECK")
+	}
+	for _, query := range []string{
+		"SELECT id FROM parent WHERE id IN (1, 2)",
+		"SELECT pid FROM child WHERE pid IN (1, 2)",
+	} {
+		if rs := execSQL(t, db, query); len(rs.Rows) != 2 {
+			t.Errorf("after rollback, %s returned %v", query, rs.Rows)
+		}
+	}
+}
+
+func TestUpsertCascadesIntoItsOwnRow(t *testing.T) {
+	db := storage.NewDB()
+	defer db.Close()
+	execSQL(t, db, "CREATE TABLE node (id INT PRIMARY KEY, parent INT REFERENCES node(id) ON UPDATE CASCADE)")
+	execSQL(t, db, "INSERT INTO node VALUES (1, NULL)")
+	execSQL(t, db, "UPDATE node SET parent = 1 WHERE id = 1")
+	execSQL(t, db, "INSERT INTO node VALUES (1, NULL) ON CONFLICT (id) DO UPDATE SET id = 2")
+	rs := execSQL(t, db, "SELECT parent FROM node WHERE id = 2")
+	if len(rs.Rows) != 1 || rs.Rows[0]["parent"] != 2 {
+		t.Fatalf("self-reference after key change = %v", rs.Rows)
+	}
+}
+
+func TestUpsertRollsBackUpdateTriggerWrites(t *testing.T) {
+	db := storage.NewDB()
+	defer db.Close()
+	execSQL(t, db, "CREATE TABLE parent (id INT PRIMARY KEY, n INT CHECK (n >= 0))")
+	execSQL(t, db, "CREATE TABLE audit (id INT)")
+	execSQL(t, db, "CREATE TRIGGER audit_updates AFTER UPDATE ON parent BEGIN INSERT INTO audit VALUES (NEW.id); END")
+	execSQL(t, db, "INSERT INTO parent VALUES (1, 1)")
+	stmt := mustParse("INSERT INTO parent VALUES (1, 2), (1, -1) ON CONFLICT (id) DO UPDATE SET n = excluded.n")
+	if _, err := Execute(t.Context(), db, "default", stmt); err == nil {
+		t.Fatal("expected CHECK failure")
+	}
+	if rs := execSQL(t, db, "SELECT id FROM audit"); len(rs.Rows) != 0 {
+		t.Fatalf("failed upsert left audit records %v", rs.Rows)
+	}
+}
+
 func TestForeignKeyNoForeignKeysAnywhereUnaffected(t *testing.T) {
 	// tenantHasAnyForeignKeys must short-circuit to true no-op when the
 	// tenant has no FK columns at all, so ordinary DELETE/UPDATE keep using

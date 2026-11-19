@@ -637,9 +637,9 @@ func lookupConstraintIndexRowsInto(index *constraintIndexEntry, value any, dst [
 	if index == nil {
 		return nil
 	}
-	var stack [8]int
 	rows := dst[:0]
 	if cap(rows) == 0 {
+		var stack [8]int
 		rows = stack[:0]
 	}
 	buckets := 0

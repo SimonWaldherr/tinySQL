@@ -189,6 +189,8 @@ ROLLBACK TO SAVEPOINT before_restock; -- the doubling is undone, the insert stay
 COMMIT;
 ```
 
+- With RBAC enabled, a conflict update requires INSERT and UPDATE on the target
+  table. A conflict action of DO NOTHING requires INSERT.
 - The proposed row is checked against CHECK constraints before the conflict
   lookup. A malformed row is rejected even when `DO NOTHING` would skip it, in
   the same way NOT NULL is enforced first.

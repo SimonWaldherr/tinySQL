@@ -262,9 +262,10 @@ type dmlPlan struct {
 	// directory listing in the disk-backed modes) per call. tenantFKKnown is
 	// false when the statement shape never asks for it, so a future consumer
 	// that does cannot silently read the zero value as "no foreign keys".
-	tenantFK      bool
-	tenantFKKnown bool
-	before, after []*storage.CatalogTrigger
+	tenantFK             bool
+	tenantFKKnown        bool
+	upsertUpdateTriggers bool
+	before, after        []*storage.CatalogTrigger
 	// colIndex and rowIDs are populated only for the statement shapes whose
 	// handler is going to need them again; a nil colIndex means "not
 	// precomputed". rowIDsFound mirrors the seek's own found result, which is
@@ -279,7 +280,9 @@ type dmlPlan struct {
 	updateIndexNames []string
 }
 
-func (p *dmlPlan) hasTriggers() bool { return len(p.before) > 0 || len(p.after) > 0 }
+func (p *dmlPlan) hasTriggers() bool {
+	return len(p.before) > 0 || len(p.after) > 0 || p.upsertUpdateTriggers
+}
 
 // planTable returns the target table a plan already resolved, or nil when
 // there is no plan or the lookup failed. A nil result means the caller must
@@ -355,12 +358,18 @@ func newDMLPlan(out *dmlPlan, db *storage.DB, tenant string, stmt Statement) *dm
 	plan := out
 	plan.stmt = stmt
 	plan.before, plan.after = db.Catalog().GetTriggersForEvent(name, event)
-	// Deliberately not computed for INSERT: nothing on the INSERT path asks
-	// for it (per-column FOREIGN KEY validation goes through
-	// validateOneRowConstraint instead), and the answer costs a full
-	// ListTables — two allocations, a sort, and a backend directory listing
-	// in the disk-backed storage modes.
-	if _, isInsert := stmt.(*Insert); !isInsert {
+	// A plain INSERT only checks outgoing references. Its DO UPDATE branch
+	// can also cascade into child tables or fire UPDATE triggers, both of
+	// which need a rollback point covering more than the insert target.
+	insert, isInsert := stmt.(*Insert)
+	upsert := isInsert && insert.OnConflict != nil && !insert.OnConflict.DoNothing
+	if upsert {
+		before, after := db.Catalog().GetTriggersForEvent(name, storage.TriggerUpdate)
+		plan.upsertUpdateTriggers = len(before) > 0 || len(after) > 0
+	}
+	// A trigger may create a referencing table between upserted rows. The
+	// full snapshot already covers its side effects; resolve FKs at runtime.
+	if !isInsert || (upsert && !plan.hasTriggers()) {
 		plan.tenantFK = tenantHasAnyForeignKeys(ExecEnv{tenant: tenant, db: db})
 		plan.tenantFKKnown = true
 	}
@@ -506,21 +515,15 @@ func rowsOnlySnapshotTarget(plan *dmlPlan) (string, bool) {
 // cloning every table on each statement. Triggers and FK cascades can write
 // elsewhere, so they deliberately retain the full-database snapshot.
 func tableScopedSnapshotTarget(plan *dmlPlan) (string, bool) {
-	if plan == nil || plan.hasTriggers() {
+	if plan == nil || plan.hasTriggers() || plan.tenantFK {
 		return "", false
 	}
 	switch s := plan.stmt.(type) {
 	case *Insert:
 		return s.Table, true
 	case *Update:
-		if plan.tenantFK {
-			return "", false
-		}
 		return s.Table, true
 	case *Delete:
-		if plan.tenantFK {
-			return "", false
-		}
 		return s.Table, true
 	default:
 		return "", false

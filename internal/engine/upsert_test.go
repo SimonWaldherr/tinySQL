@@ -2,11 +2,32 @@ package engine
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
+
+func TestUpsertBatchReturningOwnsEachVersion(t *testing.T) {
+	db := storage.NewDB()
+	defer db.Close()
+	mustExec(t, db, t.Context(), "CREATE TABLE inventory (id INT PRIMARY KEY, qty INT, note TEXT)")
+	mustExec(t, db, t.Context(), "INSERT INTO inventory VALUES (1, 10, 'initial')")
+	rs := mustExec(t, db, t.Context(), `INSERT INTO inventory (id, qty, note)
+		VALUES (1, 2, 'first'), (2, 5, 'new'), (1, 0, 'skip'), (1, 3, NULL), (2, 1, 'last')
+		ON CONFLICT (id) DO UPDATE SET qty = inventory.qty + excluded.qty, note = excluded.note
+		WHERE excluded.qty > 0 RETURNING id, qty, note`)
+	want := []Row{
+		{"id": 1, "qty": 12, "note": "first"},
+		{"id": 2, "qty": 5, "note": "new"},
+		{"id": 1, "qty": 15, "note": nil},
+		{"id": 2, "qty": 6, "note": "last"},
+	}
+	if !reflect.DeepEqual(rs.Rows, want) {
+		t.Fatalf("RETURNING rows = %#v, want %#v", rs.Rows, want)
+	}
+}
 
 func TestOnConflictDoUpdateAndTargetedDoNothing(t *testing.T) {
 	ctx := context.Background()

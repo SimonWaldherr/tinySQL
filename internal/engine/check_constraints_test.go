@@ -109,3 +109,43 @@ func TestCheckConstraintsSchemaValidationAndAlterTable(t *testing.T) {
 		t.Fatal("expected INSERT violating ALTER-added CHECK to fail")
 	}
 }
+
+func BenchmarkCheckConstraintRow(b *testing.B) {
+	table := storage.NewTable("stock", []storage.Column{
+		{Name: "qty", Type: storage.IntType},
+		{Name: "reserved", Type: storage.IntType},
+	}, false)
+	table.CheckConstraints = []storage.CheckConstraint{
+		{Expr: "qty >= 0"},
+		{Expr: "stock.reserved BETWEEN 0 AND qty"},
+	}
+	env := ExecEnv{ctx: b.Context()}
+	row := []any{100, 5}
+	for b.Loop() {
+		if err := validateCheckConstraints(env, table, row); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestTableCheckPlanTracksCurrentSchema(t *testing.T) {
+	table := storage.NewTable("stock", []storage.Column{{Name: "qty", Type: storage.IntType}}, false)
+	table.CheckConstraints = []storage.CheckConstraint{{Expr: "stock.qty > 0"}}
+	env := ExecEnv{ctx: t.Context()}
+	require := func(pass bool) {
+		t.Helper()
+		if err := validateCheckConstraints(env, table, []any{2}); (err == nil) != pass {
+			t.Fatalf("check %q: err = %v, want pass = %v", table.CheckConstraints[0].Expr, err, pass)
+		}
+	}
+	require(true)
+	table.CheckConstraints[0].Expr = "qty > 2"
+	require(false)
+	if err := table.RenameColumn("qty", "count"); err != nil {
+		t.Fatal(err)
+	}
+	table.CheckConstraints[0].Expr = "stock.count > 0"
+	require(true)
+	table.Name = "inventory"
+	require(false)
+}

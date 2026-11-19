@@ -268,3 +268,33 @@ func TestRBACDisableBeforeAnyUserIsANoOp(t *testing.T) {
 		t.Fatalf("expected CREATE TABLE to succeed with no users regardless of the toggle: %v", err)
 	}
 }
+
+func TestRBACInsertConflictPermissions(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { db.Close() })
+	cat := db.Catalog()
+	if err := cat.CreateRole("writer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.GrantPermission("writer", storage.PermInsert, "main", "items"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.CreateUser("bob", "pw", []string{"writer"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithUser(t.Context(), "bob")
+	skip := mustParse("INSERT INTO items VALUES (1) ON CONFLICT (id) DO NOTHING")
+	update := mustParse("INSERT INTO items VALUES (1) ON CONFLICT (id) DO UPDATE SET id = excluded.id")
+	if err := checkPermission(ctx, db, skip); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkPermission(ctx, db, update); err == nil {
+		t.Fatal("DO UPDATE requires an UPDATE grant")
+	}
+	if err := cat.GrantPermission("writer", storage.PermUpdate, "main", "items"); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkPermission(ctx, db, update); err != nil {
+		t.Fatal(err)
+	}
+}
