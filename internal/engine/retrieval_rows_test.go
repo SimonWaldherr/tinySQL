@@ -65,11 +65,13 @@ func TestRetrievalRowsMatchCopyingQualification(t *testing.T) {
 		}
 	}
 	for _, name := range []string{"ID", "r.id", "a.b"} {
-		result := &ResultSet{Cols: []string{name}, Rows: []Row{{name: 1}}}
-		before := cloneRow(result.Rows[0])
-		got := aliasRetrievalRows(&VecSearchTableFunc{}, result, "r")
-		if !reflect.DeepEqual(got, aliasRows([]Row{before}, "r")) || !reflect.DeepEqual(result.Rows[0], before) {
-			t.Fatalf("fallback %s mutated rows", name)
+		for _, alias := range []string{"", "r"} {
+			result := &ResultSet{Cols: []string{name}, Rows: []Row{{name: 1}}}
+			before := cloneRow(result.Rows[0])
+			got := aliasRetrievalRows(&VecSearchTableFunc{}, result, alias)
+			if !reflect.DeepEqual(got, aliasRows([]Row{before}, alias)) || !reflect.DeepEqual(result.Rows[0], before) {
+				t.Fatalf("fallback %s alias %q changed behavior", name, alias)
+			}
 		}
 	}
 }

@@ -87,6 +87,24 @@ func TestRAGFuseCandidatesSmallWindowMatchesMapPath(t *testing.T) {
 	}
 }
 
+func TestRAGFuseSparseTextMatchesMapPath(t *testing.T) {
+	table := benchmarkRAGFuseTable(100)
+	vec := make([]vecScoredRow, 80)
+	for i := range vec {
+		vec[i] = vecScoredRow{rowIdx: i, distance: float64(i)}
+	}
+	vec[79].rowIdx = 1 // The last occurrence receives the text score.
+	for _, text := range [][]ftsScored{nil, {{rowIdx: 1, score: 2}}, {{rowIdx: 99, score: 2}}} {
+		// Invalid trailing IDs force hashed fusion without adding output rows.
+		padded := append(append([]ftsScored(nil), text...), ftsScored{rowIdx: -1}, ftsScored{rowIdx: -1})
+		got := ragFuseNativeCandidates(table, vec, text, 60, 100)
+		want := ragFuseNativeCandidates(table, vec, padded, 60, 100)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ranks or scores differ for text candidates %v", text)
+		}
+	}
+}
+
 // TestRAGContextHitSourceMatchesMaterializedHits keeps the compact
 // context-expansion input behaviorally identical to the prior path, which
 // first formatted full vector/RRF result rows and then used them only to read
@@ -145,19 +163,24 @@ func BenchmarkRAGFuseCandidates(b *testing.B) {
 	for _, tc := range []struct {
 		name       string
 		candidates int
+		textHits   int
 		k          int
 	}{
-		{name: "candidate_k_24_return_6", candidates: 24, k: 6},
-		{name: "candidate_k_256_return_24", candidates: 256, k: 24},
-		{name: "candidate_k_4096_return_24", candidates: 4096, k: 24},
+		{name: "candidate_k_24_return_6", candidates: 24, textHits: 24, k: 6},
+		{name: "candidate_k_256_return_24", candidates: 256, textHits: 256, k: 24},
+		{name: "candidate_k_256_no_text", candidates: 256, textHits: 0, k: 24},
+		{name: "candidate_k_256_one_text", candidates: 256, textHits: 1, k: 24},
+		{name: "candidate_k_4096_return_24", candidates: 4096, textHits: 4096, k: 24},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			table := benchmarkRAGFuseTable(tc.candidates * 2)
 			vecRows := make([]vecScoredRow, tc.candidates)
-			ftsRows := make([]ftsScored, tc.candidates)
-			for i := 0; i < tc.candidates; i++ {
+			ftsRows := make([]ftsScored, tc.textHits)
+			for i := range vecRows {
 				vecRows[i] = vecScoredRow{rowIdx: i, distance: float64(i) / float64(tc.candidates)}
-				// Half the rows overlap the vector list, and half are text-only.
+			}
+			for i := range ftsRows {
+				// Start halfway into the vector list so a full text window has 50% overlap.
 				ftsRows[i] = ftsScored{rowIdx: tc.candidates/2 + i, score: float64(tc.candidates - i)}
 			}
 

@@ -892,33 +892,75 @@ func ragVecSearchCandidatesFiltered(ctx context.Context, env ExecEnv, a vecSearc
 	if searchCtx == nil {
 		searchCtx = env.ctx
 	}
-	started := time.Now()
+	analyticsOn := vecAnalyticsEnabled()
+	var started time.Time
+	if analyticsOn {
+		started = time.Now()
+	}
 	tenant := env.tenant
 	if tenant == "" {
 		tenant = "default"
 	}
-	cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
-	distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm)
+	needNorm := vecDistanceFuncNeedsNorm(a.metric)
+	index := "flat"
+	var rows []vecScoredRow
 	if a.indexMode == vecIndexHNSW && len(filter.rows) >= vecSearchParallelMinRows {
-		idx, err := getRAGFilteredANNIndex(searchCtx, tenant, table, vecColIdx, a.metric, len(a.queryVec), filter, cache)
-		if err != nil {
-			return nil, err
+		cache := getVecColumnCache(tenant, table, vecColIdx, needNorm)
+		idx, buildErr := getRAGFilteredANNIndex(searchCtx, tenant, table, vecColIdx, a.metric, len(a.queryVec), filter, cache)
+		if buildErr != nil {
+			return nil, buildErr
 		}
-		rows, err := idx.searchFiltered(searchCtx, a.queryVec, queryNorm, a.k, cache, filter)
-		if err != nil {
-			return nil, err
+		index = "filter-hnsw"
+		rows, err = idx.searchFiltered(searchCtx, a.queryVec, queryNorm, a.k, cache, filter)
+	} else {
+		distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm)
+		// A small ACL or bounding box can leave just a few candidates.
+		// If the whole column is cold, score those physical rows directly
+		// instead of copying and normalizing every embedding in the corpus.
+		key := vecSearchColumnCacheKey{source: table, tenant: tenant, table: table.Name, colIdx: vecColIdx}
+		cache, warm := currentVecColumnCache(key, needNorm)
+		// TEXT columns use the cache to amortize parsing JSON vectors.
+		if !warm && table.Cols[vecColIdx].Type == storage.VectorType && len(filter.rows) <= min(64, len(table.Rows)/16) {
+			rows, err = ragVecTopKTableRows(searchCtx, table, vecColIdx, filter.rows, len(a.queryVec), a.k, distFn, needNorm)
+		} else {
+			if !warm {
+				cache = getVecColumnCache(tenant, table, vecColIdx, needNorm)
+			}
+			rows, err = ragVecTopKAllowed(searchCtx, filter.rows, len(a.queryVec), a.k, cache, distFn, needNorm)
 		}
-		finalizeVecScoredRows(a.metric, rows)
-		recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: "filter-hnsw", K: a.k, Duration: time.Since(started)})
-		return rows, nil
 	}
-	rows, err := ragVecTopKAllowed(searchCtx, filter.rows, len(a.queryVec), a.k, cache, distFn, vecDistanceFuncNeedsNorm(a.metric))
 	if err != nil {
 		return nil, err
 	}
 	finalizeVecScoredRows(a.metric, rows)
-	recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: "flat", K: a.k, Duration: time.Since(started)})
+	if analyticsOn {
+		recordVecQuery(VectorQueryEvent{At: time.Now(), Table: table.Name, Column: a.colName, Metric: a.metric, Index: index, K: a.k, Duration: time.Since(started)})
+	}
 	return rows, nil
+}
+
+func ragVecTopKTableRows(ctx context.Context, table *storage.Table, colIdx int, allowed []int, dims, k int, distance vecDistanceFunc, needNorm bool) ([]vecScoredRow, error) {
+	h := newScoredHeap(k, len(allowed))
+	for _, id := range allowed {
+		if err := checkCtx(ctx); err != nil {
+			return nil, err
+		}
+		if id < 0 || id >= len(table.Rows) || colIdx >= len(table.Rows[id]) {
+			continue
+		}
+		v, ok := vecRowValue(table.Rows[id][colIdx])
+		if !ok || len(v) != dims {
+			continue
+		}
+		var norm float64
+		if needNorm {
+			norm = vectorL2Norm(v)
+		}
+		if d, ok := distance(v, norm); ok {
+			pushTopK(h, id, d, k)
+		}
+	}
+	return topKFromHeap(h, k), nil
 }
 
 func ragVecTopKAllowed(ctx context.Context, allowed []int, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) ([]vecScoredRow, error) {

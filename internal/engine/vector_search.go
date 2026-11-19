@@ -481,17 +481,21 @@ func evictOverCap[K comparable, V any](m map[K]V, maxEntries int) {
 	sqlval.EvictOverCap(m, maxEntries)
 }
 
+// Published segments and overrides are immutable, so a lock-free snapshot
+// can return a ready column without committing the caller to a cache build.
+func currentVecColumnCache(key vecSearchColumnCacheKey, includeNorms bool) (vecSearchColumnCacheEntry, bool) {
+	if snap := vecSearchColumnCacheSnapshot.Load(); snap != nil {
+		if cached, ok := (*snap)[key]; ok && cached.table == key.source && cached.version == key.source.Version && (!includeNorms || cached.normsReady) {
+			return cached, true
+		}
+	}
+	return vecSearchColumnCacheEntry{}, false
+}
+
 func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
 	key := vecSearchColumnCacheKey{source: table, tenant: tenant, table: table.Name, colIdx: colIdx}
-
-	// Published segments and overrides are immutable. Appends share them;
-	// refresh takes a private map before changing row values. Lock-free
-	// snapshot reads can therefore reuse the data safely. Lazy warm statistics
-	// synchronize through their own shared state rather than the cache lock.
-	if snap := vecSearchColumnCacheSnapshot.Load(); snap != nil {
-		if cached, ok := (*snap)[key]; ok && cached.table == table && cached.version == table.Version && (!includeNorms || cached.normsReady) {
-			return cached
-		}
+	if cached, ok := currentVecColumnCache(key, includeNorms); ok {
+		return cached
 	}
 
 	for {

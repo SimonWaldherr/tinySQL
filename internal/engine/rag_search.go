@@ -54,7 +54,7 @@ const ragSearchDefaultRRFK = 60.0
 
 // The default hybrid window is 4*k per branch (normally 24+24 candidates).
 // A small linear probe is cheaper than allocating and hashing a map at that
-// size. Wider recall-oriented windows retain the map path below.
+// size. Wider windows use a map when there are multiple text hits to merge.
 const ragFusionLinearCandidateLimit = 64
 
 // RAGSearchTableFunc implements the RAG_SEARCH table-valued function.
@@ -454,7 +454,9 @@ func ragFuseNativeCandidates(table *storage.Table, vecRows []vecScoredRow, ftsRo
 	// remain stable through all appends below.
 	candidateCap := len(vecRows) + len(ftsRows)
 	var byRow map[int]*ragNativeCandidate
-	if candidateCap > ragFusionLinearCandidateLimit {
+	// Only the text branch probes the map. Even a wide vector window takes
+	// at most one linear scan when a rare text term matches a single row.
+	if len(ftsRows) > 1 && candidateCap > ragFusionLinearCandidateLimit {
 		byRow = make(map[int]*ragNativeCandidate, candidateCap)
 	}
 	candidates := make([]ragNativeCandidate, 0, candidateCap)

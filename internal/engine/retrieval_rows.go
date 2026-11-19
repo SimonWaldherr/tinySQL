@@ -14,28 +14,34 @@ func aliasRetrievalRows(fn TableFunction, result *ResultSet, alias string) []Row
 	default:
 		return aliasRows(result.Rows, alias)
 	}
-	keys := make([]derivedKeys, len(result.Cols))
-	lowerAlias := strings.ToLower(alias)
-	for i, col := range result.Cols {
+	if result.Rows == nil {
+		return []Row{}
+	}
+	for _, col := range result.Cols {
 		// Preserve legacy casing and dotted-key collision behavior through
 		// the copying path, before modifying any result row.
 		if strings.ToLower(col) != col || strings.Contains(col, ".") {
 			return aliasRows(result.Rows, alias)
 		}
-		keys[i].plain = col
-		if alias != "" {
-			keys[i].qualified = lowerAlias + "." + col
-		}
 	}
-	if result.Rows == nil {
-		return []Row{}
+	if alias == "" {
+		return result.Rows
 	}
-	if alias != "" {
-		for _, row := range result.Rows {
-			for _, key := range keys {
-				if value, found := row[key.plain]; found {
-					row[key.qualified] = value
-				}
+	var scratch [16]string
+	qualified := scratch[:]
+	if len(result.Cols) > len(qualified) {
+		qualified = make([]string, len(result.Cols))
+	} else {
+		qualified = qualified[:len(result.Cols)]
+	}
+	lowerAlias := strings.ToLower(alias)
+	for i, col := range result.Cols {
+		qualified[i] = lowerAlias + "." + col
+	}
+	for _, row := range result.Rows {
+		for i, col := range result.Cols {
+			if value, found := row[col]; found {
+				row[qualified[i]] = value
 			}
 		}
 	}

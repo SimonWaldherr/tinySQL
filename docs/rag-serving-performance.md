@@ -27,6 +27,31 @@ for every serving database, and warm each database separately with `RAG_WARM`.
 A request waiting for a concurrent IVF/HNSW build can now leave when its context
 is canceled. This does not cancel another request's build or its waiters.
 
+## Selective vector filters
+
+An exact `RAG_SEARCH` or `VEC_SEARCH_FILTERED` on a native `VECTOR` column
+can score the eligible rows directly. This applies when the filter admits at
+most 64 rows and at most one sixteenth of the table. A current column cache
+still takes precedence. Applications that repeatedly query the same corpus
+can use `VEC_WARM` to amortize cosine norms.
+
+`BenchmarkRAGSparseVectorSQL` retrieves six hits from 8,192 vectors of 128
+dimensions. An already resolved, indexed region filter admits 32 rows. The
+following are medians of five 150 ms runs on an Apple M2 Max with Go 1.27.4
+and `GOMAXPROCS=2`.
+
+| State at query time | Before | After |
+| --- | ---: | ---: |
+| Cold vector column | 744 µs, 8,673,835 B/op | 21.35 µs, 13,027 B/op |
+| Repeated query, no explicit warm-up | 13.81 µs | 15.43 µs |
+| Explicitly warmed vector column | 13.76 µs | 12.77 µs |
+
+The direct path recomputes norms for the selected rows. This accounts for
+the tradeoff on repeated queries. Separately, reciprocal-rank fusion skips
+building its row lookup map when the text branch returns zero or one hit.
+With 256 vector candidates and 24 results, this saved 9,512 B/op in both
+cases in `BenchmarkRAGFuseCandidates`.
+
 ## Final hit rows
 
 The built-in vector, FTS, hybrid, and context retrievers allocate fresh result
@@ -35,6 +60,12 @@ maps instead of copying every hit map again. Extension table functions retain
 the copying path because their ownership contract may allow shared results.
 Noncanonical column names also use the existing conversion to preserve casing
 and dotted-name behavior.
+
+Qualification reuses the original column names and keeps up to 16 qualified
+names on the stack. In `BenchmarkRetrievalRowQualification`, materializing and
+qualifying six hits with eight source columns fell from 12,088 to 11,736 B/op
+and from 58 to 57 allocations. With 32 source columns, it fell from 46,696 to
+46,120 B/op with 82 allocations in both cases.
 
 Tests compare the resulting maps with the copying implementation, including
 qualified aliases, absent branch scores, context expansion, and repeated calls
