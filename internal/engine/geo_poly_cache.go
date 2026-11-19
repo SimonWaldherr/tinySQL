@@ -15,6 +15,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -32,13 +33,98 @@ const (
 
 // geoPolygonEntry is a parsed polygon plus the bounding box of all its rings.
 type geoPolygonEntry struct {
-	text      string
-	mp        geoMultiPolygon
-	hasBounds bool
-	minX      float64
-	minY      float64
-	maxX      float64
-	maxY      float64
+	text string
+	mp   geoMultiPolygon
+	minX float64 // NaN if there is no usable bounding box
+	minY float64
+	maxX float64
+	maxY float64
+}
+
+// Consecutive edges of a detailed border tend to stay close in latitude.
+// Store two floats for each block so a horizontal ray (or a point lying on
+// an edge) can skip blocks outside its latitude without inspecting vertices.
+const geoEdgesPerBlock = 32
+
+type geoLatitudeRange struct {
+	low, high float64
+}
+
+// One entry per ring, with nil blocks for short rings.
+type geoPolygonEdgeBlocks [][]geoLatitudeRange
+
+// prepareEdgeBlocks is called on freshly parsed geometry before it is shared.
+func (mp *geoMultiPolygon) prepareEdgeBlocks() {
+	if mp.edgeBlocks != nil {
+		return
+	}
+	for i, poly := range mp.Polygons {
+		var rings geoPolygonEdgeBlocks
+		for j, ring := range poly.Rings {
+			edges := len(ring) - 1
+			if edges < 4*geoEdgesPerBlock {
+				continue
+			}
+			if mp.edgeBlocks == nil {
+				index := make([]geoPolygonEdgeBlocks, len(mp.Polygons))
+				mp.edgeBlocks = &index
+			}
+			if rings == nil {
+				rings = make(geoPolygonEdgeBlocks, len(poly.Rings))
+				(*mp.edgeBlocks)[i] = rings
+			}
+			blocks := make([]geoLatitudeRange, (edges+geoEdgesPerBlock-1)/geoEdgesPerBlock)
+			for k := range blocks {
+				start := k * geoEdgesPerBlock
+				low, high := ring[start].Lat, ring[start].Lat
+				for _, v := range ring[start+1 : min(start+geoEdgesPerBlock, edges)+1] {
+					low, high = min(low, v.Lat), max(high, v.Lat)
+				}
+				blocks[k] = geoLatitudeRange{low, high}
+			}
+			rings[j] = blocks
+		}
+	}
+}
+
+func (b geoLatitudeRange) pathAt(ring geoRing, block int, latitude float64) geoRing {
+	if latitude < b.low || latitude > b.high {
+		return nil
+	}
+	start := block * geoEdgesPerBlock
+	return ring[start:min(start+geoEdgesPerBlock+1, len(ring))]
+}
+
+func (mp geoMultiPolygon) polygonBlocks(i int) geoPolygonEdgeBlocks {
+	if mp.edgeBlocks == nil {
+		return nil
+	}
+	return (*mp.edgeBlocks)[i]
+}
+
+func polygonRingContains(p geoPoint, ring geoRing, blocks geoPolygonEdgeBlocks, i int) bool {
+	if blocks == nil || blocks[i] == nil {
+		return pointInRing(p, ring)
+	}
+	inside := rayCrossesEdge(p, ring[len(ring)-1], ring[0])
+	for k, block := range blocks[i] {
+		if path := block.pathAt(ring, k, p.Lat); path != nil && rayCrossesPath(p, path) {
+			inside = !inside
+		}
+	}
+	return inside
+}
+
+func polygonRingBoundaryContains(p geoPoint, ring geoRing, blocks geoPolygonEdgeBlocks, i int) bool {
+	if blocks == nil || blocks[i] == nil {
+		return pointOnRingBoundary(p, ring)
+	}
+	for k, block := range blocks[i] {
+		if path := block.pathAt(ring, k, p.Lat); path != nil && pointOnRingBoundary(p, path) {
+			return true
+		}
+	}
+	return false
 }
 
 var (
@@ -49,13 +135,13 @@ var (
 // newGeoPolygonEntry computes the bounding box over every ring. A coordinate that
 // is NaN disables the bounding-box shortcut instead of corrupting it.
 func newGeoPolygonEntry(text string, mp geoMultiPolygon) *geoPolygonEntry {
-	e := &geoPolygonEntry{text: text, mp: mp, hasBounds: true}
+	e := &geoPolygonEntry{text: text, mp: mp}
 	first := true
 	for _, poly := range mp.Polygons {
 		for _, ring := range poly.Rings {
 			for _, p := range ring {
 				if p.Lon != p.Lon || p.Lat != p.Lat {
-					e.hasBounds = false
+					e.minX = math.NaN()
 					return e
 				}
 				if first {
@@ -68,8 +154,15 @@ func newGeoPolygonEntry(text string, mp geoMultiPolygon) *geoPolygonEntry {
 			}
 		}
 	}
-	e.hasBounds = !first
+	if first {
+		e.minX = math.NaN()
+	}
 	return e
+}
+
+func (e *geoPolygonEntry) outsideBounds(p geoPoint) bool {
+	return !math.IsNaN(e.minX) && !math.IsNaN(p.Lon) && !math.IsNaN(p.Lat) &&
+		(p.Lon < e.minX || p.Lon > e.maxX || p.Lat < e.minY || p.Lat > e.maxY)
 }
 
 // contains is pointInMultiPolygon with a bounding-box rejection first. A point
@@ -77,8 +170,7 @@ func newGeoPolygonEntry(text string, mp geoMultiPolygon) *geoPolygonEntry {
 // casting test crosses an even number of edges of an (implicitly closed) ring
 // from there. NaN coordinates skip the shortcut.
 func (e *geoPolygonEntry) contains(p geoPoint) bool {
-	if e.hasBounds && p.Lon == p.Lon && p.Lat == p.Lat &&
-		(p.Lon < e.minX || p.Lon > e.maxX || p.Lat < e.minY || p.Lat > e.maxY) {
+	if e.outsideBounds(p) {
 		return false
 	}
 	return pointInMultiPolygon(p, e.mp)
@@ -88,11 +180,10 @@ func (e *geoPolygonEntry) contains(p geoPoint) bool {
 // point strictly outside every ring's box is neither inside nor on a boundary.
 func (e *geoPolygonEntry) pointsIntersect(pts []geoPoint) bool {
 	for _, p := range pts {
-		if e.hasBounds && p.Lon == p.Lon && p.Lat == p.Lat &&
-			(p.Lon < e.minX || p.Lon > e.maxX || p.Lat < e.minY || p.Lat > e.maxY) {
+		if e.outsideBounds(p) {
 			continue
 		}
-		if pointInMultiPolygon(p, e.mp) || pointOnMultiPolygonBoundary(p, e.mp) {
+		if pointIntersectsMultiPolygon(p, e.mp) {
 			return true
 		}
 	}
@@ -131,6 +222,7 @@ func geoPolygonFromValueCached(v any) (*geoPolygonEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+	mp.prepareEdgeBlocks()
 	e := newGeoPolygonEntry(text, mp)
 	slot := geoPolyCacheNext.Add(1) % geoPolyCacheSlots
 	geoPolyCache[slot].Store(e)
@@ -190,7 +282,10 @@ func geoCachedObjectPolygon(obj map[string]any) (*geoObjectEntry, bool) {
 		if e == nil || e.ptr != ptr {
 			continue
 		}
-		e.once.Do(func() { e.mp, e.err = geoMultiPolygonFromObject(e.obj) })
+		e.once.Do(func() {
+			e.mp, e.err = geoMultiPolygonFromObject(e.obj)
+			e.mp.prepareEdgeBlocks()
+		})
 		return e, true
 	}
 	return nil, false

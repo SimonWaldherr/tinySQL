@@ -167,9 +167,8 @@ func segmentsIntersect(p1, p2, p3, p4 geoPoint) bool {
 }
 
 // pointOnRingBoundary reports whether p lies exactly on any edge of ring.
-// Rings in this file are always stored explicitly closed (ring[0] equals
-// ring[len-1], per polygonFromRingsValue), so edges are just consecutive
-// pairs -- no wraparound edge needs to be added separately.
+// A GeoJSON ring includes its closing vertex. For an unclosed input the
+// boundary test examines only the edges actually supplied.
 //
 // This exists because pointInRing's ray-casting rule can be
 // parity-inconsistent for a point exactly on an edge, and ST_INTERSECTS
@@ -185,9 +184,10 @@ func pointOnRingBoundary(p geoPoint, ring geoRing) bool {
 }
 
 func pointOnMultiPolygonBoundary(p geoPoint, mp geoMultiPolygon) bool {
-	for _, poly := range mp.Polygons {
-		for _, ring := range poly.Rings {
-			if pointOnRingBoundary(p, ring) {
+	for i, poly := range mp.Polygons {
+		blocks := mp.polygonBlocks(i)
+		for j, ring := range poly.Rings {
+			if polygonRingBoundaryContains(p, ring, blocks, j) {
 				return true
 			}
 		}
@@ -285,11 +285,15 @@ func geoPointsIntersectPolygons(aObj, bObj map[string]any) (bool, error) {
 
 func pointsIntersectPolygons(pts []geoPoint, mp geoMultiPolygon) bool {
 	for _, p := range pts {
-		if pointInMultiPolygon(p, mp) || pointOnMultiPolygonBoundary(p, mp) {
+		if pointIntersectsMultiPolygon(p, mp) {
 			return true
 		}
 	}
 	return false
+}
+
+func pointIntersectsMultiPolygon(p geoPoint, mp geoMultiPolygon) bool {
+	return pointInMultiPolygon(p, mp) || pointOnMultiPolygonBoundary(p, mp)
 }
 
 // geoLinesIntersectLines is the one fully rigorous pair here: two

@@ -45,7 +45,7 @@ func TestGeoPolygonEntryContainsMatchesPlainTest(t *testing.T) {
 			t.Fatal(err)
 		}
 		points := []geoPoint{{Lon: math.Inf(1)}, {Lon: math.Inf(-1), Lat: 1}, {Lat: math.Inf(1)}, {Lon: math.NaN()}, {Lat: math.NaN()}}
-		if entry.hasBounds {
+		if !math.IsNaN(entry.minX) {
 			for _, dx := range []float64{-1, 0, 1} {
 				for _, dy := range []float64{-1, 0, 1} {
 					points = append(points,
@@ -61,6 +61,60 @@ func TestGeoPolygonEntryContainsMatchesPlainTest(t *testing.T) {
 		for _, p := range points {
 			if got, want := entry.contains(p), pointInMultiPolygon(p, mp); got != want {
 				t.Fatalf("trial %d: contains(%v) = %v, plain test says %v", trial, p, got, want)
+			}
+		}
+	}
+}
+
+func TestGeoPolygonEdgeBlocksMatchFullScan(t *testing.T) {
+	// Cover a partial last block, a hole, a second polygon with an unclosed
+	// ring, and a small unindexed ring in the same geometry.
+	large := geoBenchRing(11, 49, 4, 11*geoEdgesPerBlock+5)
+	open := geoBenchRing(18, 49, 2, 5*geoEdgesPerBlock)
+	open = open[:strings.LastIndex(open, ",[")] + "]"
+	// Every block of this zigzag spans the same latitudes, with horizontal
+	// edges exactly at each limit and a duplicate point at the end.
+	var zigzag strings.Builder
+	for i := 0; i < 160; i++ {
+		fmt.Fprintf(&zigzag, "[%d,%d],", i-160, 47+i/2%2)
+	}
+	zigzag.WriteString("[-1,48],[-160,47]")
+	region := fmt.Sprintf(`{"type":"MultiPolygon","coordinates":[[%s,%s,%s],[%s],[[%s]]]}`,
+		large, geoBenchRing(11, 49, 1, 160), geoBenchRing(13, 49, 0.2, 8), open, zigzag.String())
+	plain, ok := decodeGeoMultiPolygonFast(region)
+	if !ok {
+		t.Fatal("invalid fixture")
+	}
+	var points []geoPoint
+	for _, poly := range plain.Polygons {
+		for _, ring := range poly.Rings {
+			for i, p := range ring {
+				before := ring[(i+len(ring)-1)%len(ring)]
+				points = append(points, p,
+					geoPoint{Lon: p.Lon, Lat: math.Nextafter(p.Lat, math.Inf(1))},
+					geoPoint{Lon: p.Lon, Lat: math.Nextafter(p.Lat, math.Inf(-1))},
+					geoPoint{Lon: (before.Lon + p.Lon) / 2, Lat: (before.Lat + p.Lat) / 2})
+			}
+		}
+	}
+	points = append(points, geoPoint{Lon: 11, Lat: 49}, geoPoint{Lon: 13, Lat: 49},
+		geoPoint{Lon: 10, Lat: 47}, geoPoint{Lon: 18, Lat: 49}, geoPoint{Lat: math.NaN()})
+
+	// A foreign GeoJSON member exercises the decoded-object cache.
+	for _, text := range []string{region, strings.Replace(region, `{"type"`, `{"name":"test","type"`, 1)} {
+		entry, err := geoPolygonFromValueCached(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if blocks := entry.mp.polygonBlocks(0); blocks == nil || blocks[0] == nil || blocks[2] != nil {
+			t.Fatal("expected blocks only for long rings")
+		}
+		for _, p := range points {
+			inside := pointInMultiPolygon(p, plain)
+			boundary := pointOnMultiPolygonBoundary(p, plain)
+			if entry.contains(p) != inside || pointOnMultiPolygonBoundary(p, entry.mp) != boundary ||
+				entry.pointsIntersect([]geoPoint{p}) != (inside || boundary) {
+				t.Fatalf("point %v: full scan gives inside=%v boundary=%v", p, inside, boundary)
 			}
 		}
 	}
@@ -107,11 +161,8 @@ func TestGeoPolygonCacheInvalidInputStillErrors(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			_, cachedErr := geoPolygonFromValueCached(bad)
 			_, plainErr := geoMultiPolygonFromValue(bad)
-			if cachedErr == nil || plainErr == nil {
-				continue // an extra member is legal; only compare when the plain path fails
-			}
-			if cachedErr.Error() != plainErr.Error() {
-				t.Fatalf("error changed: cached %q, plain %q", cachedErr, plainErr)
+			if (cachedErr == nil) != (plainErr == nil) || (plainErr != nil && cachedErr.Error() != plainErr.Error()) {
+				t.Fatalf("error changed: cached %v, plain %v", cachedErr, plainErr)
 			}
 		}
 	}
@@ -133,7 +184,8 @@ func TestGeoWithinPolygonSQLWithCachedRegion(t *testing.T) {
 	for i := 0; i < 300; i++ {
 		exec(fmt.Sprintf(`INSERT INTO pts VALUES (%d, '{"type":"Point","coordinates":[%.4f,%.4f]}')`, i, rng.Float64()*20-10, rng.Float64()*20-10))
 	}
-	region := randomRegionText(rng, 2, 1)
+	region := fmt.Sprintf(`{"type":"MultiPolygon","coordinates":[[%s,%s],[%s]]}`,
+		geoBenchRing(1, 2, 6, 500), geoBenchRing(0, 1, 0.5, 9), geoBenchRing(-8, -8, 1, 16))
 	mp, err := geoMultiPolygonFromValue(region)
 	if err != nil {
 		t.Fatal(err)
@@ -172,6 +224,8 @@ func TestGeoPolygonCacheConcurrentUse(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		texts = append(texts, randomRegionText(rng, 1, 1))
 	}
+	texts = append(texts, fmt.Sprintf(`{"name":"region","type":"Polygon","coordinates":[%s]}`,
+		geoBenchRing(9, 49, 3, 500)))
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
 		wg.Add(1)

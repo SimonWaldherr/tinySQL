@@ -147,11 +147,12 @@ func geoTouchesPointsPolygons(ptsObj, polyObj map[string]any) (any, error) {
 	}
 	touched := false
 	for _, p := range pts {
-		if pointStrictlyInsideMultiPolygon(p, mp) {
-			return false, nil // interior contact: not a touch
-		}
 		if pointOnMultiPolygonBoundary(p, mp) {
 			touched = true
+			continue
+		}
+		if pointInMultiPolygon(p, mp) {
+			return false, nil // interior contact: not a touch
 		}
 	}
 	return touched, nil
@@ -385,6 +386,23 @@ func geoCovers(name string, aObj, bObj map[string]any) (any, error) {
 		return nil, fmt.Errorf("%s arg2: %w", name, err)
 	}
 
+	if aKind == geoRelatePolygons && bKind == geoRelatePoints {
+		mp, err := geoMultiPolygonFromValue(aObj)
+		if err != nil {
+			return nil, err
+		}
+		pts, err := geoPointsFromObject(bObj)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range pts {
+			if !pointIntersectsMultiPolygon(p, mp) {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+
 	pointInA, err := geoContainmentTest(aKind, aObj)
 	if err != nil {
 		return nil, err
@@ -459,9 +477,7 @@ func geoContainmentTest(aKind geoRelateKind, aObj map[string]any) (func(geoPoint
 		if err != nil {
 			return nil, err
 		}
-		return func(p geoPoint) bool {
-			return pointInMultiPolygon(p, mp) || pointOnMultiPolygonBoundary(p, mp)
-		}, nil
+		return func(p geoPoint) bool { return pointIntersectsMultiPolygon(p, mp) }, nil
 	default:
 		return nil, fmt.Errorf("unsupported or missing geometry type")
 	}

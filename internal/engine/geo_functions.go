@@ -759,7 +759,8 @@ type geoPolygon struct {
 // GEO_WITHIN_POLYGON/ST_CONTAINS treat membership in any part as membership
 // in the whole; GEO_POLYGON_AREA sums every part's area.
 type geoMultiPolygon struct {
-	Polygons []geoPolygon
+	Polygons   []geoPolygon
+	edgeBlocks *[]geoPolygonEdgeBlocks // optional, indexed by polygon
 }
 
 // geoLineString is a GeoJSON LineString: an ordered sequence of vertices.
@@ -1066,16 +1067,28 @@ func pointInRing(p geoPoint, ring geoRing) bool {
 	}
 	inside := false
 	j := n - 1
-	for i := 0; i < n; i++ {
-		xi, yi := ring[i].Lon, ring[i].Lat
-		xj, yj := ring[j].Lon, ring[j].Lat
-		if (yi > p.Lat) != (yj > p.Lat) {
-			xCross := (xj-xi)*(p.Lat-yi)/(yj-yi) + xi
-			if p.Lon < xCross {
-				inside = !inside
-			}
+	for i := range ring {
+		if rayCrossesEdge(p, ring[j], ring[i]) {
+			inside = !inside
 		}
 		j = i
+	}
+	return inside
+}
+
+func rayCrossesEdge(p, a, b geoPoint) bool {
+	return (b.Lat > p.Lat) != (a.Lat > p.Lat) &&
+		p.Lon < (a.Lon-b.Lon)*(p.Lat-b.Lat)/(a.Lat-b.Lat)+b.Lon
+}
+
+// rayCrossesPath counts only consecutive pairs. A ring's implicit closing
+// edge is tested once by its caller, even when the ring is split into blocks.
+func rayCrossesPath(p geoPoint, path geoRing) bool {
+	inside := false
+	for i := 1; i < len(path); i++ {
+		if rayCrossesEdge(p, path[i-1], path[i]) {
+			inside = !inside
+		}
 	}
 	return inside
 }
@@ -1083,12 +1096,12 @@ func pointInRing(p geoPoint, ring geoRing) bool {
 // pointInPolygon reports whether p is inside poly's exterior ring and
 // outside every hole, per the GeoJSON convention that Rings[0] is the
 // exterior boundary and Rings[1:] are holes.
-func pointInPolygon(p geoPoint, poly geoPolygon) bool {
-	if len(poly.Rings) == 0 || !pointInRing(p, poly.Rings[0]) {
+func pointInPolygon(p geoPoint, poly geoPolygon, blocks geoPolygonEdgeBlocks) bool {
+	if len(poly.Rings) == 0 || !polygonRingContains(p, poly.Rings[0], blocks, 0) {
 		return false
 	}
-	for _, hole := range poly.Rings[1:] {
-		if pointInRing(p, hole) {
+	for i := 1; i < len(poly.Rings); i++ {
+		if polygonRingContains(p, poly.Rings[i], blocks, i) {
 			return false
 		}
 	}
@@ -1137,8 +1150,8 @@ func polygonAreaMeters(poly geoPolygon) float64 {
 
 // pointInMultiPolygon reports whether p is inside any one of mp's parts.
 func pointInMultiPolygon(p geoPoint, mp geoMultiPolygon) bool {
-	for _, poly := range mp.Polygons {
-		if pointInPolygon(p, poly) {
+	for i, poly := range mp.Polygons {
+		if pointInPolygon(p, poly, mp.polygonBlocks(i)) {
 			return true
 		}
 	}

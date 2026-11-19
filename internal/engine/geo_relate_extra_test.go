@@ -70,6 +70,19 @@ func TestGeoTouchesPointsAndLines(t *testing.T) {
 	if got := execScalarBool(t, db, fmt.Sprintf(`SELECT ST_TOUCHES('%s', '%s') AS v`, inside, poly)); got {
 		t.Errorf("point inside polygon: got %v, want false", got)
 	}
+	for _, tc := range []struct {
+		coords string
+		want   bool
+	}{
+		{`[[0.5,0],[2,2]]`, true},
+		{`[[0.5,0],[0.5,0.5]]`, false},
+		{`[[0.5,0.5],[0.5,0]]`, false},
+	} {
+		points := `{"type":"MultiPoint","coordinates":` + tc.coords + `}`
+		if got := execScalarBool(t, db, fmt.Sprintf(`SELECT ST_TOUCHES('%s', '%s') AS v`, points, poly)); got != tc.want {
+			t.Errorf("points %s: got %v, want %v", tc.coords, got, tc.want)
+		}
+	}
 }
 
 func TestGeoTouchesLinesLines(t *testing.T) {
@@ -110,6 +123,10 @@ func TestGeoCovers(t *testing.T) {
 	outside := `{"type":"Point","coordinates":[5,5]}`
 	if got := execScalarBool(t, db, fmt.Sprintf(`SELECT ST_COVERS('%s', '%s') AS v`, poly, outside)); got {
 		t.Errorf("polygon does not cover an outside point: got %v, want false", got)
+	}
+	points := `{"type":"MultiPoint","coordinates":[[0,0],[0.5,0.5],[2,2]]}`
+	if got := execScalarBool(t, db, fmt.Sprintf(`SELECT ST_COVEREDBY('%s', '%s') AS v`, points, poly)); got {
+		t.Errorf("every point must be covered: got %v, want false", got)
 	}
 }
 

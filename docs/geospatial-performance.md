@@ -151,6 +151,43 @@ Two thousand 17-vertex polygons, per full scan: `GEO_AS_GEOJSON` 28 → 2.8 ms,
 `GEO_POLYGON_AREA` 21 → 4.0 ms, `ST_CONTAINS(poly, pt)` 24 → 3.8 ms, `GEO_LENGTH`
 (32 vertices) 38 → 6.9 ms.
 
+## Point queries against detailed regions
+
+For repeated point queries against a cached region, tinySQL records the
+latitude range of each group of 32 consecutive edges in rings of at least
+128 edges. A point can skip groups outside its latitude. The remaining
+edges use the usual crossing and boundary tests, including for holes.
+
+`BenchmarkGeoSQLRegion` scans 2,000 points against one constant polygon.
+With 5,000 vertices, the median times across five 100 ms runs were:
+
+| SQL predicate | Before | After |
+| --- | ---: | ---: |
+| `ST_WITHIN` | 5.14 ms | 0.82 ms |
+| `ST_INTERSECTS` | 12.66 ms | 6.13 ms |
+| `ST_COVERS` | 25.79 ms | 1.72 ms |
+| `ST_TOUCHES` | 52.83 ms | 7.77 ms |
+
+Measurements used Go 1.27.4 on an Apple M2 Max with `GOMAXPROCS=2`. Each
+prepared block uses 16 bytes, and geometries of short rings skip the index.
+Storing the optional index once per geometry restored the original
+per-polygon layout. In a follow-up benchmark of 2,000 distinct 16-edge
+polygons, that saved 16 KB per `ST_CONTAINS(poly, pt)` scan.
+
+Point and multipoint `ST_COVERS` now check the polygon directly and save
+one allocation per row. `ST_TOUCHES` evaluates boundary contact once per
+point. For the 5,000-vertex region, four paired runs measured another
+drop from 7.96 to 7.53 ms for `ST_TOUCHES`.
+
+With the Oberbayern feature from Karte.Bayern's
+`data/boundaries/bayern-bezirke-simple.geojson` (revision `7166102b`), a
+prepared `SELECT id FROM sample WHERE ST_WITHIN(pt, ?) ORDER BY id` went
+from 3.64 to 1.03 ms, including reading all 422 IDs via `database/sql`.
+This is the median of five paired runs of 100 queries after warming the
+region. The 64 × 64 grid starts at (8.8, 47.1) and advances by 0.08771°
+longitude and 0.05721° latitude. The IDs matched an independent ray-crossing
+calculation.
+
 ## Spatial index build
 
 The first pass of the `GEO_SEARCH` grid index (bounding box and centroid of every
