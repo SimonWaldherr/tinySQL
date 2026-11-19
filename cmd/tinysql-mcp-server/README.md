@@ -29,6 +29,7 @@ A supplied --dsn overrides --db-path.
 | --tenant | default | Tenant namespace |
 | --autosave | false | Save a file-backed database automatically |
 | --readonly | false | Disable write_query and create_table |
+| --allow-sql-host-io | false | Enable SQL `FILE()` and `HTTP()` for trusted clients that need to read server files or fetch URLs |
 | --max-rows | 1000 | Maximum rows returned to the MCP client; 0 removes the cap |
 | --query-timeout | 30s | Execution deadline; 0 removes it |
 | --log-level | info | debug, info, warn, or error |
@@ -80,19 +81,19 @@ in-memory configuration. VS Code uses the same command and arguments in
   permissions narrow.
 - Keep both --max-rows and --query-timeout bounded. The row limit truncates
   client-visible output; it does not limit engine work.
-- Each SQL input must contain one statement. A semicolon inside a SQL string
-  can be rejected by the conservative statement guard.
+- Each SQL input must contain one statement. Quoted strings may contain
+  semicolons.
 - The current startup log can include a short DSN prefix. Avoid credentialed
   DSNs in --dsn until that behavior is changed; use --db-path when possible
   and do not expose process logs.
 - MCP protocol traffic uses stdout and logs use stderr. Do not add other output
   to stdout.
 
-The server classifies SQL before execution, rejects multi-statement input, and
-quotes validated table identifiers for table-inspection tools. Its CTE
-classifier is deliberately conservative, so unusual nested CTEs can be
-rejected. Agent context uses sys tables through database/sql; that is suitable
-for schema inspection but does not expose the direct-engine helper.
+The server uses the tinySQL parser to route each statement. A CTE ending in
+SELECT goes to read_query, and a CTE ending in INSERT goes to write_query.
+The read tool requires an explicit SELECT or WITH query. Table-inspection
+tools quote validated table identifiers. Agent context reads the schema
+through sys tables and database/sql.
 
 ## Test
 

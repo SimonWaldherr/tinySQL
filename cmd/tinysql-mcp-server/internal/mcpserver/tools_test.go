@@ -265,12 +265,14 @@ func TestReadOnly_BlocksCreateTable(t *testing.T) {
 
 func TestReadOnly_PermitsReadQuery(t *testing.T) {
 	s := openReadOnlyStore(t)
-	// The table might not exist, but the tool should not be blocked by readonly.
-	res, _ := s.HandleReadQuery(context.Background(), ReadQueryArgs{Query: "SELECT 1"})
-	// We only care that it was not blocked for readonly reasons.
-	text := contentText(res)
-	if strings.Contains(text, "read-only mode") {
-		t.Error("read_query should not be blocked in read-only mode")
+	res, err := s.HandleReadQuery(context.Background(), ReadQueryArgs{
+		Query: "WITH places AS (SELECT 'east; west' AS regions) SELECT regions FROM places",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError || !strings.Contains(contentText(res), "east; west") {
+		t.Fatalf("read_query returned %s", contentText(res))
 	}
 }
 

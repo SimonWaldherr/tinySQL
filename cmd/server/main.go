@@ -82,6 +82,7 @@ var (
 	flagDSN            = flag.String("dsn", "mem://?tenant=default", "Storage DSN (mem:// or file:/path.db?tenant=...&autosave=1)")
 	flagHTTP           = flag.String("http", ":8080", "HTTP listen address (empty to disable)")
 	flagAuth           = flag.String("auth", "", "Authorization token for HTTP and gRPC (optional)")
+	flagAllowSQLHostIO = flag.Bool("allow-sql-host-io", false, "Allow SQL FILE() and HTTP() to read host files and fetch URLs")
 	flagGRPC           = flag.String("grpc", ":9090", "gRPC listen address (empty to disable)")
 	flagPeers          = flag.String("peers", "", "Comma-separated list of gRPC peer addresses for federation")
 	flagTenant         = flag.String("tenant", "default", "Default tenant if none provided in request")
@@ -2211,6 +2212,9 @@ func openFileDBFromDSN(dsn string) (*storage.DB, string, error) {
 
 func run() error {
 	flag.Parse()
+	if !*flagAllowSQLHostIO {
+		engine.DisableSQLHostIO()
+	}
 
 	if replicaOf := strings.TrimSpace(*flagReplicaOf); replicaOf != "" {
 		return runReplica(replicaOf)

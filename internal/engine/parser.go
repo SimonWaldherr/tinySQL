@@ -60,6 +60,19 @@ func NewParser(sql string) *Parser {
 	return p
 }
 
+// LeadingKeywords returns the keywords in the next two token positions.
+// A non-keyword position yields an empty string. Call this before ParseStatement
+// to distinguish explicit SQL from the bare-table query shorthand.
+func (p *Parser) LeadingKeywords() (first, second string) {
+	if p.cur.Typ == tKeyword {
+		first = p.cur.Val
+	}
+	if p.peek.Typ == tKeyword {
+		second = p.peek.Val
+	}
+	return first, second
+}
+
 func (p *Parser) next() { p.cur, p.peek = p.peek, p.lx.nextToken() }
 
 func (p *Parser) expectSymbol(sym string) error {

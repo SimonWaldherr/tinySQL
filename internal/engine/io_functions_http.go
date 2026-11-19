@@ -30,6 +30,9 @@ var sqlHTTPClient = func() *http.Client {
 // meaningful share of a WASM build's size) with -tags no_http; see
 // io_functions_http_disabled.go for the stub that takes over in that case.
 func evalHTTPFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if sqlHostIODisabled.Load() {
+		return nil, errSQLHostIODisabled
+	}
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("http() expects 1 argument: url")
 	}

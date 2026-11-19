@@ -22,6 +22,7 @@ func main() {
 		tenant       = flag.String("tenant", "default", "Default tenant")
 		httpAddr     = flag.String("http", "127.0.0.1:8088", "HTTP listen address; empty disables HTTP")
 		authToken    = flag.String("auth", "", "Optional bearer token for API endpoints")
+		allowHostIO  = flag.Bool("allow-sql-host-io", false, "Allow SQL FILE() and HTTP() to read host files and fetch URLs")
 		reqTimeout   = flag.Duration("request-timeout", 30*time.Second, "Maximum SQL request duration")
 		readTimeout  = flag.Duration("http-read-timeout", 10*time.Second, "HTTP read timeout")
 		writeTO      = flag.Duration("http-write-timeout", 30*time.Second, "HTTP write timeout")
@@ -34,6 +35,9 @@ func main() {
 		readOnly     = flag.Bool("read-only", false, "Open the database read-only: reject all mutations and DDL. Not supported by wal/advanced_wal, whose recovery needs write access")
 	)
 	flag.Parse()
+	if !*allowHostIO {
+		tinysql.DisableSQLHostIO()
+	}
 	tinysql.ConfigureVectorCache(tinysql.VectorCacheConfig{ResultCacheEntries: *cacheEntries, ResultCacheTTL: *cacheTTL, Analytics: *analytics})
 
 	mode, err := tinysql.ParseStorageMode(*storageMode)

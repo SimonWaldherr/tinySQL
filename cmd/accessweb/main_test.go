@@ -324,3 +324,29 @@ func TestSafeExportFilenameBase(t *testing.T) {
 		}
 	}
 }
+
+func TestQueryFormOrigin(t *testing.T) {
+	handler := newTestApp(t).handler()
+	for _, tc := range []struct {
+		site, origin string
+		want         int
+	}{
+		{"same-origin", "", http.StatusOK},
+		{"", "http://example.com", http.StatusOK},
+		{"", "", http.StatusOK},
+		{"cross-site", "", http.StatusForbidden},
+		{"", "https://other.example", http.StatusForbidden},
+	} {
+		t.Run(tc.site+"/"+tc.origin, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/query", strings.NewReader("sql=SELECT+1"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Sec-Fetch-Site", tc.site)
+			req.Header.Set("Origin", tc.origin)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Errorf("status = %d, want %d", w.Code, tc.want)
+			}
+		})
+	}
+}

@@ -30,7 +30,11 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address; use :8080 to accept connections from other machines")
 	dbFile := flag.String("db", "accessweb.db", "Database file path (empty or :memory: for in-memory)")
 	tenant := flag.String("tenant", "default", "Tenant / schema name")
+	allowHostIO := flag.Bool("allow-sql-host-io", false, "Allow SQL FILE() and HTTP() to read host files and fetch URLs")
 	flag.Parse()
+	if !*allowHostIO {
+		tinysql.DisableSQLHostIO()
+	}
 
 	// Open or create the tinySQL database.
 	nativeDB, err := openNativeDB(*dbFile)
@@ -205,5 +209,5 @@ func (a *App) handler() http.Handler {
 	mux := http.NewServeMux()
 	a.registerRoutes(mux)
 	mux.Handle("GET /static/", http.FileServer(http.FS(webFS)))
-	return securityHeaders(mux)
+	return securityHeaders(http.NewCrossOriginProtection().Handler(mux))
 }

@@ -16,6 +16,7 @@
 //	--tenant        Tenant namespace (default: "default", or derived from --dsn).
 //	--autosave      Enable auto-save for file-backed databases.
 //	--readonly      Block all mutating tools (write_query, create_table).
+//	--allow-sql-host-io Enable SQL FILE() and HTTP() for trusted clients.
 //	--max-rows      Maximum rows returned by read_query (default: 1000; 0 = unlimited).
 //	                This only truncates client-visible output, not engine-side
 //	                computation — use --query-timeout to bound query execution itself.
@@ -30,6 +31,8 @@ import (
 	"log/slog"
 	"os"
 	"time"
+
+	tinysql "github.com/SimonWaldherr/tinySQL"
 
 	"tinysql-mcp-server/internal/mcpserver"
 	"tinysql-mcp-server/internal/tinysqldb"
@@ -65,8 +68,12 @@ func run() error {
 		flagQueryTimeout = flag.Duration("query-timeout", defaultQueryTimeout, `Per-query timeout, e.g. "5s" (0 = no timeout). `+
 			"Bounds engine-side execution time; set to 0 only if you explicitly want unbounded queries.")
 		flagLogLevel = flag.String("log-level", "info", "Log verbosity: debug, info, warn, error")
+		allowHostIO  = flag.Bool("allow-sql-host-io", false, "Allow SQL FILE() and HTTP() to read host files and fetch URLs")
 	)
 	flag.Parse()
+	if !*allowHostIO {
+		tinysql.DisableSQLHostIO()
+	}
 
 	// Configure structured logging.
 	var logLevel slog.Level

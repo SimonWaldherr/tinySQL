@@ -34,6 +34,7 @@ even when authentication is enabled.
 | `-http` | `:8080` | HTTP listen address (empty disables HTTP) |
 | `-grpc` | `:9090` | gRPC listen address (empty disables gRPC) |
 | `-auth` | — | Bearer token for HTTP and gRPC |
+| `-allow-sql-host-io` | `false` | Enable SQL `FILE()` and `HTTP()` for trusted clients that need to read server files or fetch URLs |
 | `-tenant` | `default` | Default tenant if a request omits one |
 | `-peers` | — | Comma-separated `host:grpcPort` peers for federation |
 | `-analytics` | `false` | Collect vector-cache analytics and expose vector cache metrics via `/metrics` and `/api/status` (matches `cmd/tinysqld`) |

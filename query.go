@@ -10,6 +10,12 @@ import (
 	"github.com/SimonWaldherr/tinySQL/standards"
 )
 
+// DisableSQLHostIO permanently disables the built-in SQL functions FILE and
+// HTTP for all databases in this process. Call it before accepting queries.
+func DisableSQLHostIO() {
+	engine.DisableSQLHostIO()
+}
+
 // IndexAdvisor observes explicitly routed queries and optionally creates indexes.
 type IndexAdvisor = engine.IndexAdvisor
 

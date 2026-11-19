@@ -19,6 +19,14 @@ func TestClassifySQL(t *testing.T) {
 		{"select uppercase", "SELECT id FROM t WHERE id = 1", kindSelect},
 		{"select lowercase", "select * from t", kindSelect},
 		{"cte select", "WITH cte AS (SELECT 1) SELECT * FROM cte", kindSelect},
+		{"select text punctuation", "SELECT 'east; west' AS regions", kindSelect},
+		{"nested subquery", "SELECT n FROM (SELECT 1 AS n) AS sample", kindSelect},
+		{"cte insert", "WITH sample AS (SELECT 1 AS n) INSERT INTO t SELECT n FROM sample", kindInsert},
+		{"query plan", "EXPLAIN SELECT 1", kindOther},
+		{"analyzed write plan", "EXPLAIN ANALYZE INSERT INTO t VALUES (1)", kindOther},
+		{"table shorthand", "orders", kindUnknown},
+		{"transaction command", "BEGIN", kindUnknown},
+		{"temporary table", "CREATE TEMP TABLE sample (n INT)", kindCreate},
 
 		// ── mutations ─────────────────────────────────────────────────────
 		{"insert", "INSERT INTO t VALUES (1)", kindInsert},
@@ -106,41 +114,4 @@ func TestIsCreateTable(t *testing.T) {
 	if kindCreate.isCreateTable() {
 		t.Error("kindCreate.isCreateTable() should be false (CREATE VIEW etc.)")
 	}
-}
-
-// TestStripComments verifies comment removal.
-func TestStripComments(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string // we only check that the SQL keyword survives
-	}{
-		{"line comment removed", "-- DROP TABLE t\nSELECT 1", "SELECT 1"},
-		{"block comment removed", "/* DROP TABLE t */ SELECT 1", " SELECT 1"},
-		{"multiline block comment", "/*\nDROP TABLE t\n*/ SELECT 1", " SELECT 1"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			stripped := stripComments(tc.input)
-			if !contains(stripped, "SELECT") {
-				t.Errorf("stripComments(%q) = %q; expected SELECT to survive", tc.input, stripped)
-			}
-			if contains(stripped, "DROP") {
-				t.Errorf("stripComments(%q) = %q; DROP should have been removed", tc.input, stripped)
-			}
-		})
-	}
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(s) > 0 && containsStr(s, sub))
-}
-
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

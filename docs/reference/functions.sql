@@ -882,7 +882,7 @@ SELECT HTML_ESCAPE('<strong>untrusted</strong>') as escaped_html;
 SELECT HTML_TEMPLATE('<a href="{{.url}}">{{.label}}</a>',
                      '{"url":"/map","label":"Map & data"}') as rendered_html;
 
--- GZIP/GUNZIP: Compression functions (safe examples)
+-- GUNZIP and its alias UNZIP accept up to 64 MiB of decoded output per call.
 SELECT LENGTH(GZIP('tinySQL gzip test string')) as gzip_compressed_length;
 SELECT GUNZIP(GZIP('roundtrip test')) as gunzip_roundtrip;
 
@@ -890,6 +890,7 @@ SELECT GUNZIP(GZIP('roundtrip test')) as gunzip_roundtrip;
 SELECT BASE64_ENCODE('hello world') as base64_encoded_example;
 SELECT BASE64_DECODE(BASE64_ENCODE('hello world')) as base64_decoded_roundtrip;
 
+-- AccessWeb, tinysqld, cmd/server and the MCP server require -allow-sql-host-io for FILE and HTTP.
 SELECT FILE('./data/data.json') as file_content;
 
 -- HTTP: Fetch an HTTP GET response (30 second timeout, 8 MiB response limit)

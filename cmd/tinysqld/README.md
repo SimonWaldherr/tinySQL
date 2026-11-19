@@ -31,6 +31,7 @@ other machines, configure `-auth` and terminate TLS before exposing it.
 | `-tenant` | `default` | Default tenant |
 | `-http` | `127.0.0.1:8088` | HTTP listen address; empty disables HTTP |
 | `-auth` | — | Optional bearer token for API endpoints |
+| `-allow-sql-host-io` | `false` | Enable SQL `FILE()` and `HTTP()` for trusted clients that need to read server files or fetch URLs |
 | `-read-only` | `false` | Reject mutations; suitable for serving immutable artifact copies behind a load balancer (unsupported with WAL modes) |
 | `-request-timeout` | `30s` | Maximum SQL request duration |
 | `-http-read-timeout` | `10s` | HTTP read timeout |

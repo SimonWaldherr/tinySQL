@@ -34,6 +34,7 @@ Then open the selected address: `http://localhost:8080` by default, or
 | `-addr` | `127.0.0.1:8080` | HTTP listen address; pass `:8080` to accept connections from other machines |
 | `-db` | `accessweb.db` | `.gob` database file; `:memory:` or empty for in-memory |
 | `-tenant` | `default` | Tenant namespace within the database |
+| `-allow-sql-host-io` | `false` | Enable SQL `FILE()` and `HTTP()` for trusted clients that need to read server files or fetch URLs |
 
 ## Layout
 

@@ -381,6 +381,10 @@ func isSimpleRawExpr(e Expr) bool {
 		}
 		return true
 	case *FuncCall:
+		// These decoders poll the statement context while producing output.
+		if ex.Name == "GUNZIP" || ex.Name == "UNZIP" {
+			return false
+		}
 		if ex.Over != nil || ex.Filter != nil {
 			return false
 		}

@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 // These tests exercise fetchHTTP/evalHTTPFunc directly, so they carry the
@@ -19,6 +21,38 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestDisableSQLHostIO(t *testing.T) {
+	db := storage.NewDB()
+	defer db.Close()
+	execSQL(t, db, "CREATE TABLE inputs (path TEXT)")
+	execSQL(t, db, "INSERT INTO inputs VALUES (NULL)")
+	execSQL(t, db, "CREATE VIEW contents AS SELECT FILE(path) AS content FROM inputs")
+	execSQL(t, db, "CREATE TABLE copies (body TEXT)")
+	execSQL(t, db, "CREATE TRIGGER fetch_after_insert AFTER INSERT ON inputs BEGIN INSERT INTO copies VALUES (HTTP(NEW.path)); END")
+
+	// NULL arguments exercise dispatch without touching the filesystem or network.
+	warm := mustParse("SELECT FILE(path) AS content FROM inputs")
+	if _, err := Execute(t.Context(), db, "default", warm); err != nil {
+		t.Fatal(err)
+	}
+	execSQL(t, db, "SELECT HTTP(NULL)")
+	DisableSQLHostIO()
+	t.Cleanup(func() { sqlHostIODisabled.Store(false) })
+	for _, stmt := range []Statement{
+		warm,
+		mustParse("SELECT HTTP(NULL)"),
+		mustParse("SELECT content FROM contents"),
+		mustParse("INSERT INTO inputs VALUES (NULL)"),
+	} {
+		if _, err := Execute(t.Context(), db, "default", stmt); err == nil || !strings.Contains(err.Error(), errSQLHostIODisabled.Error()) {
+			t.Errorf("%T: expected host I/O denial, got %v", stmt, err)
+		}
+	}
+	if rs := execSQL(t, db, "SELECT path FROM inputs"); len(rs.Rows) != 1 {
+		t.Fatalf("trigger failure left %d inputs, want 1", len(rs.Rows))
+	}
 }
 
 func TestFetchHTTPBoundsResponseAndReusesClient(t *testing.T) {

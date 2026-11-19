@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -19,6 +20,9 @@ import (
 
 // evalFileFunc reads a file from the filesystem and returns its contents
 func evalFileFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
+	if sqlHostIODisabled.Load() {
+		return nil, errSQLHostIODisabled
+	}
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("file() expects 1 argument: path")
 	}
@@ -36,7 +40,8 @@ func evalFileFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, fmt.Errorf("file(): path must be a string")
 	}
 
-	// Security: restrict to safe paths only (no parent directory traversal)
+	// Preserve the path check used by local FILE callers. The host I/O policy
+	// above controls whether a SQL service permits filesystem access.
 	cleanPath := filepath.Clean(path)
 	if strings.Contains(cleanPath, "..") {
 		return nil, fmt.Errorf("file(): path traversal not allowed")
@@ -72,28 +77,43 @@ func evalGunzipFunc(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 		return nil, nil
 	}
 
-	var data []byte
+	var src io.Reader
 	switch v := dataVal.(type) {
 	case string:
-		data = []byte(v)
+		src = strings.NewReader(v)
 	case []byte:
-		data = v
+		src = bytes.NewReader(v)
 	default:
 		return nil, fmt.Errorf("gunzip(): data must be string or bytes")
 	}
+	return gunzipText(env.ctx, src, MaxBlobBytes)
+}
 
-	reader, err := gzip.NewReader(bytes.NewReader(data))
+// The limit covers the combined decoded size of all members in the stream.
+func gunzipText(ctx context.Context, src io.Reader, limit int) (string, error) {
+	reader, err := gzip.NewReader(src)
 	if err != nil {
-		return nil, fmt.Errorf("gunzip(): %v", err)
+		return "", fmt.Errorf("gunzip(): %w", err)
 	}
-	defer func() { _ = reader.Close() }()
-
-	uncompressed, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, fmt.Errorf("gunzip(): %v", err)
+	defer reader.Close()
+	var data strings.Builder
+	var buf [4 << 10]byte
+	for {
+		if err := checkCtx(ctx); err != nil {
+			return "", err
+		}
+		n, err := reader.Read(buf[:])
+		if n > limit-data.Len() {
+			return "", fmt.Errorf("gunzip(): decoded data exceeds %d bytes", limit)
+		}
+		data.Write(buf[:n])
+		if err == io.EOF {
+			return data.String(), nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("gunzip(): %w", err)
+		}
 	}
-
-	return string(uncompressed), nil
 }
 
 // evalGzipFunc compresses data with gzip

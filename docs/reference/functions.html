@@ -770,13 +770,14 @@ SELECT URL_PATH_DECODE(&#39;tiles%2FAltstadt%20Nord&#39;) as decoded_path_segmen
 SELECT HTML_ESCAPE(&#39;&lt;strong&gt;untrusted&lt;/strong&gt;&#39;) as escaped_html;
 SELECT HTML_TEMPLATE(&#39;&lt;a href=&#34;{{.url}}&#34;&gt;{{.label}}&lt;/a&gt;&#39;,
                      &#39;{&#34;url&#34;:&#34;/map&#34;,&#34;label&#34;:&#34;Map &amp; data&#34;}&#39;) as rendered_html;</code></pre>
-<pre><code>-- GZIP/GUNZIP: Compression functions (safe examples)
+<pre><code>-- GUNZIP and its alias UNZIP accept up to 64 MiB of decoded output per call.
 SELECT LENGTH(GZIP(&#39;tinySQL gzip test string&#39;)) as gzip_compressed_length;
 SELECT GUNZIP(GZIP(&#39;roundtrip test&#39;)) as gunzip_roundtrip;</code></pre>
 <pre><code>-- BASE64 encoding/decoding (safe examples)
 SELECT BASE64_ENCODE(&#39;hello world&#39;) as base64_encoded_example;
 SELECT BASE64_DECODE(BASE64_ENCODE(&#39;hello world&#39;)) as base64_decoded_roundtrip;</code></pre>
-<pre><code>SELECT FILE(&#39;./data/data.json&#39;) as file_content;</code></pre>
+<pre><code>-- AccessWeb, tinysqld, cmd/server and the MCP server require -allow-sql-host-io for FILE and HTTP.
+SELECT FILE(&#39;./data/data.json&#39;) as file_content;</code></pre>
 <pre><code>-- HTTP: Fetch an HTTP GET response (30 second timeout, 8 MiB response limit)
 SELECT HTTP(&#39;https://jsonplaceholder.typicode.com/todos/1&#39;) as http_response;</code></pre>
 <pre><code>-- Combined example: Read and decompress a gzipped file
