@@ -281,7 +281,7 @@ func geoSearchTopK(ctx context.Context, idx *geoGridIndex, candidates []int32, k
 			}
 		}
 		p := idx.centroids[rowID]
-		if !(math.Abs(p.Lon) <= 180 && math.Abs(p.Lat) <= 90) {
+		if !p.isWGS84() {
 			continue
 		}
 		if meters := distance(p); meters <= radiusMeters {

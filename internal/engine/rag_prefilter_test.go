@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -579,6 +580,70 @@ func TestRetrievalSpatialPolygonValidation(t *testing.T) {
 	}
 }
 
+func TestRetrievalSpatialRadiusSubset(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		lon, lat, boundaryLon float64
+	}{
+		{"dateline", 179.9, 80, -179.9},
+		{"pole", 0, 89.9, 180},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const tenant = "default"
+			table := storage.NewTable("sparse_radius_"+tc.name, []storage.Column{{Name: "geom", Type: storage.GeometryType}}, false)
+			t.Cleanup(func() { purgeGeoGridCachesFor(tenant, table.Name) })
+			point := func(lon, lat float64) []any {
+				value, err := geoPointJSON(lon, lat, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return []any{value}
+			}
+			table.Rows = make([][]any, 1024)
+			far := point(40, 0)
+			for i := range table.Rows {
+				table.Rows[i] = far
+			}
+			table.Rows[2] = point(tc.lon, tc.lat)
+			table.Rows[3] = []any{nil}
+			table.Rows[63] = point(tc.boundaryLon, tc.lat)
+			table.Rows[64] = point(tc.lon+360, tc.lat)
+			selected := make([]int, 64)
+			for i := range selected {
+				selected[i] = i
+			}
+			radius := haversineMeters(tc.lat, tc.lon, tc.lat, tc.boundaryLon)
+			opts := &ragSpatialFilterOptions{GeometryColumn: "geom", Center: []float64{tc.lon, tc.lat}, RadiusMeters: radius}
+			key := geoIndexCacheKey{tenant: tenant, table: table.Name}
+			check := func(selection, want []int, restricted bool) {
+				t.Helper()
+				got, err := ragRowsForSpatialFilter(t.Context(), tenant, table, opts, slices.Clone(selection), restricted)
+				if err != nil || !slices.Equal(got, want) {
+					t.Fatalf("radius=%g, restricted=%v: got %v (%v), want %v", opts.RadiusMeters, restricted, got, err, want)
+				}
+			}
+			check(selected, []int{2, 63}, true)
+			check(selected[:1], nil, true)
+			opts.RadiusMeters = math.Nextafter(radius, 0)
+			check(selected, []int{2}, true)
+			if cachedGeoGridIndex(key, table) != nil {
+				t.Fatal("direct radius lookup built a full grid")
+			}
+
+			opts.RadiusMeters = radius
+			// An out-of-range longitude can have the same numeric distance.
+			// The fallback must consult the grid with the complete original scope.
+			withOutlier := append(slices.Clone(selected[1:]), 64)
+			check(withOutlier, []int{2, 63}, true)
+			if cachedGeoGridIndex(key, table) == nil {
+				t.Fatal("radius lookup with an out-of-range match skipped the grid")
+			}
+			check(nil, []int{2, 63}, false)
+			check(selected, []int{2, 63}, true)
+		})
+	}
+}
+
 func BenchmarkRetrievalSpatialPolygonWarm(b *testing.B) {
 	db := storage.NewDB()
 	b.Cleanup(func() { _ = db.Close() })
@@ -629,6 +694,7 @@ func BenchmarkRetrievalSpatialSubsetCold(b *testing.B) {
 	for _, tc := range []struct{ name, spatial string }{
 		{"bbox", `"bbox":[8.9,46.9,9.9,47.1]`},
 		{"polygon", `"polygon":{"type":"Polygon","coordinates":[[[8.9,46.9],[9.9,46.9],[9.9,47.1],[8.9,47.1],[8.9,46.9]]]}`},
+		{"radius", `"center":[9.4,47],"radius_meters":50000`},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			options := fmt.Sprintf(`{"pre_filter":{"id_column":"id","allowed_row_ids":[%s],"spatial":{"geometry_column":"geom",%s}}}`, strings.Join(ids, ","), tc.spatial)

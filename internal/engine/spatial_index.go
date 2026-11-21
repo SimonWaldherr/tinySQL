@@ -86,6 +86,10 @@ func (p geoGridCentroid) point() geoPoint {
 	return geoPoint{Lon: p.Lon, Lat: p.Lat}
 }
 
+func (p geoGridCentroid) isWGS84() bool {
+	return math.Abs(p.Lon) <= 180 && math.Abs(p.Lat) <= 90
+}
+
 func (p geoGridCentroid) distanceFrom(lat, cosLat, lon float64) float64 {
 	return haversineMetersWithCosines(lat, cosLat, lon, p.Lat, p.cosLat, p.Lon)
 }

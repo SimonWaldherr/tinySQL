@@ -17,6 +17,7 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"math/bits"
 	"slices"
 	"sort"
 	"strings"
@@ -375,12 +376,13 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 	if tenant == "" {
 		tenant = "default"
 	}
-	// A polygon or a single extent can be checked directly. Radius and
-	// wrapped longitude queries use the grid's geographic candidate bounds.
-	if restricted && !radiusMode && !crossesAntimeridian && len(selected) <= min(64, len(table.Rows)/16) {
+	if restricted && !crossesAntimeridian && len(selected) <= min(ragSpatialSubsetMaxRows, len(table.Rows)/16) {
 		key := geoIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx}
 		idx := cachedGeoGridIndex(key, table)
-		return ragFilterSpatialSubset(ctx, table, colIdx, idx, selected, matches)
+		rows, err := ragFilterSpatialSubset(ctx, table, colIdx, idx, selected, matches, radiusMode)
+		if err != nil || rows != nil {
+			return rows, err
+		}
 	}
 	idx, err := getGeoGridIndex(ctx, tenant, table, colIdx)
 	if err != nil {
@@ -423,27 +425,53 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 	return rows, nil
 }
 
-func ragFilterSpatialSubset(ctx context.Context, table *storage.Table, colIdx int, idx *geoGridIndex, selected []int, matches func(geoEditBBox, geoGridCentroid) bool) ([]int, error) {
-	// selected contains sorted row IDs in a private slice owned by the filter.
-	rows := selected[:0]
-	for _, rowID := range selected {
+const ragSpatialSubsetMaxRows = 64
+
+// The caller passes between one and ragSpatialSubsetMaxRows rows. A nil
+// result with no error requests a grid lookup for the original subset.
+func ragFilterSpatialSubset(ctx context.Context, table *storage.Table, colIdx int, idx *geoGridIndex, selected []int, matches func(geoEditBBox, geoGridCentroid) bool, radiusMode bool) ([]int, error) {
+	// Keep the input intact until all rows can be decided without a grid.
+	var matched uint64
+	for i, rowID := range selected {
 		if err := checkCtx(ctx); err != nil {
 			return nil, err
 		}
+		var box geoEditBBox
+		var center geoGridCentroid
 		if idx != nil {
-			if idx.valid[rowID] && matches(idx.bboxes[rowID], idx.centroids[rowID]) {
-				rows = append(rows, rowID)
+			if !idx.valid[rowID] {
+				continue
 			}
-			continue
+			box, center = idx.bboxes[rowID], idx.centroids[rowID]
+		} else {
+			row := table.Rows[rowID]
+			if colIdx >= len(row) || row[colIdx] == nil {
+				continue
+			}
+			extent, point, ok := geoGridGeometry(row[colIdx])
+			if !ok {
+				continue
+			}
+			box, center = extent, geoGridCentroid{Lon: point.Lon, Lat: point.Lat}
+			if radiusMode {
+				center.cosLat = math.Cos(point.Lat * math.Pi / 180)
+			}
 		}
-		row := table.Rows[rowID]
-		if colIdx >= len(row) || row[colIdx] == nil {
-			continue
+		if matches(box, center) {
+			// Haversine distance can wrap an out-of-range longitude. The
+			// grid's candidate bounds still decide its legacy eligibility.
+			if radiusMode && !center.isWGS84() {
+				return nil, nil
+			}
+			matched |= uint64(1) << i
 		}
-		box, point, ok := geoGridGeometry(row[colIdx])
-		if ok && matches(box, geoGridCentroid{Lon: point.Lon, Lat: point.Lat}) {
-			rows = append(rows, rowID)
-		}
+	}
+	// selected is private and sorted. Compact it in the same order.
+	rows := selected[:0]
+	for matched != 0 {
+		i := bits.TrailingZeros64(matched)
+		rows = append(rows, selected[i])
+		matched &= matched - 1
 	}
 	return rows, nil
 }

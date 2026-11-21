@@ -72,12 +72,13 @@ Timings varied between runs, while the allocation reduction was consistent.
 
 ### Spatial filters over a small subset
 
-A bounding box or polygon can refine a row set already selected by IDs or
-metadata. For up to 64 rows and at most one sixteenth of the table, the
+A bounding box, polygon, or radius can refine a row set already selected by
+IDs or metadata. For up to 64 rows and at most one sixteenth of the table, the
 spatial filter reads those rows directly. It reuses valid cached geometry
-data when available. The same checks for extent overlap and centroid
-inclusion apply to both paths. Bounding boxes that cross the antimeridian
-and radius queries use the spatial grid.
+data when available. Bounding boxes that cross the antimeridian use the
+spatial grid. Radius queries also use the grid if an out-of-range centroid
+passes the distance check, preserving the result of the grid's geographic
+candidate selection.
 
 `BenchmarkRetrievalSpatialSubsetCold` starts without a spatial grid or
 cached filter result. It retrieves six vector hits with 32 indexed IDs
@@ -88,6 +89,11 @@ with Go 1.27.4 and `GOMAXPROCS=2` were:
 | --- | ---: | ---: |
 | Bounding box | 2.26 ms, 1,909,339 B/op | 36.52 µs, 18,198 B/op |
 | Polygon | 2.29 ms, 1,910,156 B/op | 38.40 µs, 19,307 B/op |
+
+In a follow-up on the same fixture, a 50 km radius went from 2.42 ms to
+39.12 µs and from 1,914,982 to 18,160 B/op. This compares the radius against
+the previous version, where bounding boxes and polygons already used the
+subset path.
 
 ## Final hit rows
 
