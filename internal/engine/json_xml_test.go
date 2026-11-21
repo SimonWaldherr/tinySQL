@@ -46,6 +46,36 @@ func TestJSONPathCacheCompatibility(t *testing.T) {
 	}
 }
 
+func TestCompiledJSONPathMatchesRawEvaluator(t *testing.T) {
+	columns := map[string]int{"doc": 0}
+	plan := &simpleSelectPlan{colIndex: columns}
+	document := map[string]any{"items": []any{map[string]any{"v": "a"}, map[string]any{"v": "b"}}}
+	for _, sql := range []string{
+		"JSON_GET(doc, 'items[1].v')", "JSON_EXTRACT(doc, 'items.0.v')",
+		"JSON_GET(doc, 'items[bad].v')", "JSON_GET(doc, 'items[9]')", "JSON_GET(doc, '.')", "JSON_GET(1/0, 'v')",
+	} {
+		expr := mustParse("SELECT " + sql).(*Select).Projs[0].Expr
+		bound := compileRawValue(columns, expr)
+		if bound == nil {
+			t.Fatalf("%s was not bound", sql)
+		}
+		for _, value := range []any{document, nil, map[string]any(nil), "text", []any{document}} {
+			row := []any{value}
+			want, wantErr := evalRawExpr(plan, row, expr)
+			got, err := bound(row)
+			if !reflect.DeepEqual(got, want) || fmt.Sprint(err) != fmt.Sprint(wantErr) {
+				t.Fatalf("%s on %#v: got %v / %v, want %v / %v", sql, value, got, err, want, wantErr)
+			}
+		}
+	}
+
+	call := mustParse("SELECT JSON_GET(doc, 'items[0].v')").(*Select).Projs[0].Expr.(*FuncCall)
+	call.Args[1].(*Literal).Parameter = true
+	if compileRawValue(columns, call) != nil {
+		t.Fatal("a rebound path must be evaluated at execution time")
+	}
+}
+
 func TestJSONTableOwnedRows(t *testing.T) {
 	for _, tc := range []struct {
 		input string

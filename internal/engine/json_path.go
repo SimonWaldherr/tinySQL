@@ -117,7 +117,10 @@ func jsonGet(v any, path string) any {
 	if v == nil || path == "" {
 		return nil
 	}
-	parts := cachedJSONPath(path)
+	return jsonGetByParts(v, cachedJSONPath(path))
+}
+
+func jsonGetByParts(v any, parts []pathPart) any {
 	cur := v
 	for _, p := range parts {
 		switch c := cur.(type) {

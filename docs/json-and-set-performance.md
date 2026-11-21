@@ -70,3 +70,21 @@ go test ./internal/storage -run '^$' -bench '^BenchmarkJSONDiskRowNormalization$
 go test ./internal/exporter -run '^$' -bench '^BenchmarkJSONExportEncoding$' -benchmem -benchtime=300ms -count=3
 GOEXPERIMENT=nojsonv2 go test ./internal/storage ./internal/exporter
 ```
+
+## JSON paths in SQL scans
+
+The raw SQL evaluator binds nonempty literal paths in `JSON_GET` and
+`JSON_EXTRACT` once per plan. The scan navigates the compiled path directly.
+Path parameters and column expressions are evaluated at execution time.
+
+`BenchmarkJSONPathSQL` scans 50,000 rows with a nested document or NULL.
+Median times from seven alternating runs on Apple M2 Max with Go 1.27.4 and
+`GOMAXPROCS=2` were 3.27 to 1.85 ms for `COUNT(JSON_GET(...))` and 3.56 to
+1.88 ms for a `WHERE JSON_EXTRACT(...)` comparison. The literal count used two
+additional allocations per query for binding. The dynamic path control was
+3.66 ms in both builds.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkJSONPathSQL$' -benchtime=130ms -count=7 -benchmem
+```

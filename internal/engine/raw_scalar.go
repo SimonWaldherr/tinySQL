@@ -93,6 +93,30 @@ func compileRawScalar(columns map[string]int, call *FuncCall) rawValueEvaluator 
 		}
 	case "TRIM", "LTRIM", "RTRIM":
 		return compileRawTrim(columns, call)
+	case "JSON_GET", "JSON_EXTRACT":
+		if len(call.Args) != 2 {
+			return nil
+		}
+		literal, ok := call.Args[1].(*Literal)
+		if !ok || literal.Parameter {
+			return nil
+		}
+		path, ok := literal.Val.(string)
+		if !ok || path == "" {
+			return nil
+		}
+		doc := compileRawValue(columns, call.Args[0])
+		if doc == nil {
+			return nil
+		}
+		parts := cachedJSONPath(path)
+		return func(raw []any) (any, error) {
+			value, err := doc(raw)
+			if err != nil {
+				return nil, err
+			}
+			return jsonGetByParts(value, parts), nil
+		}
 	}
 	return nil
 }
