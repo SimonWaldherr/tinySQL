@@ -290,9 +290,10 @@ func (idx *geoGridIndex) scanRange(ctx context.Context, table *storage.Table, co
 }
 
 func geoGridGeometry(value any) (geoEditBBox, geoPoint, bool) {
-	// GEOMETRY points use sorted JSON keys. The suffix check lets other
-	// geometry types go straight to the general decoder.
-	if text, ok := value.(string); ok && strings.HasSuffix(text, `],"type":"Point"}`) {
+	// GEOMETRY points use sorted JSON keys. TEXT can also hold points with
+	// the type first. Check both layouts before trying the point decoder.
+	if text, ok := value.(string); ok && (strings.HasSuffix(text, `],"type":"Point"}`) ||
+		strings.HasPrefix(text, `{"type":"Point",`)) {
 		if p, ok := decodeGeoPointFast(text); ok {
 			box := geoEditBBox{MinX: p.Lon, MaxX: p.Lon, MinY: p.Lat, MaxY: p.Lat, Set: true}
 			// Match the accumulator, including its treatment of signed zero.

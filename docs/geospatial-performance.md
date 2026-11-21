@@ -62,6 +62,25 @@ query and allocated bytes from 64,171 to 57,292. For a viewport returning
 9,821 points, `BenchmarkGeoSearchWarm` fell from 10.26 to 6.88 MB per query.
 The cold point build retained 7,701 allocations.
 
+### Cold grid builds from text columns
+
+The spatial grid decodes compact GeoJSON points directly when `"type":"Point"`
+appears before the coordinates, as well as in the sorted-key layout produced
+by `GEOMETRY`. This also covers `TEXT` columns imported without geometry type
+conversion. The general decoder handles point objects with additional members.
+
+`BenchmarkGeoSearchTextGridCold` runs a bounding-box query that returns 1,066
+of 20,000 text points and rebuilds the grid each time. Median latency fell from
+5.79 to 2.43 ms and allocation from 11.44 to 2.64 MB per query. The regular
+geometry point build varied by less than 1%. These are seven alternating runs
+on Apple M2 Max with Go 1.27.4 and `GOMAXPROCS=2`.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkGeo(SearchTextGridCold|GridPointBuild)$' \
+  -benchtime=220ms -count=7 -benchmem
+```
+
 For wider warm-query measurements and their limits, see
 [retrieval performance](retrieval-performance.md). Reproduce the focused checks
 with:

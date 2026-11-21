@@ -101,16 +101,21 @@ func TestGeoGridPointDecodeMatchesGeneralPath(t *testing.T) {
 		`[1,2,1e309]`, // all ordinates must be finite
 		`[1,2,[]]`,
 	} {
-		fastBox, fastPoint, fastOK := geoGridGeometry(`{"coordinates":` + coords + `,"type":"Point"}`)
-		slowBox, slowPoint, slowOK := geoGridGeometry(`{"type":"Point","coordinates":` + coords + `}`)
-		if fastOK != slowOK || fastBox != slowBox || fastPoint != slowPoint {
-			t.Fatalf("%s: compact point = %v %v %t, general = %v %v %t", coords, fastBox, fastPoint, fastOK, slowBox, slowPoint, slowOK)
-		}
-		if math.Float64bits(fastBox.MinX) != math.Float64bits(slowBox.MinX) ||
-			math.Float64bits(fastBox.MinY) != math.Float64bits(slowBox.MinY) ||
-			math.Float64bits(fastPoint.Lon) != math.Float64bits(slowPoint.Lon) ||
-			math.Float64bits(fastPoint.Lat) != math.Float64bits(slowPoint.Lat) {
-			t.Fatalf("%s: point decoding changed signed zero", coords)
+		wantBox, wantPoint, wantOK := geoGridGeometry(`{"type" : "Point","coordinates":` + coords + `}`)
+		for _, input := range []string{
+			`{"coordinates":` + coords + `,"type":"Point"}`,
+			`{"type":"Point","coordinates":` + coords + `}`,
+		} {
+			box, point, ok := geoGridGeometry(input)
+			if ok != wantOK || box != wantBox || point != wantPoint {
+				t.Fatalf("%s: compact point = %v %v %t, general = %v %v %t", input, box, point, ok, wantBox, wantPoint, wantOK)
+			}
+			if math.Float64bits(box.MinX) != math.Float64bits(wantBox.MinX) ||
+				math.Float64bits(box.MinY) != math.Float64bits(wantBox.MinY) ||
+				math.Float64bits(point.Lon) != math.Float64bits(wantPoint.Lon) ||
+				math.Float64bits(point.Lat) != math.Float64bits(wantPoint.Lat) {
+				t.Fatalf("%s: point decoding changed signed zero", input)
+			}
 		}
 	}
 }
@@ -136,6 +141,39 @@ func BenchmarkGeoGridPointBuild(b *testing.B) {
 		idx, err := buildGeoGridIndex(b.Context(), table, 1)
 		if err != nil || len(idx.centroids) != len(table.Rows) {
 			b.Fatalf("build failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkGeoSearchTextGridCold(b *testing.B) {
+	db := storage.NewDB()
+	defer db.Close()
+	table := storage.NewTable("text_points", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "geom", Type: storage.TextType},
+	}, false)
+	for id := range 20_000 {
+		lon, lat := 9+0.025*float64(id%200), 47+0.038*float64(id/200)
+		geom := fmt.Sprintf(`{"type":"Point","coordinates":[%v,%v]}`, lon, lat)
+		table.Rows = append(table.Rows, []any{id, geom})
+	}
+	if err := db.Put("default", table); err != nil {
+		b.Fatal(err)
+	}
+	defer purgeGeoGridCachesFor("default", table.Name)
+	stmt := mustParse(`SELECT id FROM GEO_SEARCH('text_points','geom','bbox',11,48,12,49)`)
+	b.ReportAllocs()
+	for b.Loop() {
+		b.StopTimer()
+		purgeGeoGridCachesFor("default", table.Name)
+		b.StartTimer()
+		result, err := Execute(b.Context(), db, "default", stmt)
+		if err != nil {
+			b.Fatal(err)
+		}
+		// 41 longitudes (80–120) and 26 latitudes (27–52) fit the window.
+		if len(result.Rows) != 41*26 {
+			b.Fatalf("bbox returned %d rows, want %d", len(result.Rows), 41*26)
 		}
 	}
 }
