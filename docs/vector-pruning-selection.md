@@ -246,3 +246,8 @@ varied by less than 1%. Allocation counts stayed the same.
 GOMAXPROCS=2 go test ./internal/engine -run '^$' \
   -bench '^BenchmarkVecSearchHNSWTopK$' -benchtime=220ms -count=7 -benchmem
 ```
+
+`VEC_SEARCH` now constructs the flat-scan scoring function only when the scan
+uses it. With a warm HNSW index, the top-5 benchmark uses 25 allocations per
+query instead of 26. `BenchmarkVecSearchCosineTopK_IVFCached` dropped from 87
+to 86 allocations and from 7,888 to 7,840 bytes per query on the same machine.

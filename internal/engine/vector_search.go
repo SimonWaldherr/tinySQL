@@ -1169,7 +1169,6 @@ func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*st
 		return nil, nil, fmt.Errorf("VEC_SEARCH: %w", err)
 	}
 
-	queryLen := len(a.queryVec)
 	var queryNorm float64
 	if a.metric == "cosine" {
 		queryNorm = vectorL2Norm(a.queryVec)
@@ -1204,8 +1203,7 @@ func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*st
 	}
 	if !cacheHit {
 		cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
-		distFn := buildVecDistanceFunc(a.metric, a.queryVec, queryNorm)
-		scoredRowsOrdered, err = vecSearchTopKWithIndex(searchCtx, tenant, table, vecColIdx, a, queryLen, queryNorm, cache, distFn)
+		scoredRowsOrdered, err = vecSearchTopKWithIndex(searchCtx, tenant, table, vecColIdx, a, queryNorm, cache)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -428,17 +428,13 @@ func vecSearchTopKWithIndex(
 	table *storage.Table,
 	colIdx int,
 	args vecSearchArgs,
-	queryLen int,
 	queryNorm float64,
 	cache vecSearchColumnCacheEntry,
-	distFn vecDistanceFunc,
 ) ([]vecScoredRow, error) {
-	needNorm := vecDistanceFuncNeedsNorm(args.metric)
+	queryLen := len(args.queryVec)
 	var rows []vecScoredRow
 	var err error
 	switch args.indexMode {
-	case vecIndexFlat:
-		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn, needNorm)
 	case vecIndexIVF:
 		var idx *vecIVFIndex
 		idx, err = getVecIVFIndex(ctx, tenant, table, colIdx, args.metric, queryLen, cache)
@@ -452,7 +448,8 @@ func vecSearchTopKWithIndex(
 			rows, err = idx.search(ctx, args.queryVec, queryNorm, args.k, cache)
 		}
 	default:
-		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn, needNorm)
+		distFn := buildVecDistanceFunc(args.metric, args.queryVec, queryNorm)
+		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn, vecDistanceFuncNeedsNorm(args.metric))
 	}
 	if err != nil {
 		return nil, err
