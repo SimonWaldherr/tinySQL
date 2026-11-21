@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1072,7 +1073,7 @@ func (idx *vecHNSWIndex) insertHNSWNode(rowIdx int, cache vecSearchColumnCacheEn
 		current, currentDist = idx.greedyClosest(&scorer, current, currentDist, layer, visited)
 	}
 	for layer := min(level, idx.maxLevel); layer >= 0; layer-- {
-		candidates := idx.searchLayer(&scorer, current, currentDist, vecHNSWEfConstruction, layer, visited, scratch)
+		candidates := idx.searchLayer(&scorer, current, currentDist, vecHNSWEfConstruction, layer, vecHNSWEfConstruction, visited, scratch)
 		if len(candidates) == 0 {
 			continue
 		}
@@ -1202,7 +1203,13 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
 	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
-	candidates, err := idx.searchCandidates(ctx, &scorer, chooseHNSWEfSearch(k), visited, scratch)
+	ef := chooseHNSWEfSearch(k)
+	limit := k
+	if len(idx.deltaRows) != 0 {
+		// Keep the full beam for the existing merge with updated vectors.
+		limit = ef
+	}
+	candidates, err := idx.searchCandidates(ctx, &scorer, ef, limit, visited, scratch)
 	if err != nil {
 		return nil, err
 	}
@@ -1238,9 +1245,9 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 }
 
 // searchCandidates descends greedily from the entry point to layer 1 and
-// returns layer 0's ef nearest rows, sorted nearest first and owned by
-// scratch. Shared by search and searchFiltered.
-func (idx *vecHNSWIndex) searchCandidates(ctx context.Context, s *vecRowScorer, ef int, visited *vecVisitedSet, scratch *vecHNSWScratch) ([]vecScoredRow, error) {
+// returns up to limit rows from layer 0's beam of width ef, sorted nearest
+// first and owned by scratch. Shared by search and searchFiltered.
+func (idx *vecHNSWIndex) searchCandidates(ctx context.Context, s *vecRowScorer, ef, limit int, visited *vecVisitedSet, scratch *vecHNSWScratch) ([]vecScoredRow, error) {
 	current := idx.entry
 	currentDist, ok := s.distance(current)
 	if !ok {
@@ -1258,7 +1265,7 @@ func (idx *vecHNSWIndex) searchCandidates(ctx context.Context, s *vecRowScorer, 
 	if err := checkCtx(ctx); err != nil {
 		return nil, err
 	}
-	return idx.searchLayer(s, current, currentDist, ef, 0, visited, scratch), nil
+	return idx.searchLayer(s, current, currentDist, ef, 0, limit, visited, scratch), nil
 }
 
 // greedyClosest walks layer from current to the nearest node reachable by
@@ -1291,10 +1298,10 @@ func (idx *vecHNSWIndex) greedyClosest(s *vecRowScorer, current int, currentDist
 	return current, currentDist
 }
 
-// searchLayer is the HNSW beam search (Algorithm 2): it returns the ef
-// nearest rows found on layer from entry, sorted nearest first. The slice is
-// scratch.results and is only valid until the next call with scratch.
-func (idx *vecHNSWIndex) searchLayer(s *vecRowScorer, entry int, entryDist float64, ef int, layer int, visited *vecVisitedSet, scratch *vecHNSWScratch) []vecScoredRow {
+// searchLayer is the HNSW beam search (Algorithm 2). It explores layer with
+// beam width ef and returns up to limit nearest rows. The returned slice
+// aliases scratch.results and is valid until the next call with scratch.
+func (idx *vecHNSWIndex) searchLayer(s *vecRowScorer, entry int, entryDist float64, ef, layer, limit int, visited *vecVisitedSet, scratch *vecHNSWScratch) []vecScoredRow {
 	if entry < 0 || ef <= 0 || !idx.hasLayer(entry, layer) {
 		return nil
 	}
@@ -1340,14 +1347,33 @@ func (idx *vecHNSWIndex) searchLayer(s *vecRowScorer, entry int, entryDist float
 			}
 		}
 	}
-	// Heap-sort in place: each step moves the current worst to the end.
-	for n := len(results) - 1; n > 0; n-- {
-		results[0], results[n] = results[n], results[0]
-		vecScoredHeapDown(results[:n], 0)
-	}
 	scratch.candidates = candidates
 	scratch.results = results
-	return results
+	return rankHNSWResults(results, limit)
+}
+
+func rankHNSWResults(rows vecScoredHeap, limit int) []vecScoredRow {
+	limit = min(limit, len(rows))
+	if limit > 0 && limit <= len(rows)/2 {
+		// Heapify once and extract only the best rows. Pop leaves each
+		// extracted row in the tail, in reverse order.
+		nearest := vecMinScoredHeap(rows)
+		for parent := len(nearest)/2 - 1; parent >= 0; parent-- {
+			vecMinHeapDown(nearest, parent)
+		}
+		for range limit {
+			vecMinHeapPop(&nearest)
+		}
+		top := rows[len(nearest):]
+		slices.Reverse(top)
+		return top
+	}
+	// Heap-sort in place: each step moves the current worst to the end.
+	for n := len(rows) - 1; n > 0; n-- {
+		rows[0], rows[n] = rows[n], rows[0]
+		vecScoredHeapDown(rows[:n], 0)
+	}
+	return rows[:limit]
 }
 
 func (idx *vecHNSWIndex) hasLayer(rowIdx, layer int) bool {

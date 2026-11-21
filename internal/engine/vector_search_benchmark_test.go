@@ -305,6 +305,45 @@ func BenchmarkVecSearchCosineTopK200_IVFCached(b *testing.B) {
 	benchmarkVecSearchIndexedK(b, "ivf", 200)
 }
 
+func BenchmarkVecSearchHNSWTopK(b *testing.B) {
+	db := storage.NewDB()
+	defer db.Close()
+	table, queries := hnswRecallCorpus(4096, 64, 16)
+	if err := db.Put("default", table); err != nil {
+		b.Fatal(err)
+	}
+	defer purgeVectorCachesFor("default", table.Name)
+	fn := &VecSearchTableFunc{}
+	for _, k := range []int{5, 10, 20, 100} {
+		b.Run(strconv.Itoa(k), func(b *testing.B) {
+			ctx := b.Context()
+			env := ExecEnv{ctx: ctx, tenant: "default", db: db}
+			query := &Literal{Val: queries[0]}
+			args := []Expr{
+				&Literal{Val: table.Name}, &Literal{Val: "embedding"},
+				query, &Literal{Val: k}, &Literal{Val: "cosine"},
+				&Literal{Val: vecIndexHNSW},
+			}
+			if _, err := fn.Execute(ctx, args, env, nil); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			next := 0
+			for b.Loop() {
+				query.Val = queries[next]
+				next = (next + 1) % len(queries)
+				result, err := fn.Execute(ctx, args, env, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(result.Rows) != k {
+					b.Fatalf("got %d rows, want %d", len(result.Rows), k)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkVecSearchIndexModesSameTable(b *testing.B) {
 	db := makeRAGHybridBenchmarkTable(12000, 64)
 	fn := &VecSearchTableFunc{}

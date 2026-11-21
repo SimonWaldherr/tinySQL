@@ -24,7 +24,8 @@ func legacyFilteredANNSelection(ctx context.Context, idx *vecHNSWIndex, query []
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
 	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
-	candidates, err := idx.searchCandidates(ctx, &scorer, chooseHNSWEfSearch(k), visited, scratch)
+	ef := chooseHNSWEfSearch(k)
+	candidates, err := idx.searchCandidates(ctx, &scorer, ef, ef, visited, scratch)
 	if err != nil {
 		return nil, err
 	}

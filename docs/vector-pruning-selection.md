@@ -228,3 +228,21 @@ A run with spare capacity still copies into a 16,384-byte result, and two active
 runs retain one 32,768-byte allocation. The ownership regression test checks
 buffer reuse, oversized-buffer refusal and empty slices that alias the active
 run. Reusing any worker header after the merge must leave returned rows intact.
+
+### HNSW result prefixes
+
+When a query needs at most half of the final HNSW beam, the result heap is
+rebuilt in place as a min-heap and only the requested prefix is extracted.
+The traversal still uses the same beam width. Index construction and queries
+that merge updated vectors continue to rank the full beam.
+
+`BenchmarkVecSearchHNSWTopK` searches 4,096 clustered 64-dimensional embeddings
+with cosine distance and a warm index. Median latency over seven alternating
+runs on Apple M2 Max, Go 1.27.4 and `GOMAXPROCS=2` went from 13.15 to 12.89 µs
+for top 5 and from 13.65 to 13.41 µs for top 10. The top-20 and top-100 medians
+varied by less than 1%. Allocation counts stayed the same.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkVecSearchHNSWTopK$' -benchtime=220ms -count=7 -benchmem
+```

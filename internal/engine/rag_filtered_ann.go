@@ -187,7 +187,7 @@ func (idx *vecHNSWIndex) searchFiltered(ctx context.Context, query []float64, qu
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
 	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&searchCache, metricNeedsNorms(idx.metric)))
-	candidates, err := idx.searchCandidates(ctx, &scorer, chooseHNSWEfSearch(k), visited, scratch)
+	candidates, err := idx.searchCandidates(ctx, &scorer, chooseHNSWEfSearch(k), k, visited, scratch)
 	if err != nil {
 		return nil, err
 	}

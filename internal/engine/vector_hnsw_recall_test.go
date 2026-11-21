@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"math"
 	"math/rand"
+	"slices"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -131,7 +133,7 @@ func TestVecHNSWSearchLayerLeavesEntryPoint(t *testing.T) {
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
 	for _, ef := range []int{1, 3} {
-		got := idx.searchLayer(&scorer, 0, entryDist, ef, 0, visited, scratch)
+		got := idx.searchLayer(&scorer, 0, entryDist, ef, 0, ef, visited, scratch)
 		if len(got) == 0 || got[0].rowIdx != n-1 {
 			t.Fatalf("ef=%d: searchLayer returned %v, want nearest row %d first", ef, got, n-1)
 		}
@@ -140,5 +142,27 @@ func TestVecHNSWSearchLayerLeavesEntryPoint(t *testing.T) {
 	visited.visit(0)
 	if best, _ := idx.greedyClosest(&scorer, 0, entryDist, 0, visited); best != n-1 {
 		t.Fatalf("greedyClosest stopped at %d, want %d", best, n-1)
+	}
+}
+
+func TestVecHNSWResultPrefixMatchesFullSort(t *testing.T) {
+	distances := []float64{math.Inf(-1), -1, math.Copysign(0, -1), 0, 1, math.Inf(1)}
+	for _, size := range []int{0, 1, 3, 40, 100} {
+		var heap vecScoredHeap
+		for i := size - 1; i >= 0; i-- {
+			vecScoredHeapPush(&heap, vecScoredRow{rowIdx: i, distance: distances[i%len(distances)]})
+		}
+		want := rankHNSWResults(slices.Clone(heap), size)
+		for _, k := range []int{1, 5, 10, 20, 21, size, size + 1} {
+			got := rankHNSWResults(slices.Clone(heap), k)
+			if len(got) != min(k, size) {
+				t.Fatalf("size=%d, k=%d: got %d rows", size, k, len(got))
+			}
+			for j, row := range got {
+				if row.rowIdx != want[j].rowIdx || math.Float64bits(row.distance) != math.Float64bits(want[j].distance) {
+					t.Fatalf("size=%d, k=%d, position=%d: got %+v, want %+v", size, k, j, row, want[j])
+				}
+			}
+		}
 	}
 }
