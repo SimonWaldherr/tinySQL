@@ -192,6 +192,29 @@ func TestRawJoinLargeDuplicateOrderAndAggregates(t *testing.T) {
 	}
 }
 
+func TestRawJoinCountGroupsWithDuplicateKeys(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	execSQL(t, db, `CREATE TABLE lhs (id INT, grp TEXT)`)
+	execSQL(t, db, `CREATE TABLE rhs (id INT, seq INT, grp TEXT, keep BOOL)`)
+	execSQL(t, db, `INSERT INTO lhs VALUES (1,'a'), (2,NULL), (1,'b'), (3,'unmatched'), (NULL,'null key'), (1,'a')`)
+	execSQL(t, db, `INSERT INTO rhs VALUES (1,1,'x',TRUE), (1,2,'y',TRUE), (1,3,'skip',FALSE), (2,4,'y',TRUE), (NULL,5,'null key',TRUE)`)
+	for _, tc := range []struct {
+		columns string
+		where   string
+		want    []Row
+	}{
+		{"l.grp", "r.keep = TRUE", []Row{{"g": "a", "n": 4}, {"g": nil, "n": 1}, {"g": "b", "n": 2}}},
+		{"l.grp", "r.keep = TRUE AND l.id < r.seq", []Row{{"g": "a", "n": 2}, {"g": nil, "n": 1}, {"g": "b", "n": 1}}},
+		{"r.grp", "r.keep = TRUE", []Row{{"g": "x", "n": 3}, {"g": "y", "n": 4}}},
+	} {
+		query := "SELECT " + tc.columns + " AS g, COUNT(*) AS n FROM lhs l JOIN rhs r ON l.id = r.id WHERE " + tc.where + " GROUP BY " + tc.columns
+		if got := execSQL(t, db, query); !reflect.DeepEqual(got.Rows, tc.want) {
+			t.Fatalf("%s: got %#v, want %#v", query, got.Rows, tc.want)
+		}
+	}
+}
+
 func collectRawJoinMatches(index *simpleJoinRightIndex, key any) [][]any {
 	var rows [][]any
 	for rowID := index.first(key); rowID != 0; rowID = index.after(rowID) {

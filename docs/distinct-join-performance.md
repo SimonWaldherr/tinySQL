@@ -145,3 +145,21 @@ go vet ./...
 
 The final validation commands run in an isolated copy of the committed
 repository plus this patch, including its original dependency definitions.
+
+## COUNT(*) grouped by the left input
+
+For an inner equality join with no remaining cross-table predicate, a group
+from the left input gets one count increment per left row, sized by the
+matching right bucket. Duplicate matches still contribute to the total and
+groups follow the order of their first match.
+
+`BenchmarkRawJoinLargePrepared` runs a prepared query with a warm right index.
+On Apple M2 Max with Go 1.27.4 and `GOMAXPROCS=2`, the median of seven
+alternating runs went from 1.58 to 0.23 ms for 100,000 matches and from 36.1 to
+31.2 µs for the unique-key case with 1,000 matches. Both retained nine
+allocations per query.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkRawJoinLargePrepared$' -benchtime=130ms -count=7 -benchmem
+```

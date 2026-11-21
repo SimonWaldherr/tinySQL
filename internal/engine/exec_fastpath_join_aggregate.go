@@ -166,6 +166,19 @@ func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePl
 	groups := make(map[string]int)
 	order := make([]simpleJoinCountState, 0)
 	keyBuf := make([]byte, 0, 32)
+	addCount := func(groupValue any, count int) {
+		keyBuf = writeSingleGroupKey(keyBuf[:0], groupValue)
+		stateIndex, exists := groups[string(keyBuf)]
+		if !exists {
+			stateIndex = len(order)
+			groups[string(keyBuf)] = stateIndex
+			order = append(order, simpleJoinCountState{groupValue: groupValue})
+		}
+		order[stateIndex].count += count
+	}
+	// A left group is constant across the bucket. Side filters have already
+	// been applied, so a join with no residual needs only its match count.
+	countWholeBucket := plan.groupSide == 0 && plan.join.where == nil
 	for i, left := range plan.join.left.Rows {
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
@@ -185,7 +198,18 @@ func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePl
 		if leftKey == nil {
 			continue
 		}
-		for rowID := rightByKey.first(comparableKeyPart(leftKey)); rowID != 0; rowID = rightByKey.after(rowID) {
+		rowID := rightByKey.first(comparableKeyPart(leftKey))
+		if countWholeBucket {
+			if rowID != 0 {
+				count := 1
+				for rowID = rightByKey.after(rowID); rowID != 0; rowID = rightByKey.after(rowID) {
+					count++
+				}
+				addCount(left[plan.groupCol], count)
+			}
+			continue
+		}
+		for ; rowID != 0; rowID = rightByKey.after(rowID) {
 			right := rightByKey.rows[rowID-1]
 			match, err := evalJoinRawWhere(plan.join, left, right)
 			if err != nil {
@@ -194,18 +218,13 @@ func executeSimpleJoinCountStarFastPath(env ExecEnv, plan *simpleJoinAggregatePl
 			if !match {
 				continue
 			}
-			groupValue := left[plan.groupCol]
-			if plan.groupSide == 1 {
+			var groupValue any
+			if plan.groupSide == 0 {
+				groupValue = left[plan.groupCol]
+			} else {
 				groupValue = right[plan.groupCol]
 			}
-			keyBuf = writeSingleGroupKey(keyBuf[:0], groupValue)
-			stateIndex, exists := groups[string(keyBuf)]
-			if !exists {
-				stateIndex = len(order)
-				groups[string(keyBuf)] = stateIndex
-				order = append(order, simpleJoinCountState{groupValue: groupValue})
-			}
-			order[stateIndex].count++
+			addCount(groupValue, 1)
 		}
 	}
 
