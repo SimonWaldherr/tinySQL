@@ -82,7 +82,7 @@ func BenchmarkGISRAGIndex(b *testing.B) {
 				opts := &ragSpatialFilterOptions{GeometryColumn: "geom", BBox: tc.box}
 				b.ReportAllocs()
 				for b.Loop() {
-					rows, err := ragRowsForSpatialFilter(ctx, "default", table, opts)
+					rows, err := ragRowsForSpatialFilter(ctx, "default", table, opts, nil, false)
 					if err != nil || len(rows) == 0 {
 						b.Fatalf("rows=%d err=%v", len(rows), err)
 					}

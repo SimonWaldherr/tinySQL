@@ -486,6 +486,11 @@ func TestRetrievalSpatialPolygonBeforeRanking(t *testing.T) {
 		(6, TRUE, ST_MAKEPOINT(5,5), 'map', '[1,0]'),
 		(7, TRUE, NULL, 'map', '[1,0]'),
 		(8, TRUE, '{"type":"LineString","coordinates":[[0,0],[2,2]]}', 'map', '[0.6,0.4]')`)
+	padding := make([]string, 120)
+	for i := range padding {
+		padding[i] = fmt.Sprintf("(%d, TRUE, ST_MAKEPOINT(1,1), 'map', '[1,0]')", 9+i)
+	}
+	execSQL(t, db, `INSERT INTO district_chunks VALUES `+strings.Join(padding, ","))
 	const opts = `'{"pre_filter":{"allowed_row_ids":[1,2,3,4,5,6,7,8],"equals":{"visible":true},
 		"spatial":{"geometry_column":"geom","polygon":{"type":"MultiPolygon","coordinates":[
 			[[[0,0],[4,0],[4,4],[0,4],[0,0]],[[2,2],[2,3],[3,3],[3,2],[2,2]]],
@@ -495,6 +500,33 @@ func TestRetrievalSpatialPolygonBeforeRanking(t *testing.T) {
 	if got := execSQL(t, db, query).Rows; len(got) != 1 || expectAsInt(t, got[0]["id"]) != 2 {
 		t.Fatalf("nearest authorized vector inside polygon = %v, want only 2", got)
 	}
+	const bboxQuery = `SELECT id FROM VEC_SEARCH_FILTERED('district_chunks','embedding','[1,0]',1,
+		'{"pre_filter":{"allowed_row_ids":[1,2,3,4,5,6,7,8],"spatial":{"geometry_column":"geom","bbox":[0,0,0.5,0.5]}}}')`
+	checkBBox := func() {
+		t.Helper()
+		if got := execSQL(t, db, bboxQuery).Rows; len(got) != 1 || expectAsInt(t, got[0]["id"]) != 8 {
+			t.Fatalf("bbox overlap should include the line with a centroid outside the viewport, got %v", got)
+		}
+	}
+	checkBBox()
+	emptyQuery := strings.Replace(bboxQuery, "[1,2,3,4,5,6,7,8]", "[]", 1)
+	if got := execSQL(t, db, emptyQuery).Rows; len(got) != 0 {
+		t.Fatalf("empty scope with bbox returned %v", got)
+	}
+	table, err := db.Get("default", "district_chunks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := geoIndexCacheKey{tenant: "default", table: table.Name, colIdx: 2}
+	if cachedGeoGridIndex(key, table) != nil {
+		t.Fatal("selective spatial queries built a full grid")
+	}
+	if _, err := getGeoGridIndex(t.Context(), key.tenant, table, key.colIdx); err != nil {
+		t.Fatal(err)
+	}
+	purgeRAGPreFilterCachesFor(table.Name)
+	checkBBox()
+
 	otherPolygon := strings.Replace(query,
 		`[[[0,0],[4,0],[4,4],[0,4],[0,0]],[[2,2],[2,3],[3,3],[3,2],[2,2]]]`,
 		`[[[15,15],[16,15],[16,16],[15,16],[15,15]]]`, 1)
@@ -531,10 +563,12 @@ func TestRetrievalSpatialPolygonValidation(t *testing.T) {
 		`"polygon":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1]]]}`,
 		`"polygon":{"type":"Polygon","coordinates":[[[0,0],[181,0],[1,1],[0,0]]]}`,
 	} {
-		query := `SELECT id FROM VEC_SEARCH_FILTERED('bad_polygon_filter','embedding','[1,0]',1,
-			'{"pre_filter":{"spatial":{"geometry_column":"geom",` + options + `}}}')`
-		if _, err := Execute(t.Context(), db, "default", mustParse(query)); err == nil {
-			t.Fatalf("accepted invalid spatial options %s", options)
+		for _, scope := range []string{"", `"allowed_row_ids":[],`} {
+			query := `SELECT id FROM VEC_SEARCH_FILTERED('bad_polygon_filter','embedding','[1,0]',1,
+				'{"pre_filter":{` + scope + `"spatial":{"geometry_column":"geom",` + options + `}}}')`
+			if _, err := Execute(t.Context(), db, "default", mustParse(query)); err == nil {
+				t.Fatalf("accepted invalid spatial options %s with scope %q", options, scope)
+			}
 		}
 	}
 	geoGridCacheMu.RLock()
@@ -569,6 +603,48 @@ func BenchmarkRetrievalSpatialPolygonWarm(b *testing.B) {
 			opts := fmt.Sprintf(`{"pre_filter":{"spatial":{"geometry_column":"location","polygon":%s}}}`, polygon)
 			query := `SELECT id FROM VEC_SEARCH_FILTERED('warm_polygon_chunks','embedding','[1,0]',6,'` + opts + `')`
 			runRAGBench(b, db, query, 6)
+		})
+	}
+}
+
+func BenchmarkRetrievalSpatialSubsetCold(b *testing.B) {
+	points := geoSearchBenchmarkPointTable()
+	table := storage.NewTable("sparse_spatial", append(points.Cols, storage.Column{Name: "embedding", Type: storage.VectorType}), false)
+	table.Rows = points.Rows
+	for i := range table.Rows {
+		table.Rows[i] = append(table.Rows[i], []float64{1, float64(i % 200)})
+	}
+	if err := table.CreateSecondaryIndex("ix_id", []string{"id"}, true); err != nil {
+		b.Fatal(err)
+	}
+	db := storage.NewDB()
+	b.Cleanup(func() { _ = db.Close() })
+	if err := db.Put("default", table); err != nil {
+		b.Fatal(err)
+	}
+	var ids []string
+	for i := range 32 {
+		ids = append(ids, strconv.Itoa(i))
+	}
+	for _, tc := range []struct{ name, spatial string }{
+		{"bbox", `"bbox":[8.9,46.9,9.9,47.1]`},
+		{"polygon", `"polygon":{"type":"Polygon","coordinates":[[[8.9,46.9],[9.9,46.9],[9.9,47.1],[8.9,47.1],[8.9,46.9]]]}`},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			options := fmt.Sprintf(`{"pre_filter":{"id_column":"id","allowed_row_ids":[%s],"spatial":{"geometry_column":"geom",%s}}}`, strings.Join(ids, ","), tc.spatial)
+			query := fmt.Sprintf(`SELECT id FROM VEC_SEARCH_FILTERED('%s','embedding','[1,0]',6,'%s')`, table.Name, options)
+			stmt := mustParse(query)
+			b.ReportAllocs()
+			for b.Loop() {
+				b.StopTimer()
+				purgeGeoGridCachesFor("default", table.Name)
+				purgeRAGPreFilterCachesFor(table.Name)
+				b.StartTimer()
+				rs, err := Execute(b.Context(), db, "default", stmt)
+				if err != nil || len(rs.Rows) != 6 {
+					b.Fatalf("expected six results, got %v (%v)", rs, err)
+				}
+			}
 		})
 	}
 }

@@ -141,6 +141,16 @@ func purgeGeoGridCachesFor(tenant, table string) {
 	geoGridCacheMu.Unlock()
 }
 
+func cachedGeoGridIndex(key geoIndexCacheKey, table *storage.Table) *geoGridIndex {
+	geoGridCacheMu.RLock()
+	idx := geoGridCache[key]
+	geoGridCacheMu.RUnlock()
+	if idx != nil && idx.table == table && idx.version == table.Version {
+		return idx
+	}
+	return nil
+}
+
 func getGeoGridIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int) (*geoGridIndex, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -148,12 +158,9 @@ func getGeoGridIndex(ctx context.Context, tenant string, table *storage.Table, c
 	key := geoIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx}
 
 	for {
-		geoGridCacheMu.RLock()
-		if idx := geoGridCache[key]; idx != nil && idx.table == table && idx.version == table.Version {
-			geoGridCacheMu.RUnlock()
+		if idx := cachedGeoGridIndex(key, table); idx != nil {
 			return idx, nil
 		}
-		geoGridCacheMu.RUnlock()
 
 		geoGridCacheMu.Lock()
 		if idx := geoGridCache[key]; idx != nil && idx.table == table && idx.version == table.Version {

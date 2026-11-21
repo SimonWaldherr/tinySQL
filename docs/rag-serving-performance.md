@@ -70,6 +70,25 @@ In `BenchmarkRetrievalSpatialPolygonWarm`, six hits are selected from
 median dropped from 6.55 to 2.82 ms and from 490,026 to 207,585 B/op.
 Timings varied between runs, while the allocation reduction was consistent.
 
+### Spatial filters over a small subset
+
+A bounding box or polygon can refine a row set already selected by IDs or
+metadata. For up to 64 rows and at most one sixteenth of the table, the
+spatial filter reads those rows directly. It reuses valid cached geometry
+data when available. The same checks for extent overlap and centroid
+inclusion apply to both paths. Bounding boxes that cross the antimeridian
+and radius queries use the spatial grid.
+
+`BenchmarkRetrievalSpatialSubsetCold` starts without a spatial grid or
+cached filter result. It retrieves six vector hits with 32 indexed IDs
+from 20,000 points. The medians of five paired runs on an Apple M2 Max
+with Go 1.27.4 and `GOMAXPROCS=2` were:
+
+| Spatial selector | Before | After |
+| --- | ---: | ---: |
+| Bounding box | 2.26 ms, 1,909,339 B/op | 36.52 µs, 18,198 B/op |
+| Polygon | 2.29 ms, 1,910,156 B/op | 38.40 µs, 19,307 B/op |
+
 ## Final hit rows
 
 The built-in vector, FTS, hybrid, and context retrievers allocate fresh result

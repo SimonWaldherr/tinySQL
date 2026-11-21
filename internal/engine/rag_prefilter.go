@@ -280,16 +280,10 @@ func ragBuildRowFilterContext(ctx context.Context, tenant string, table *storage
 	}
 
 	if opts.Spatial != nil {
-		rows, err := ragRowsForSpatialFilter(ctx, tenant, table, opts.Spatial)
+		selected, err = ragRowsForSpatialFilter(ctx, tenant, table, opts.Spatial, selected, hasSelection)
 		if err != nil {
 			return nil, err
 		}
-		if !hasSelection {
-			selected = rows
-		} else {
-			selected = ragIntersectRowIDs(selected, rows)
-		}
-		hasSelection = true
 	}
 
 	filter := &ragRowFilter{rows: selected}
@@ -308,10 +302,7 @@ func ragBuildRowFilterContext(ctx context.Context, tenant string, table *storage
 	return filter, nil
 }
 
-func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.Table, opts *ragSpatialFilterOptions) ([]int, error) {
-	if opts == nil {
-		return nil, nil
-	}
+func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.Table, opts *ragSpatialFilterOptions, selected []int, restricted bool) ([]int, error) {
 	column := strings.TrimSpace(opts.GeometryColumn)
 	if column == "" {
 		return nil, fmt.Errorf("pre_filter.spatial.geometry_column must be a non-empty string")
@@ -328,6 +319,7 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 		return nil, fmt.Errorf("pre_filter.spatial requires exactly one of bbox, center with radius_meters, or polygon")
 	}
 	var polygon *geoPolygonEntry
+	var matches func(geoEditBBox, geoGridCentroid) bool
 	var west, south, east, north, lon, lat float64
 	crossesAntimeridian := false
 	switch {
@@ -335,6 +327,10 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 		polygon, err = ragParseSpatialPolygon(opts.Polygon)
 		if err != nil {
 			return nil, fmt.Errorf("pre_filter.spatial.polygon: %w", err)
+		}
+		matches = func(_ geoEditBBox, center geoGridCentroid) bool {
+			point := center.point()
+			return !polygon.outsideBounds(point) && pointIntersectsMultiPolygon(point, polygon.mp)
 		}
 	case bboxMode:
 		if len(opts.BBox) != 4 || !geoSearchFinite(opts.BBox...) {
@@ -345,6 +341,15 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 			return nil, fmt.Errorf("pre_filter.spatial.bbox requires -180 <= west/east <= 180 and -90 <= south <= north <= 90")
 		}
 		crossesAntimeridian = west > east
+		matches = func(box geoEditBBox, _ geoGridCentroid) bool {
+			if !box.Set || box.MaxY < south || box.MinY > north {
+				return false
+			}
+			if crossesAntimeridian {
+				return box.MaxX >= west || box.MinX <= east
+			}
+			return box.MaxX >= west && box.MinX <= east
+		}
 	default:
 		if len(opts.Center) != 2 || !geoSearchFinite(opts.Center...) {
 			return nil, fmt.Errorf("pre_filter.spatial.center must contain two finite numbers [longitude,latitude]")
@@ -356,12 +361,26 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 		if lon < -180 || lon > 180 || lat < -90 || lat > 90 {
 			return nil, fmt.Errorf("pre_filter.spatial.center requires longitude in -180..180 and latitude in -90..90")
 		}
+		cosLat := math.Cos(lat * math.Pi / 180)
+		matches = func(_ geoEditBBox, center geoGridCentroid) bool {
+			return center.distanceFrom(lat, cosLat, lon) <= opts.RadiusMeters
+		}
 	}
-	if ctx == nil {
-		ctx = context.Background()
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
+	}
+	if restricted && len(selected) == 0 {
+		return nil, nil
 	}
 	if tenant == "" {
 		tenant = "default"
+	}
+	// A polygon or a single extent can be checked directly. Radius and
+	// wrapped longitude queries use the grid's geographic candidate bounds.
+	if restricted && !radiusMode && !crossesAntimeridian && len(selected) <= min(64, len(table.Rows)/16) {
+		key := geoIndexCacheKey{tenant: tenant, table: table.Name, colIdx: colIdx}
+		idx := cachedGeoGridIndex(key, table)
+		return ragFilterSpatialSubset(ctx, table, colIdx, idx, selected, matches)
 	}
 	idx, err := getGeoGridIndex(ctx, tenant, table, colIdx)
 	if err != nil {
@@ -369,45 +388,17 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 	}
 
 	var candidates []int32
-	var matches func(int32) bool
 	switch {
 	case polygonMode:
 		candidates = idx.candidatesCentroidBBox(polygon.minX, polygon.minY, polygon.maxX, polygon.maxY)
-		matches = func(rowIdx int32) bool {
-			point := idx.centroids[rowIdx].point()
-			return !polygon.outsideBounds(point) && pointIntersectsMultiPolygon(point, polygon.mp)
-		}
 	case bboxMode:
 		if crossesAntimeridian {
 			candidates = append(idx.candidatesBBox(west, south, 180, north), idx.candidatesBBox(-180, south, east, north)...)
 		} else {
 			candidates = idx.candidatesBBox(west, south, east, north)
 		}
-		matches = func(rowIdx int32) bool {
-			if rowIdx < 0 || int(rowIdx) >= len(idx.bboxes) || !idx.valid[rowIdx] {
-				return false
-			}
-			box := idx.bboxes[rowIdx]
-			if !box.Set || box.MaxY < south || box.MinY > north {
-				return false
-			}
-			if crossesAntimeridian {
-				return box.MaxX >= west || box.MinX <= east
-			}
-			return box.MaxX >= west && box.MinX <= east
-		}
 	default:
 		candidates = idx.candidatesRadius(lon, lat, opts.RadiusMeters)
-		// cos(lat) is loop-invariant across every candidate this filter
-		// re-verifies, so it is computed once here instead of once per
-		// candidate inside haversineMeters — see haversineMetersFromOrigin.
-		cosLat := math.Cos(lat * math.Pi / 180)
-		matches = func(rowIdx int32) bool {
-			if rowIdx < 0 || int(rowIdx) >= len(idx.centroids) || !idx.valid[rowIdx] {
-				return false
-			}
-			return idx.centroids[rowIdx].distanceFrom(lat, cosLat, lon) <= opts.RadiusMeters
-		}
 	}
 
 	rows := make([]int, 0, len(candidates))
@@ -417,18 +408,44 @@ func ragRowsForSpatialFilter(ctx context.Context, tenant string, table *storage.
 				return nil, err
 			}
 		}
-		if matches(rowIdx) {
+		if idx.valid[rowIdx] && matches(idx.bboxes[rowIdx], idx.centroids[rowIdx]) {
 			rows = append(rows, int(rowIdx))
 		}
 	}
-	// These rows are newly allocated and bounds-checked above. Normalize in
-	// place instead of hashing and copying an already query-local candidate set.
-	// Dateline windows may contribute a geometry from both halves.
 	if len(rows) == 0 {
 		return nil, nil
 	}
 	slices.Sort(rows)
-	return slices.Compact(rows), nil
+	rows = slices.Compact(rows) // Dateline windows may return a row twice.
+	if restricted {
+		rows = ragIntersectRowIDs(selected, rows)
+	}
+	return rows, nil
+}
+
+func ragFilterSpatialSubset(ctx context.Context, table *storage.Table, colIdx int, idx *geoGridIndex, selected []int, matches func(geoEditBBox, geoGridCentroid) bool) ([]int, error) {
+	// selected contains sorted row IDs in a private slice owned by the filter.
+	rows := selected[:0]
+	for _, rowID := range selected {
+		if err := checkCtx(ctx); err != nil {
+			return nil, err
+		}
+		if idx != nil {
+			if idx.valid[rowID] && matches(idx.bboxes[rowID], idx.centroids[rowID]) {
+				rows = append(rows, rowID)
+			}
+			continue
+		}
+		row := table.Rows[rowID]
+		if colIdx >= len(row) || row[colIdx] == nil {
+			continue
+		}
+		box, point, ok := geoGridGeometry(row[colIdx])
+		if ok && matches(box, geoGridCentroid{Lon: point.Lon, Lat: point.Lat}) {
+			rows = append(rows, rowID)
+		}
+	}
+	return rows, nil
 }
 
 func ragParseSpatialPolygon(raw json.RawMessage) (*geoPolygonEntry, error) {
