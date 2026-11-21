@@ -33,6 +33,20 @@ row, broad-window candidate selection changed from 105–107 µs to about 1.38 �
 a small window remained about 64 ns. These measurements exclude index building,
 exact distance checks, and SQL result materialization.
 
+For a window covering the complete indexed extent, the candidate list is
+sized from the number of valid geometries. A fully populated layer emits row
+IDs directly in source order. On Apple M2 Max with Go 1.27.4 and
+`GOMAXPROCS=2`, candidate selection for a complete 20,000-point layer fell
+from 19.81 to 14.66 µs. For 100,000 rows with 5,000 valid points, allocated
+bytes fell from 401,408 to 20,480 per selection. Both figures are medians of
+five runs. The benchmarks time candidate selection with the index built.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^BenchmarkGeoGrid(Candidates|FullExtentSparse)$' \
+  -benchtime=150ms -count=5 -benchmem
+```
+
 ### Nearest features within a radius
 
 ```sql

@@ -113,6 +113,7 @@ type geoGridIndex struct {
 	// reparsing GeoJSON after the grid has narrowed the candidate set.
 	bboxes      []geoEditBBox
 	valid       []bool
+	validCount  int
 	uniqueCells bool // no row occurs in multiple cells; overflow rows are disjoint
 	// Polygon centroids can fall outside their extent, for example when
 	// subtracting holes whose signed areas almost cancel the exterior.
@@ -337,6 +338,7 @@ func buildGeoGridIndex(ctx context.Context, table *storage.Table, colIdx int) (*
 
 	idx.cells = make(map[geoCellID][]int32)
 	idx.bounds = union
+	idx.validCount = validCount
 	idx.cellSizeLon, idx.cellSizeLat = geoGridMinCellSizeDegrees, geoGridMinCellSizeDegrees
 	if validCount == 0 {
 		return idx, nil
@@ -434,7 +436,15 @@ func (idx *geoGridIndex) candidatesBBox(minLon, minLat, maxLon, maxLat float64) 
 	// A query covering the complete extent needs no cell traversal or
 	// deduplication. Row order is already deterministic in this path.
 	if minLon <= idx.bounds.MinX && maxLon >= idx.bounds.MaxX && minLat <= idx.bounds.MinY && maxLat >= idx.bounds.MaxY {
-		out := make([]int32, 0, len(idx.valid))
+		count := idx.validCount
+		if count == len(idx.valid) {
+			out := make([]int32, count)
+			for row := range out {
+				out[row] = int32(row)
+			}
+			return out
+		}
+		out := make([]int32, 0, count)
 		for row, valid := range idx.valid {
 			if valid {
 				out = append(out, int32(row))

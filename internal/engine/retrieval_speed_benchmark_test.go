@@ -84,6 +84,31 @@ func BenchmarkGeoGridOverflowCandidates(b *testing.B) {
 	}
 }
 
+func BenchmarkGeoGridFullExtentSparse(b *testing.B) {
+	const rows, stride = 100_000, 20
+	table := storage.NewTable("sparse_points", []storage.Column{{Name: "geom", Type: storage.GeometryType}}, false)
+	missing := []any{nil}
+	point := []any{`{"coordinates":[11.575,48.137],"type":"Point"}`}
+	table.Rows = make([][]any, rows)
+	for i := range table.Rows {
+		table.Rows[i] = missing
+		if i%stride == 0 {
+			table.Rows[i] = point
+		}
+	}
+	idx, err := buildGeoGridIndex(b.Context(), table, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		geoCandidateBenchmarkSink = idx.candidatesBBox(-180, -90, 180, 90)
+		if len(geoCandidateBenchmarkSink) != rows/stride {
+			b.Fatalf("got %d candidates, want %d", len(geoCandidateBenchmarkSink), rows/stride)
+		}
+	}
+}
+
 func BenchmarkGeoSearchWarm(b *testing.B) {
 	db := storage.NewDB()
 	if err := db.Put("default", geoSpeedTable(b, false)); err != nil {
