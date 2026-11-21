@@ -58,6 +58,37 @@ account for most allocations; the expression binding change primarily reduces
 CPU work. It does not establish a general reduction in peak live memory or a
 speedup for arbitrary SQL shapes.
 
+## Single-table SELECT pagination and ordering
+
+A filtered page checks skipped rows against `WHERE`. When the projection
+contains only direct columns, the executor checks row width and reads the
+projected values only for the returned page. Projection expressions on
+skipped matches still run in order and report their errors.
+
+`ORDER BY` on a single FLOAT column can sort unboxed keys with or without a
+limit. Each candidate stores its key and scan position. Projection reads the
+source row after sorting. Unbounded queries with NULLs, NaNs or mixed key types
+use the generic sorter. Equal keys follow source order.
+
+The following medians use seven alternating runs against `aa56737` on Apple
+M2 Max with Go 1.27.4 and `GOMAXPROCS=2`. All fixtures use 20,000 rows.
+
+| Query shape | Before | After | Allocated bytes/op before → after |
+| --- | ---: | ---: | ---: |
+| Filtered projection, `LIMIT 10 OFFSET 15000` | 134.6 µs | 70.7 µs | 4,129 → 4,128 |
+| FLOAT `ORDER BY`, full result | 2.64 ms | 2.29 ms | 8,408,449 → 7,212,460 |
+| FLOAT `ORDER BY LIMIT 20` | 370.3 µs | 326.7 µs | 8,500 → 7,924 |
+
+Plain full-scan projections, `SELECT *`, unfiltered pagination and indexed
+point lookups had overlapping timing ranges. The benchmark counts include
+result materialization.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^Benchmark(FilteredDeepOffset|OrderBySingleColumnNoLimit|OrderByWithLimit|Select.*FullScan|SelectProjectedLimitOffset|SelectIndexedSmallResult)$' \
+  -benchtime=150ms -count=7 -benchmem
+```
+
 ## Computed aggregate arguments
 
 Eligible raw COUNT/DISTINCT, SUM/AVG and MIN/MAX arguments also reuse the

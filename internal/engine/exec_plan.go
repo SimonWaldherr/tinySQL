@@ -107,8 +107,10 @@ func buildSimpleSelectPlanInto(plan *simpleSelectPlan, env ExecEnv, s *Select) (
 		return true, nil
 	}
 	resetSimplePlanAccess(plan, len(table.Rows))
-	if err := selectSimplePlanIndexRows(plan, s.Where); err != nil {
-		return true, err
+	if s.Where != nil {
+		if err := selectSimplePlanIndexRows(plan, s.Where); err != nil {
+			return true, err
+		}
 	}
 	return true, nil
 }

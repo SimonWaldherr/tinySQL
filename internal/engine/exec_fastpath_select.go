@@ -59,51 +59,67 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 	if plan.offset != nil && *plan.offset > 0 {
 		offset = *plan.offset
 	}
-	var skippedValues []any
+	minSkippedWidth := 0
 	if offset > 0 {
-		skippedValues = make([]any, len(plan.projs))
+		for _, p := range plan.projs {
+			if p.colIdx < 0 {
+				minSkippedWidth = -1
+				break
+			}
+			minSkippedWidth = max(minSkippedWidth, p.colIdx+1)
+		}
 	}
+	var skippedValues []any
 	matched := 0
 
 	rows := simplePlanRows(plan)
+	rowIDs := plan.rowIDs
 	rowCount := len(rows)
-	if plan.rowIDs != nil {
-		rowCount = len(plan.rowIDs)
+	if rowIDs != nil {
+		rowCount = len(rowIDs)
+	}
+	// Simple SELECT planning supplies a compiled predicate. An exact seek
+	// can omit it when the index has already checked the entire WHERE clause.
+	filter := plan.filter
+	if plan.filterFullyCovered {
+		filter = nil
 	}
 	for i := 0; i < rowCount; i++ {
-		rowID := i
-		if plan.rowIDs != nil {
-			rowID = plan.rowIDs[i]
+		var raw []any
+		if rowIDs == nil {
+			raw = rows[i]
+		} else {
+			rowID := rowIDs[i]
+			if rowID < 0 || rowID >= len(rows) {
+				return nil, true, fmt.Errorf("index %q returned invalid row id %d", plan.indexName, rowID)
+			}
+			raw = rows[rowID]
 		}
-		if rowID < 0 || rowID >= len(rows) {
-			return nil, true, fmt.Errorf("index %q returned invalid row id %d", plan.indexName, rowID)
-		}
-		raw := rows[rowID]
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
 				return nil, true, err
 			}
 		}
-		match := plan.filterFullyCovered
-		if !match {
-			var err error
-			if plan.filter != nil {
-				match, err = plan.filter(raw)
-			} else {
-				match, err = evalRawWhere(plan, raw)
-			}
+		if filter != nil {
+			match, err := filter(raw)
 			if err != nil {
 				return nil, true, err
 			}
-		}
-		if !match {
-			continue
+			if !match {
+				continue
+			}
 		}
 		if matched < offset {
-			// Preserve expression errors and evaluation on skipped matches.
-			if err := projectRawValues(plan, raw, skippedValues); err != nil {
-				return nil, true, err
+			// Direct column reads need only a width check on discarded rows.
+			// Keep the original projection order for expressions and short rows.
+			if minSkippedWidth < 0 || len(raw) < minSkippedWidth {
+				if skippedValues == nil {
+					skippedValues = make([]any, len(plan.projs))
+				}
+				if err := projectRawValues(plan, raw, skippedValues); err != nil {
+					return nil, true, err
+				}
 			}
 		} else {
 			out, err := projectRawRow(plan, raw)
@@ -117,7 +133,6 @@ func executeSimpleSelectFastPath(env ExecEnv, s *Select) (*ResultSet, bool, erro
 			if len(outRows) == 64 && i < 128 && capacityHint > 64 {
 				outRows = slices.Grow(outRows, capacityHint-len(outRows))
 			}
-
 		}
 		matched++
 		if plan.limit != nil && len(outRows) >= *plan.limit {
@@ -365,27 +380,22 @@ type orderedRawRow struct {
 	keys []any
 }
 
-// floatOrderedRawRow is the narrow top-N representation for ORDER BY on a
-// physical FLOAT/FLOAT64 column. Keeping the sort key unboxed avoids the
-// generic compare/type-switch path for every heap comparison. It is used only
-// after simpleFloatOrderColumn has verified every source value is float64;
-// all nullable, mixed-type, indexed, or filtered queries retain the general
-// orderedRawRow implementation below.
+// floatOrderedRawRow keeps only the unboxed key and original scan position.
+// Projection fetches the source row after the sort or bounded heap is done.
 type floatOrderedRawRow struct {
 	idx int
-	raw []any
 	key float64
 }
 
-// simpleFloatOrderColumn recognizes the common pagination shape
+// simpleFloatOrderColumn recognizes the common shape
 //
-//	SELECT ... FROM t ORDER BY float_column [ASC|DESC] LIMIT n [OFFSET m]
+//	SELECT ... FROM t ORDER BY float_column [ASC|DESC] [LIMIT n] [OFFSET m]
 //
 // without a WHERE clause or index RowID set. The schema test avoids an extra
 // table scan for non-float ORDER BY queries; the caller still checks the raw
 // values, because direct storage callers may bypass SQL coercion.
 func simpleFloatOrderColumn(plan *simpleSelectPlan) (int, bool) {
-	if plan == nil || plan.table == nil || plan.where != nil || plan.rowIDs != nil || plan.limit == nil ||
+	if plan == nil || plan.table == nil || plan.where != nil || plan.rowIDs != nil ||
 		len(plan.orderBy) != 1 || len(plan.orderExprs) != 1 {
 		return 0, false
 	}
@@ -436,7 +446,7 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 					return nil, err
 				}
 			}
-			topRows.items = append(topRows.items, floatOrderedRawRow{raw: raw, key: raw[column].(float64), idx: i})
+			topRows.items = append(topRows.items, floatOrderedRawRow{key: raw[column].(float64), idx: i})
 		}
 	} else {
 		for i, raw := range sourceRows {
@@ -445,7 +455,7 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 					return nil, err
 				}
 			}
-			topRows.pushBounded(floatOrderedRawRow{raw: raw, key: raw[column].(float64), idx: i}, keepCount)
+			topRows.pushBounded(floatOrderedRawRow{key: raw[column].(float64), idx: i}, keepCount)
 		}
 	}
 
@@ -471,7 +481,7 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 		return &ResultSet{Cols: plan.outputCols, Rows: []Row{}}, nil
 	}
 	rows = rows[start:]
-	if *plan.limit < len(rows) {
+	if plan.limit != nil && *plan.limit < len(rows) {
 		rows = rows[:*plan.limit]
 	}
 
@@ -482,7 +492,7 @@ func executeSimpleSelectFloatOrderedTopN(env ExecEnv, plan *simpleSelectPlan, so
 	}
 	outRows := make([]Row, 0, len(rows))
 	for _, item := range rows {
-		out, err := projectRawRow(plan, item.raw)
+		out, err := projectRawRow(plan, sourceRows[item.idx])
 		if err != nil {
 			return nil, err
 		}
@@ -652,7 +662,7 @@ func executeSimpleSelectFloatScoredTopN(env ExecEnv, plan *simpleSelectPlan, sou
 		if err != nil {
 			return nil, err
 		}
-		topRows.pushBounded(floatOrderedRawRow{raw: raw, key: key, idx: i}, keepCount)
+		topRows.pushBounded(floatOrderedRawRow{key: key, idx: i}, keepCount)
 	}
 
 	rows := topRows.items
@@ -681,7 +691,11 @@ func executeSimpleSelectFloatScoredTopN(env ExecEnv, plan *simpleSelectPlan, sou
 	}
 	outRows := make([]Row, 0, len(rows))
 	for _, item := range rows {
-		out, err := projectRawRow(plan, item.raw)
+		rowID := item.idx
+		if plan.rowIDs != nil {
+			rowID = plan.rowIDs[rowID]
+		}
+		out, err := projectRawRow(plan, sourceRows[rowID])
 		if err != nil {
 			return nil, err
 		}
@@ -814,6 +828,7 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			_, validatePhase = startQueryPhase(env, "VALIDATE", "float ordering source types")
 			defer validatePhase.finish(-1)
 		}
+		unlimited := plan.limit == nil
 		allFloat64 := true
 		for i, raw := range sourceRows {
 			if i&63 == 0 {
@@ -825,14 +840,17 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 				allFloat64 = false
 				break
 			}
-			if _, ok := raw[column].(float64); !ok {
+			value, ok := raw[column].(float64)
+			// Like the adaptive full-sort path, only switch algorithms when
+			// the keys have a total order. NaN retains its generic ordering.
+			if !ok || (unlimited && math.IsNaN(value)) {
 				allFloat64 = false
 				break
 			}
 		}
 		validatePhase.finish(0)
 		if allFloat64 {
-			rs, err := executeSimpleSelectFloatOrderedTopN(env, plan, sourceRows, column, keepCount, fullSort)
+			rs, err := executeSimpleSelectFloatOrderedTopN(env, plan, sourceRows, column, keepCount, unlimited || fullSort)
 			return rs, true, err
 		}
 	}

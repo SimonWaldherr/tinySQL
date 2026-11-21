@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"testing"
@@ -135,6 +136,35 @@ func TestRawOrderMixedNumericNullAndStableTies(t *testing.T) {
 		limit, offset := page[0], page[1]
 		start, end := min(offset, len(want)), min(offset+limit, len(want))
 		assertIDs(fmt.Sprintf("%s LIMIT %d OFFSET %d", ordered, limit, offset), want[start:end])
+	}
+}
+
+func TestRawUnboundedFloatOrderingMatchesGeneric(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	fast := storage.NewTable("float_order", []storage.Column{{Name: "id", Type: storage.IntType}, {Name: "val", Type: storage.Float64Type}}, false)
+	// Keep the raw keys identical and use the declared type to keep the
+	// reference on the generic sorting path.
+	general := storage.NewTable("generic_order", []storage.Column{{Name: "id", Type: storage.IntType}, {Name: "val", Type: storage.TextType}}, false)
+	values := []float64{2, math.Inf(1), -1, math.Copysign(0, -1), 0, 2, math.Inf(-1)}
+	for i := range 140 {
+		fast.Rows = append(fast.Rows, []any{i, values[i%len(values)]})
+	}
+	general.Rows = fast.Rows
+	for _, table := range []*storage.Table{fast, general} {
+		if err := db.Put("default", table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, last := range []any{2.0, nil, math.NaN(), int64(2)} {
+		fast.Rows[len(fast.Rows)-1][1] = last
+		for _, order := range []string{" ORDER BY val ASC NULLS FIRST", " ORDER BY val DESC NULLS LAST OFFSET 3"} {
+			got := execSQL(t, db, "SELECT id FROM float_order"+order)
+			want := execSQL(t, db, "SELECT id FROM generic_order"+order)
+			if !reflect.DeepEqual(got.Rows, want.Rows) {
+				t.Fatalf("last key %T(%v), %s: got %v, want %v", last, last, order, got.Rows, want.Rows)
+			}
+		}
 	}
 }
 
