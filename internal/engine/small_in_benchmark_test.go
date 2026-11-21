@@ -78,3 +78,51 @@ func BenchmarkInSelectPaths(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkWhereEqualityAlternatives(b *testing.B) {
+	db := storage.NewDB()
+	b.Cleanup(func() { _ = db.Close() })
+	const rows = 50_000
+	table := storage.NewTable("where_choices", []storage.Column{
+		{Name: "id", Type: storage.IntType}, {Name: "tag", Type: storage.TextType},
+	}, false)
+	for i := range rows {
+		table.Rows = append(table.Rows, []any{i, fmt.Sprintf("tag-%d", i%100)})
+	}
+	if err := db.Put("default", table); err != nil {
+		b.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		count int
+		text  bool
+	}{
+		{"integer_2", 2, false}, {"integer_16", 16, false}, {"text_16", 16, true},
+	} {
+		terms := make([]string, tc.count)
+		for i := range terms {
+			if tc.text {
+				terms[i] = fmt.Sprintf("tag = 'tag-%d'", i)
+			} else {
+				terms[i] = fmt.Sprintf("id = %d", i*1000)
+			}
+		}
+		want := tc.count
+		if tc.text {
+			want *= rows / 100
+		}
+		b.Run(tc.name, func(b *testing.B) {
+			stmt := mustParse("SELECT COUNT(*) AS n FROM where_choices WHERE " + strings.Join(terms, " OR "))
+			b.ReportAllocs()
+			for b.Loop() {
+				got, err := Execute(b.Context(), db, "default", stmt)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(got.Rows) != 1 || got.Rows[0]["n"] != want {
+					b.Fatalf("got %v, want %d matches", got.Rows, want)
+				}
+			}
+		})
+	}
+}

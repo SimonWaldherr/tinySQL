@@ -177,12 +177,14 @@ func rowToTextLikeMatcher(e Expr) (func(string) bool, bool) {
 // buildRawFilterSpecialized/buildRawExprFilter to handle the expression as
 // before.
 func buildRawRowToTextAndFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
-	conjuncts := flattenAndConjuncts(e)
-	if len(conjuncts) < 2 {
+	if binary, ok := e.(*Binary); !ok || binary.Op != "AND" {
 		return nil
 	}
+	var scratch [8]Expr
+	conjuncts := appendAndConjuncts(scratch[:0], e)
 	var matchers []func(string) bool
-	var rest []Expr
+	// Compact in place. The write position never passes the current input.
+	rest := conjuncts[:0]
 	for _, c := range conjuncts {
 		if m, ok := rowToTextLikeMatcher(c); ok {
 			matchers = append(matchers, m)
@@ -447,6 +449,9 @@ func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]
 	if filter := buildRawRangeFilter(colIndex, leftExpr, rightExpr, true); filter != nil {
 		return filter
 	}
+	if filter := buildRawEqualityOrFilter(colIndex, leftExpr, rightExpr); filter != nil {
+		return filter
+	}
 	left := buildRawFilterSpecialized(colIndex, leftExpr)
 	right := buildRawFilterSpecialized(colIndex, rightExpr)
 	if left != nil && right != nil {
@@ -494,6 +499,60 @@ func buildRawOrFilter(colIndex map[string]int, leftExpr, rightExpr Expr) func([]
 	}
 	return buildRawOrFilterWithFallback(colIndex, rightExpr, left)
 
+}
+
+// A disjunction of constant equalities on one column can probe the same
+// membership sets as IN. WHERE excludes both UNKNOWN and FALSE. Keep bound
+// literals and other predicates on their normal paths so rebinding and error
+// evaluation still work.
+func buildRawEqualityOrFilter(columns map[string]int, left, right Expr) func([]any) (bool, error) {
+	var scratch [8]any
+	values := scratch[:0]
+	column := -1
+	// Limit both work and recursion when testing a large or mixed OR tree.
+	const maxAlternatives = 64
+	budget := 2*maxAlternatives - 2
+	if !appendRawEqualityAlternatives(columns, left, &column, &values, &budget) ||
+		!appendRawEqualityAlternatives(columns, right, &column, &values, &budget) || len(values) == 0 {
+		return nil
+	}
+	return buildInFilter(column, values, false)
+}
+
+func appendRawEqualityAlternatives(columns map[string]int, expr Expr, column *int, values *[]any, budget *int) bool {
+	if *budget == 0 {
+		return false
+	}
+	*budget = *budget - 1
+	binary, ok := expr.(*Binary)
+	if !ok {
+		return false
+	}
+	if binary.Op == "OR" {
+		return appendRawEqualityAlternatives(columns, binary.Left, column, values, budget) &&
+			appendRawEqualityAlternatives(columns, binary.Right, column, values, budget)
+	}
+	if binary.Op != "=" {
+		return false
+	}
+	ref, ok := binary.Left.(*VarRef)
+	literal, literalOK := binary.Right.(*Literal)
+	if !ok || !literalOK {
+		ref, ok = binary.Right.(*VarRef)
+		literal, literalOK = binary.Left.(*Literal)
+	}
+	if !ok || !literalOK || literal.Parameter {
+		return false
+	}
+	index, ok := columns[strings.ToLower(ref.Name)]
+	if !ok || index < 0 || (*column >= 0 && *column != index) {
+		return false
+	}
+	*column = index
+	if literal.Val != nil {
+		*values = append(*values, literal.Val)
+	}
+	return true
 }
 
 func buildRawOrFilterWithFallback(colIndex map[string]int, expr Expr, fastFilter func([]any) (bool, error)) func([]any) (bool, error) {

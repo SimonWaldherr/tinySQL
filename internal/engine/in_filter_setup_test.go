@@ -74,6 +74,79 @@ func TestInFilterDomainsCountScans(t *testing.T) {
 	}
 }
 
+func TestRawEqualityOrMatchesSeparateComparisons(t *testing.T) {
+	columns := map[string]int{"v": 0, "t.v": 0}
+	values := []any{
+		nil, 1, int64(9007199254740993), float64(9007199254740992), math.Copysign(0, -1),
+		math.NaN(), math.Inf(1), "x", true, []byte("x"), big.NewRat(1, 2),
+	}
+	probes := append(values, int64(9007199254740992), 0.0, "other", false, []byte("other"))
+	for _, literals := range [][]any{{nil, 1}, {"x", "y"}, {int64(9007199254740993), 7}, values} {
+		var tree *Binary
+		separate := make([]func([]any) (bool, error), 0, len(literals))
+		for i, value := range literals {
+			leaf := &Binary{Op: "=", Left: &Literal{Val: value}, Right: &VarRef{Name: "t.v"}}
+			if i%2 != 0 {
+				leaf.Left, leaf.Right = &VarRef{Name: "V"}, leaf.Left
+			}
+			separate = append(separate, buildRawComparisonFilter(columns, leaf))
+			if tree == nil {
+				tree = leaf
+			} else {
+				tree = &Binary{Op: "OR", Left: tree, Right: leaf}
+			}
+		}
+		filter := buildRawEqualityOrFilter(columns, tree.Left, tree.Right)
+		if filter == nil {
+			t.Fatalf("failed to compile equalities for %v", literals)
+		}
+		for _, value := range probes {
+			row := []any{value}
+			want := false
+			for _, equal := range separate {
+				match, err := equal(row)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want = want || match
+			}
+			if got, err := filter(row); err != nil || got != want {
+				t.Fatalf("%T(%v) with %v: got %t / %v, want %t", value, value, literals, got, err, want)
+			}
+		}
+	}
+}
+
+func TestRawEqualityOrLeavesParametersAndOtherPredicatesDynamic(t *testing.T) {
+	columns := map[string]int{"v": 0, "w": 1}
+	for _, predicate := range []string{"v = 1 OR w = 2", "v = 1 OR unknown = 2", "v = 1 OR v = 2/0", "v = 1 OR v > 2"} {
+		call := mustParse("SELECT v FROM t WHERE " + predicate).(*Select).Where.(*Binary)
+		if buildRawEqualityOrFilter(columns, call.Left, call.Right) != nil {
+			t.Fatalf("unexpected membership filter for %s", predicate)
+		}
+	}
+	call := mustParse("SELECT v FROM t WHERE v = 1 OR v = 2").(*Select).Where.(*Binary)
+	parameter := call.Left.(*Binary).Right.(*Literal)
+	parameter.Parameter = true
+	if buildRawEqualityOrFilter(columns, call.Left, call.Right) != nil {
+		t.Fatal("compiled a bound value into a fixed set")
+	}
+	filter := buildRawFilter(columns, call)
+	for _, value := range []any{1, int64(1), 1.0, nil, 2, "1"} {
+		parameter.Val = value
+		if got, err := filter([]any{1}); err != nil || got != rawEqual(1, value) {
+			t.Fatalf("bound %T(%v): got %t / %v", value, value, got, err)
+		}
+	}
+	// The raw WHERE membership test must not be inverted under NOT.
+	for _, predicate := range []string{"NOT (v = 1 OR v = NULL)", "NOT (v = NULL OR v = NULL)"} {
+		expr := mustParse("SELECT v FROM t WHERE " + predicate).(*Select).Where
+		if got, err := buildRawFilter(columns, expr)([]any{3}); err != nil || got {
+			t.Fatalf("%s: got %t / %v, want UNKNOWN excluded", predicate, got, err)
+		}
+	}
+}
+
 var inFilterSetupSink func([]any) (bool, error)
 
 func BenchmarkInFilterSetup(b *testing.B) {

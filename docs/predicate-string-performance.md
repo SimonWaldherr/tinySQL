@@ -102,3 +102,34 @@ boundaries, NULLs, NaNs and mixed domains. They also check literal ownership,
 filtered vector rankings, parameter changes and indexed-versus-scan results.
 REPL tests use a driver that overwrites its BLOB buffer on every row and on
 close, and fails after partial results to check error-only text and HTML output.
+
+## OR chains of equalities
+
+The WHERE compiler uses one membership probe for literal equalities on a
+single column, such as `id = 1 OR id = 2 OR id = 3`. The scan reuses the
+typed `IN` probes, including exact integer equality and mixed integer/float
+comparison rules. Parameterized equalities and mixed predicates use their
+usual evaluators. `NOT` evaluates SQL's three-valued result before filtering.
+The `AND` compiler also gathers terms into reusable scratch space when
+checking for combined `ROW_TO_TEXT` predicates.
+
+Medians of seven alternating runs on Apple M2 Max with Go 1.27.4 and
+`GOMAXPROCS=2`, against `bbc1275`. Each OR benchmark counts matches over
+50,000 rows without an index.
+
+| Predicate | Before | After | Bytes/op before → after | Allocs/op before → after |
+|---|---:|---:|---:|---:|
+| Two integer equalities | 435.5 µs | 258.0 µs | 2,144 → 2,248 | 22 → 21 |
+| 16 integer equalities | 3.29 ms | 0.55 ms | 3,127 → 4,953 | 52 → 37 |
+| 16 text equalities | 3.45 ms | 0.56 ms | 3,135 → 4,345 | 53 → 31 |
+
+Larger lists allocate more bytes per statement to build the lookup sets.
+In the `BETWEEN` count benchmarks the compiler allocates three fewer objects
+per query for both literal and parameter bounds. The `BETWEEN` and `IN`
+control timings moved by less than 1%.
+
+```sh
+GOMAXPROCS=2 go test ./internal/engine -run '^$' \
+  -bench '^Benchmark(WhereEqualityAlternatives|BetweenCountScan)$' \
+  -benchmem -count=7 -benchtime=150ms
+```

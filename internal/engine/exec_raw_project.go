@@ -544,14 +544,11 @@ func buildRawFilter(colIndex map[string]int, e Expr) func([]any) (bool, error) {
 	return buildRawExprFilter(colIndex, e)
 }
 
-// flattenAndConjuncts splits a (possibly deeply nested, e.g. left- or
-// right-associative) chain of AND-combined Binary nodes into its leaf
-// conjuncts, in left-to-right order. A non-AND node returns a single-element
-// slice containing itself.
-func flattenAndConjuncts(e Expr) []Expr {
+// appendAndConjuncts appends the leaves of an AND chain in source order.
+func appendAndConjuncts(dst []Expr, e Expr) []Expr {
 	b, ok := e.(*Binary)
 	if !ok || b.Op != "AND" {
-		return []Expr{e}
+		return append(dst, e)
 	}
-	return append(flattenAndConjuncts(b.Left), flattenAndConjuncts(b.Right)...)
+	return appendAndConjuncts(appendAndConjuncts(dst, b.Left), b.Right)
 }
