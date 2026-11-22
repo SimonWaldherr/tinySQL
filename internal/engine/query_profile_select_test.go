@@ -179,6 +179,14 @@ func TestQueryProfileConcurrentProcedureReadsKeepSummary(t *testing.T) {
 	if measured != 1 {
 		t.Errorf("measured phases = %d, want 1", measured)
 	}
+	result, profile, err := ExecuteWithProfile(t.Context(), db, "default", mustParse("CALL "+procedure+"()"))
+	if err != nil || result == nil || len(result.Rows) != 1 {
+		t.Fatalf("profiled CALL = %#v, error %v", result, err)
+	}
+	stages := checkExecutionProfile(t, profile, 1)
+	if run := stages["RUN"]; run.Parent != 1 || run.Self != run.Total || len(profile.Stages) != 3 {
+		t.Fatalf("CALL should keep its child work in dispatch time: %+v", profile)
+	}
 	if !reflect.DeepEqual(table.Rows, [][]any{{1}, {2}}) {
 		t.Errorf("concurrent procedure reads modified source rows: %#v", table.Rows)
 	}

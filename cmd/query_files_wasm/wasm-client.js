@@ -3,7 +3,7 @@
     'use strict';
 
     const METHODS = [
-        'importFile', 'executeQuery', 'executeQueryStream', 'executeMulti', 'getResultPage',
+        'importFile', 'executeQuery', 'executeQueryStream', 'analyzeQueryStream', 'executeMulti', 'getResultPage',
         'clearDatabase', 'dropTable', 'listTables', 'exportResults',
         'getTableSchema', 'exportDatabase', 'exportDatabaseBytes',
         'importDatabase', 'importDatabaseBytes', 'validateDatabaseBytes',
@@ -302,7 +302,7 @@
     }
 
     for (const method of METHODS) {
-        if (method === 'executeQueryStream' || method === 'importDatabaseBytes' || method === 'validateDatabaseBytes') continue;
+        if (method === 'executeQueryStream' || method === 'analyzeQueryStream' || method === 'importDatabaseBytes' || method === 'validateDatabaseBytes') continue;
         TinySQLWasmClient.prototype[method] = function wasmMethod(...args) {
             return this.call(method, args);
         };
@@ -310,6 +310,10 @@
 
     TinySQLWasmClient.prototype.executeQueryStream = function executeQueryStream(sql, options = {}) {
         return this.call('executeQueryStream', [sql], options);
+    };
+
+    TinySQLWasmClient.prototype.analyzeQueryStream = function analyzeQueryStream(sql, options = {}) {
+        return this.call('analyzeQueryStream', [sql], options);
     };
 
     // Pass raw workspace snapshots through the worker as transferables. The

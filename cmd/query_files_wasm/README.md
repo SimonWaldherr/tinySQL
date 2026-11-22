@@ -62,6 +62,14 @@ refine the query or add LIMIT before exporting a complete result. Blocking
 shapes such as joins, ORDER BY, aggregates, DISTINCT, and CTEs materialize
 before producing their first row.
 
+**Analyze query** runs `EXPLAIN ANALYZE` for one SELECT in the editor or the
+current selection. It leaves the editor intact and displays the measured
+execution stages in the result grid. Compare `self_ns` across stages to find
+where execution spent its time. The browser request duration also includes
+work to prepare and stream the result. See the
+[query analyzer guide](../../docs/query-analyzer.md) for the column definitions
+and measurement scope.
+
 Browser imports are limited to 64 MiB; snapshot imports are limited to 256 MiB.
 Those limits protect the most expensive local paths, not the total memory used
 by an in-memory database.

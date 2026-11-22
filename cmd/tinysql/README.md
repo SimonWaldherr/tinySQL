@@ -36,6 +36,7 @@ the first argument, so they too must precede their flags.
 | `-mode` | Output mode: `column`, `list`, `csv`, `json`, `jsonl`/`ndjson`, `table`, `geojson`, `topojson` | `column` |
 | `-header` | Include column headers | `true` |
 | `-echo` | Echo SQL before execution | `false` |
+| `-profile` | Report elapsed statement time and execution stages on stderr | `false` |
 | `-cmd` | Run this SQL and exit | — |
 | `-batch` | Force batch mode (error if no SQL) | `false` |
 | `-output` | Write output to this file, not stdout | — |
@@ -88,7 +89,7 @@ running, Ctrl+C cancels that query and returns to the prompt.
 | `.schema ?TABLE?` | Show CREATE statements |
 | `.mode MODE` | Set output mode (no arg: print current) |
 | `.headers on\|off` | Toggle header display |
-| `.timer on\|off` | Toggle SQL timer (no arg: print state) |
+| `.timer on\|off\|profile` | Show total or detailed SQL timing, or report the current mode without an argument |
 | `.nullvalue STRING` | Print STRING for NULL values |
 | `.read FILENAME` | Execute SQL in FILENAME |
 | `.save FILENAME` | Write in-memory database to FILENAME |
@@ -96,6 +97,24 @@ running, Ctrl+C cancels that query and returns to the prompt.
 | `.import FILE [TABLE]` | Import a file into a table (CSV, JSON, GeoJSON, TopoJSON, KML, OSM XML, GeoPackage, MBTiles, ...) |
 | `.count [TABLE...]` | Show row counts |
 | `.stats` | Database statistics |
+
+## Query timing
+
+Use `.timer profile` in the shell or `-profile` on the command line to measure
+each statement while receiving its ordinary results.
+
+```bash
+./tinysql -profile data.tsql "SELECT id, total FROM orders WHERE total > 100 ORDER BY total"
+./tinysql query -profile -mode json data.tsql "SELECT COUNT(*) FROM orders" > result.json
+```
+
+The timing report goes to stderr. It shows total elapsed time, SQL parsing,
+database execution, and result formatting and writing separately. Profile
+mode materializes results before formatting, including in CSV and JSON modes.
+Each execution stage reports its inclusive time and its own time (`Self`),
+plus invocation and row counts. Start with the largest `Self` value to find
+where execution spent time. See [Query analyzer](../../docs/query-analyzer.md)
+for the SQL equivalent and how to interpret measurements.
 
 ## Subcommands
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/engine"
 	"github.com/SimonWaldherr/tinySQL/internal/sqlbind"
@@ -34,6 +35,14 @@ type Row = engine.Row
 // ResultSet holds query results with column names and data rows.
 // Returned by SELECT queries and available for inspection.
 type ResultSet = engine.ResultSet
+
+// QueryProfile records wall-clock parsing, statement execution and measured
+// execution stages. Its durations exclude client-side result formatting.
+type QueryProfile = engine.QueryProfile
+
+// QueryStage is a measured execution stage. Total includes measured children;
+// Self is the remainder after subtracting their time.
+type QueryStage = engine.QueryStage
 
 // ColumnarResultSet holds positional result columns without a map per row.
 type ColumnarResultSet = engine.ColumnarResultSet
@@ -238,6 +247,13 @@ func Execute(ctx context.Context, db *DB, tenant string, stmt Statement) (*Resul
 	return engine.Execute(ctx, db, tenant, stmt)
 }
 
+// ExecuteWithProfile executes a parsed statement once, returning its ordinary
+// result and an execution profile. ParseTime is zero for an already parsed
+// statement. The profile also records stages completed before an error.
+func ExecuteWithProfile(ctx context.Context, db *DB, tenant string, stmt Statement) (*ResultSet, QueryProfile, error) {
+	return engine.ExecuteWithProfile(ctx, db, tenant, stmt)
+}
+
 // ExecuteColumnar executes a SELECT into Values[column][row]. Simple scans
 // avoid Row maps; complex SELECTs transpose the ordinary executor's result.
 func ExecuteColumnar(ctx context.Context, db *DB, tenant string, stmt Statement) (*ColumnarResultSet, error) {
@@ -280,6 +296,21 @@ func ExecSQL(ctx context.Context, db *DB, tenant, sql string) (*ResultSet, error
 		return nil, err
 	}
 	return Execute(ctx, db, tenant, stmt)
+}
+
+// ExecSQLWithProfile measures parsing and execution of exactly one SQL
+// statement. It returns the ordinary result and measures parsing even when
+// the SQL is invalid. The statement executes only after parsing succeeds.
+func ExecSQLWithProfile(ctx context.Context, db *DB, tenant, sql string) (*ResultSet, QueryProfile, error) {
+	started := time.Now()
+	stmt, err := ParseSQL(sql)
+	parseTime := time.Since(started)
+	if err != nil {
+		return nil, QueryProfile{ParseTime: parseTime}, err
+	}
+	result, profile, err := ExecuteWithProfile(ctx, db, tenant, stmt)
+	profile.ParseTime = parseTime
+	return result, profile, err
 }
 
 // ExecSQLArgs binds args to the ?, $n or :n placeholders of one SQL

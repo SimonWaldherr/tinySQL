@@ -42,11 +42,14 @@ type Config struct {
 	Echo      bool
 	Batch     bool
 	Timer     bool
+	Profile   bool
 	NullValue string
 	Mode      OutputMode
 	// GeomCol names the geometry column for ModeGeoJSON/ModeTopoJSON.
 	// Empty auto-detects it (see exporter.ExportGeoJSON/ExportTopoJSON).
 	GeomCol string
+	// Profile diagnostics default to stderr and keep the result stream clean.
+	diagnostics io.Writer
 }
 
 type OutputMode string
@@ -133,6 +136,7 @@ func runCLI(args []string) (runErr error) {
 		echo    = fs.Bool("echo", false, "Echo SQL before execution")
 		cmd     = fs.String("cmd", "", "Run specific SQL and exit")
 		batch   = fs.Bool("batch", false, "Force batch mode")
+		profile = fs.Bool("profile", false, "Report per-statement timing and execution stages on stderr")
 		outFile = fs.String("output", "", "Write output to file")
 		geomCol = fs.String("geom-col", "", "Geometry column for -mode geojson|topojson (auto-detected if omitted)")
 		version = fs.Bool("version", false, "Print version and exit")
@@ -160,6 +164,7 @@ func runCLI(args []string) (runErr error) {
 		Header:    *headers,
 		Echo:      *echo,
 		Batch:     *batch,
+		Profile:   *profile,
 		Mode:      selectedMode,
 		NullValue: "", // default empty for column mode, usually
 		GeomCol:   *geomCol,
@@ -606,20 +611,25 @@ func (r *Repl) handleMeta(line string) error {
 		}
 	case ".timer":
 		if len(args) < 1 {
-			if r.cfg.Timer {
+			switch {
+			case r.cfg.Profile:
+				fmt.Fprintln(r.out, "timer: profile")
+			case r.cfg.Timer:
 				fmt.Fprintln(r.out, "timer: on")
-			} else {
+			default:
 				fmt.Fprintln(r.out, "timer: off")
 			}
 			return nil
 		}
 		switch strings.ToLower(args[0]) {
 		case "on":
-			r.cfg.Timer = true
+			r.cfg.Timer, r.cfg.Profile = true, false
 		case "off":
-			r.cfg.Timer = false
+			r.cfg.Timer, r.cfg.Profile = false, false
+		case "profile":
+			r.cfg.Timer, r.cfg.Profile = false, true
 		default:
-			return errors.New("usage: .timer on|off")
+			return errors.New("usage: .timer on|off|profile")
 		}
 	case ".nullvalue":
 		if len(args) < 1 {
@@ -673,7 +683,7 @@ func printHelp(out io.Writer) {
 .schema ?TABLE?        Show the CREATE statements
 .stats                 Show database statistics
 .tables                List names of tables
-.timer on|off          Turn SQL timer on or off`)
+.timer on|off|profile  Show total or detailed SQL timing`)
 }
 
 // dumpTables outputs INSERT statements for specified tables (or all).
@@ -870,9 +880,17 @@ func execute(ctx context.Context, db *tsql.DB, cfg *Config, sqlText string, out 
 	stmts := splitStatements(sqlText)
 	dirty := false
 
-	for _, stmtSQL := range stmts {
+	for i, stmtSQL := range stmts {
 		if cfg.Echo {
 			fmt.Fprintln(out, stmtSQL)
+		}
+		if cfg.Profile {
+			changed, err := executeProfiledStatement(ctx, db, cfg, i+1, stmtSQL, out)
+			dirty = dirty || changed
+			if err != nil {
+				return dirty, err
+			}
+			continue
 		}
 
 		start := time.Now()
@@ -922,6 +940,52 @@ func execute(ctx context.Context, db *tsql.DB, cfg *Config, sqlText string, out 
 		}
 	}
 	return dirty, nil
+}
+
+func executeProfiledStatement(ctx context.Context, db *tsql.DB, cfg *Config, statement int, sql string, out io.Writer) (bool, error) {
+	started := time.Now()
+	result, profile, err := tsql.ExecSQLWithProfile(ctx, db, cfg.Tenant, sql)
+	dirty := err == nil && result == nil
+	var outputTime time.Duration
+	if err == nil && result != nil {
+		outputStart := time.Now()
+		err = getPrinter(cfg.Mode).Print(out, result, cfg)
+		outputTime = time.Since(outputStart)
+	}
+	total := time.Since(started)
+	diagnostics := cfg.diagnostics
+	if diagnostics == nil {
+		diagnostics = os.Stderr
+	}
+	status := "completed"
+	if err != nil {
+		status = "failed"
+	}
+	fmt.Fprintf(diagnostics, "Statement %d %s in %s (parse %s, execute %s, output %s)\n",
+		statement, status, total, profile.ParseTime, profile.Elapsed, outputTime)
+	printProfileStages(diagnostics, profile.Stages)
+	return dirty, err
+}
+
+func printProfileStages(out io.Writer, stages []tsql.QueryStage) {
+	if len(stages) == 0 {
+		return
+	}
+	table := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(table, "Step\tParent\tStage\tTotal\tSelf\tCalls\tRows\tDetail")
+	for i, stage := range stages {
+		parent := "-"
+		if stage.Parent != 0 {
+			parent = strconv.Itoa(stage.Parent)
+		}
+		detail := ""
+		if stage.Detail != "" {
+			detail = strconv.Quote(stage.Detail)
+		}
+		fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
+			i+1, parent, stage.Operation, stage.Total, stage.Self, stage.Calls, stage.Rows, detail)
+	}
+	table.Flush()
 }
 
 func isStreamingOutputMode(mode OutputMode) bool {
@@ -1229,12 +1293,18 @@ func (lp *ListPrinter) Print(out io.Writer, rs *tsql.ResultSet, cfg *Config) err
 	for _, row := range rs.Rows {
 		for i, col := range rs.Cols {
 			if i > 0 {
-				fmt.Fprint(out, "|")
+				if _, err := io.WriteString(out, "|"); err != nil {
+					return err
+				}
 			}
 			val, _ := tsql.GetVal(row, col)
-			fmt.Fprint(out, fmtScalar(val, cfg.NullValue))
+			if _, err := io.WriteString(out, fmtScalar(val, cfg.NullValue)); err != nil {
+				return err
+			}
 		}
-		fmt.Fprintln(out)
+		if _, err := io.WriteString(out, "\n"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1544,6 +1614,7 @@ func runQueryUtil(args []string) (runErr error) {
 	tenant := fs.String("tenant", "default", "Tenant")
 	mode := fs.String("mode", "table", "Output mode")
 	headers := fs.Bool("header", true, "Include column headers")
+	profile := fs.Bool("profile", false, "Report per-statement timing and execution stages on stderr")
 	storageFlags := addStorageFlags(fs)
 	if done, err := parseCLIFlags(fs, args); done {
 		return err
@@ -1576,7 +1647,7 @@ func runQueryUtil(args []string) (runErr error) {
 	}()
 
 	sql := strings.Join(fs.Args()[1:], " ")
-	cfg := &Config{Tenant: *tenant, Mode: selectedMode, Header: *headers}
+	cfg := &Config{Tenant: *tenant, Mode: selectedMode, Header: *headers, Profile: *profile}
 	return runWithSignalContext(func(ctx context.Context) error {
 		dirty, err := execute(ctx, db, cfg, sql, os.Stdout)
 		if err != nil {

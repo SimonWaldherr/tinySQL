@@ -57,9 +57,22 @@ var activeStreamQueries = struct {
 // part of the public UI API. Work is consumed in small timer-scheduled chunks
 // so the Worker can process a cancellation message between result batches.
 func executeQueryStream(_ js.Value, args []js.Value) interface{} {
+	return startQueryStreamRequest(args, false)
+}
+
+// analyzeQueryStream uses the same result transport and cancellation as a
+// normal query, with a read-only statement check before execution.
+func analyzeQueryStream(_ js.Value, args []js.Value) interface{} {
+	return startQueryStreamRequest(args, true)
+}
+
+func startQueryStreamRequest(args []js.Value, analyze bool) interface{} {
 	request := telemetry.begin("query")
 	if len(args) < 2 || args[0].Type() != js.TypeNumber {
 		telemetry.finish(request, false, false)
+		if analyze {
+			return jsErr("Usage: analyzeQueryStream(requestId, sqlQuery)")
+		}
 		return jsErr("Usage: executeQueryStream(requestId, sqlQuery)")
 	}
 
@@ -69,6 +82,9 @@ func executeQueryStream(_ js.Value, args []js.Value) interface{} {
 		return jsErr("stream request id must be a positive integer")
 	}
 	query, err := normalizeSQLInput(args[1].String())
+	if err == nil && analyze {
+		query, err = queryAnalysisSQL(query)
+	}
 	if err != nil {
 		telemetry.finish(request, false, false)
 		return jsErr(err.Error())

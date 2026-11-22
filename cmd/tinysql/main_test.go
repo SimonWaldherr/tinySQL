@@ -48,6 +48,18 @@ func TestBuildTinysql(t *testing.T) {
 			t.Fatalf("tinysql %s = %q, want %q", arg, got, want)
 		}
 	}
+	for _, args := range [][]string{
+		{"--profile", "-mode", "json", ":memory:", "SELECT 1 AS n"},
+		{"query", "-profile", "-mode", "json", ":memory:", "SELECT 1 AS n"},
+	} {
+		command := exec.Command(out, args...)
+		var diagnostics bytes.Buffer
+		command.Stderr = &diagnostics
+		output, err := command.Output()
+		if err != nil || !json.Valid(output) || !strings.Contains(diagnostics.String(), "Statement 1 completed") {
+			t.Fatalf("tinysql %v: stdout=%q stderr=%q err=%v", args, output, diagnostics.String(), err)
+		}
+	}
 }
 
 func TestShellAndReplSubcommandsRouteToMainCLI(t *testing.T) {
@@ -248,6 +260,57 @@ func TestExecute_Timer(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "Run Time:") {
 		t.Errorf("expected 'Run Time:' in timer output, got:\n%s", out)
+	}
+}
+
+func TestExecuteProfileKeepsJSONCleanAndExecutesEachStatementOnce(t *testing.T) {
+	db := setupTestDB(t)
+	t.Cleanup(func() { db.Close() })
+	var output, diagnostics bytes.Buffer
+	cfg := &Config{Tenant: "default", Mode: ModeJSON, Profile: true, diagnostics: &diagnostics}
+	dirty, err := execute(t.Context(), db, cfg, "INSERT INTO users VALUES (3, 'Carol', NULL); SELECT COUNT(*) AS n FROM users", &output)
+	if err != nil || !dirty {
+		t.Fatalf("execute with profile: dirty=%t, err=%v", dirty, err)
+	}
+	var rows []map[string]int
+	if err := json.Unmarshal(output.Bytes(), &rows); err != nil || len(rows) != 1 || rows[0]["n"] != 3 {
+		t.Fatalf("profiled query: stdout=%q, err=%v", output.String(), err)
+	}
+	for _, expected := range []string{"Statement 1 completed", "Statement 2 completed", "parse ", "execute ", "output ", "Total", "Self", "SELECT"} {
+		if !strings.Contains(diagnostics.String(), expected) {
+			t.Errorf("missing %q in profile:\n%s", expected, diagnostics.String())
+		}
+	}
+}
+
+func TestExecuteProfileReportsFailures(t *testing.T) {
+	db := setupTestDB(t)
+	t.Cleanup(func() { db.Close() })
+	for _, query := range []string{"SELECT )", "SELECT name FROM missing"} {
+		var output, diagnostics bytes.Buffer
+		cfg := &Config{Tenant: "default", Mode: ModeJSON, Profile: true, diagnostics: &diagnostics}
+		dirty, err := execute(t.Context(), db, cfg, query, &output)
+		if err == nil || dirty || output.Len() != 0 || !strings.Contains(diagnostics.String(), "Statement 1 failed") {
+			t.Fatalf("%q: dirty=%t, stdout=%q, diagnostics=%q, err=%v", query, dirty, output.String(), diagnostics.String(), err)
+		}
+	}
+}
+
+func TestExecuteProfileReportsListOutputFailure(t *testing.T) {
+	db := setupTestDB(t)
+	t.Cleanup(func() { db.Close() })
+	output, err := os.Create(filepath.Join(t.TempDir(), "result.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var diagnostics bytes.Buffer
+	cfg := &Config{Tenant: "default", Mode: ModeList, Profile: true, diagnostics: &diagnostics}
+	_, err = execute(t.Context(), db, cfg, "SELECT id FROM users", output)
+	if !errors.Is(err, os.ErrClosed) || !strings.Contains(diagnostics.String(), "Statement 1 failed") {
+		t.Fatalf("closed result file: diagnostics=%q, err=%v", diagnostics.String(), err)
 	}
 }
 
@@ -706,6 +769,17 @@ func TestReplHandleMeta_Timer(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "on") {
 		t.Errorf("expected timer status, got:\n%s", buf.String())
+	}
+
+	if err := r.handleMeta(".timer profile"); err != nil || !cfg.Profile || cfg.Timer {
+		t.Fatalf("handleMeta(.timer profile): profile=%t timer=%t, err=%v", cfg.Profile, cfg.Timer, err)
+	}
+	buf.Reset()
+	if err := r.handleMeta(".timer"); err != nil || strings.TrimSpace(buf.String()) != "timer: profile" {
+		t.Fatalf("profile status: output=%q, err=%v", buf.String(), err)
+	}
+	if err := r.handleMeta(".timer off"); err != nil || cfg.Profile || cfg.Timer {
+		t.Fatalf("handleMeta(.timer off): profile=%t timer=%t, err=%v", cfg.Profile, cfg.Timer, err)
 	}
 }
 

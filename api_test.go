@@ -45,6 +45,37 @@ func TestPublicAPIWrappers(t *testing.T) {
 	}()
 }
 
+func TestExecSQLWithProfile(t *testing.T) {
+	db := tsql.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	const tenant = "default"
+	if _, err := tsql.ExecSQL(t.Context(), db, tenant, "CREATE TABLE timings (id INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, profile, err := tsql.ExecSQLWithProfile(t.Context(), db, tenant, "INSERT INTO timings VALUES (1)"); err != nil || len(profile.Stages) == 0 {
+		t.Fatalf("profiled insert: %+v, %v", profile, err)
+	}
+	if _, profile, err := tsql.ExecSQLWithProfile(t.Context(), db, tenant, "INSERT INTO timings VALUES (2); SELECT 1"); err == nil || profile.Elapsed != 0 || len(profile.Stages) != 0 {
+		t.Fatalf("invalid statement reached execution: %+v, %v", profile, err)
+	}
+	result, profile, err := tsql.ExecSQLWithProfile(t.Context(), db, tenant, "SELECT id FROM timings WHERE id > 0")
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["id"] != 1 {
+		t.Fatalf("profiled select: %+v, %v", result, err)
+	}
+	if profile.ParseTime < 0 || profile.Elapsed < 0 || len(profile.Stages) < 2 {
+		t.Fatalf("missing select timings: %+v", profile)
+	}
+	for i, stage := range profile.Stages {
+		if stage.Parent < 0 || stage.Parent > i || stage.Calls < 1 || stage.Self < 0 || stage.Self > stage.Total {
+			t.Fatalf("invalid stage %d: %+v", i+1, stage)
+		}
+	}
+	stmt := tsql.MustParseSQL("SELECT id FROM missing_table")
+	if _, profile, err := tsql.ExecuteWithProfile(t.Context(), db, tenant, stmt); err == nil || profile.ParseTime != 0 || len(profile.Stages) == 0 {
+		t.Fatalf("profiled execution error: %+v, %v", profile, err)
+	}
+}
+
 func TestPublicSQLStateHelpers(t *testing.T) {
 	base := fmt.Errorf("bad sql")
 	err := tsql.WithSQLState(tsql.SQLStateSyntaxError, base)

@@ -186,7 +186,7 @@ type ExecEnv struct {
 	// projections must preserve their schema without executing the source twice.
 	tableFuncColumns map[*TableFuncCall][]string
 	ctx              context.Context
-	// Profiling is execution-local and enabled only by EXPLAIN ANALYZE.
+	// Profiling is execution-local and opt-in.
 	// Child environments retain the collector and carry their own parent span.
 	profile       *queryProfile
 	profileParent int

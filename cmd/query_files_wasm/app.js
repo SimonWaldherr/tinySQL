@@ -47,6 +47,7 @@ let wasmApi = {
     importFile: null,
     executeQuery: null,
     executeQueryStream: null,
+    analyzeQueryStream: null,
     executeMulti: null,
     getResultPage: null,
     clearDatabase: null,
@@ -80,7 +81,7 @@ let activeQueryStreamProgress = null;
 let streamPreviewRenderTimer = null;
 const activeWorkerRequests = new Map();
 const workspaceChangingMethods = new Set([
-    'importFile', 'executeQuery', 'executeQueryStream', 'executeMulti', 'clearDatabase', 'dropTable',
+    'importFile', 'executeQuery', 'executeQueryStream', 'analyzeQueryStream', 'executeMulti', 'clearDatabase', 'dropTable',
     'importDatabase', 'importDatabaseBytes',
 ]);
 
@@ -1041,9 +1042,11 @@ function handleQueryStreamEvent(message) {
         : `${Math.max(retained, produced).toLocaleString()} rows`;
     updateStatus(`Query ${detail}: ${progress}`);
 
-    const executeButton = document.getElementById('executeBtn');
-    if (executeButton) {
-        executeButton.textContent = `${event.materialized ? '⏳ Materializing' : '⏳ Streaming'}…`;
+    const activeButton = document.getElementById(message.method === 'analyzeQueryStream' ? 'analyzeQueryBtn' : 'executeBtn');
+    if (activeButton) {
+        activeButton.textContent = message.method === 'analyzeQueryStream'
+            ? '⏳ Analyzing…'
+            : `${event.materialized ? '⏳ Materializing' : '⏳ Streaming'}…`;
     }
 }
 
@@ -1086,6 +1089,8 @@ async function initWasm() {
             activeWorkerRequests.clear();
             setRuntimeActivityHint(0);
             document.getElementById('executeBtn').disabled = true;
+            const analyzeButton = document.getElementById('analyzeQueryBtn');
+            if (analyzeButton) analyzeButton.disabled = true;
             statusIndicator?.classList.remove('loading', 'ready');
             statusIndicator?.classList.add('failed');
             updateStatus('Local engine stopped unexpectedly');
@@ -1126,6 +1131,8 @@ async function initWasm() {
         statusIndicator?.classList.remove('loading', 'failed');
         statusIndicator?.classList.add('ready');
         document.getElementById('executeBtn').disabled = false;
+        const analyzeButton = document.getElementById('analyzeQueryBtn');
+        if (analyzeButton) analyzeButton.disabled = typeof wasmApi.analyzeQueryStream !== 'function';
         await refreshRuntimeStatus();
         scheduleRuntimeStatusRefresh();
         // If any tables were registered client-side before WASM was ready,
@@ -3797,6 +3804,14 @@ function formatQuery() {
 
 // Execute query (UI handler)
 async function onExecuteClick() {
+    return runEditorQuery(false);
+}
+
+async function onAnalyzeClick() {
+    return runEditorQuery(true);
+}
+
+async function runEditorQuery(analyze) {
     if (queryExecutionInFlight) {
         showToast('A query is already running.', 'info');
         return;
@@ -3816,6 +3831,10 @@ async function onExecuteClick() {
         alert('WASM not ready yet...');
         return;
     }
+    if (analyze && typeof wasmApi.analyzeQueryStream !== 'function') {
+        showToast('Query analysis is unavailable in this local engine.', 'info');
+        return;
+    }
 
     queryExecutionInFlight = true;
     activeQueryStreamProgress = null;
@@ -3824,24 +3843,29 @@ async function onExecuteClick() {
         streamPreviewRenderTimer = null;
     }
     const executeBtn = document.getElementById('executeBtn');
+    const analyzeBtn = document.getElementById('analyzeQueryBtn');
+    const activeBtn = analyze ? analyzeBtn : executeBtn;
     const resultsContainer = document.getElementById('resultsContainer');
-    const useStreamingQuery = !hasMultipleSQLStatements(query) &&
-        typeof wasmApi.executeQueryStream === 'function';
+    const streamQuery = analyze ? wasmApi.analyzeQueryStream : wasmApi.executeQueryStream;
+    const useStreamingQuery = analyze || (!hasMultipleSQLStatements(query) && typeof streamQuery === 'function');
     activeQueryAbortController = useStreamingQuery ? new AbortController() : null;
     // A failed batch can still have committed earlier statements. Likewise,
     // an interrupted write may already have changed the in-memory database.
-    const mutationPossible = sqlMayMutate(query);
+    const mutationPossible = !analyze && sqlMayMutate(query);
     let querySent = false;
 
     executeBtn.disabled = true;
-    executeBtn.innerHTML = '<span class="spinner"></span> Running…';
+    if (analyzeBtn) analyzeBtn.disabled = true;
+    activeBtn.innerHTML = analyze
+        ? '<span class="spinner"></span> Analyzing…'
+        : '<span class="spinner"></span> Running…';
     setQueryCancellationState(useStreamingQuery);
     if (resultsContainer) {
         resultsContainer.setAttribute('aria-busy', 'true');
     }
     setOpenVanillaGridEnabled(false);
     
-    updateStatus('Executing query…');
+    updateStatus(analyze ? 'Analyzing query…' : 'Executing query…');
     setRuntimeActivityHint(1);
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
@@ -3854,10 +3878,10 @@ async function onExecuteClick() {
         // A single statement (including one with a trailing semicolon) uses
         // the bounded ResultStream preview. Scripts keep the established
         // materialized semantics until multi-statement streaming is added.
-        const hasMulti = hasMultipleSQLStatements(query) && typeof wasmApi.executeMulti === 'function';
+        const hasMulti = !useStreamingQuery && hasMultipleSQLStatements(query) && typeof wasmApi.executeMulti === 'function';
         querySent = true;
         const result = useStreamingQuery
-            ? await wasmApi.executeQueryStream(query, { signal: activeQueryAbortController.signal })
+            ? await streamQuery(query, { signal: activeQueryAbortController.signal })
             : hasMulti
                 ? await wasmApi.executeMulti(query)
                 : await wasmApi.executeQuery(query);
@@ -3897,12 +3921,15 @@ async function onExecuteClick() {
                 materialized: Boolean(result.materialized),
             };
             await renderResults(currentResults);
-            pushHistory(query, duration, currentResults.rowCount);
-            saveEditorState();
+            if (!analyze) {
+                pushHistory(query, duration, currentResults.rowCount);
+                saveEditorState();
+            }
             const resultCount = currentResults.truncated
                 ? `${currentResults.rowCount.toLocaleString()}+ preview rows`
                 : `${currentResults.rowCount.toLocaleString()} rows`;
-            updateStatus(`Query completed: ${resultCount} in ${duration}${result.statementsRun > 1 ? ` (${result.statementsRun} statements)` : ''}`);
+            updateStatus(analyze ? `Analysis completed in ${duration}`
+                : `Query completed: ${resultCount} in ${duration}${result.statementsRun > 1 ? ` (${result.statementsRun} statements)` : ''}`);
         } else {
             const errMsg = result && result.error ? result.error : 'Unknown error';
             resultsContainer.innerHTML = `
@@ -3912,8 +3939,8 @@ async function onExecuteClick() {
             `;
             window.clearVanillaGrid?.();
             setOpenVanillaGridEnabled(false);
-            updateStatus('Query failed');
-            pushHistory(query, '0 ms', 'err');
+            updateStatus(analyze ? 'Analysis failed' : 'Query failed');
+            if (!analyze) pushHistory(query, '0 ms', 'err');
         }
     } catch (error) {
         const cancelled = error?.name === 'AbortError';
@@ -3952,8 +3979,9 @@ async function onExecuteClick() {
             clearTimeout(streamPreviewRenderTimer);
             streamPreviewRenderTimer = null;
         }
-        executeBtn.disabled = false;
-        executeBtn.innerHTML = '▶ Execute';
+        executeBtn.disabled = !wasmReady;
+        if (analyzeBtn) analyzeBtn.disabled = !wasmReady || typeof wasmApi.analyzeQueryStream !== 'function';
+        activeBtn.textContent = analyze ? 'Analyze query' : '▶ Execute';
         setQueryCancellationState(false);
         if (resultsContainer) {
             resultsContainer.setAttribute('aria-busy', 'false');

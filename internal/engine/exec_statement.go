@@ -20,6 +20,12 @@ func executeStatement(ctx context.Context, db *storage.DB, tenant string, stmt S
 // columns affects only the outermost result. Nested SELECTs keep Row maps, and
 // both public result formats share authorization, locks, recovery and auditing.
 func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant string, stmt Statement, columns *ColumnarResultSet) (rs *ResultSet, err error) {
+	return executeStatementWithColumnsAndProfile(ctx, db, tenant, stmt, columns, nil)
+}
+
+func executeStatementWithColumnsAndProfile(ctx context.Context, db *storage.DB, tenant string, stmt Statement, columns *ColumnarResultSet, profile *queryProfile) (rs *ResultSet, err error) {
+	// ExecuteWithProfile starts the root as the collector's first stage.
+	const rootID = 1
 	var notifyTables []storage.TableRef
 	if err := checkPermission(ctx, db, stmt); err != nil {
 		recordAudit(ctx, db, tenant, stmt, err)
@@ -42,12 +48,27 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 	}
 
 	readOnly := isReadOnlyStatementWithProc(stmt, procedure)
+	var lockPhase, preparePhase *queryPhase
+	if profile != nil {
+		detail := "exclusive content lock"
+		if readOnly {
+			detail = "shared content lock"
+		}
+		lockPhase = profile.start(rootID, "LOCK", detail)
+	}
 	if readOnly {
 		db.LockContentForRead()
 		defer db.UnlockContentForRead()
+		if lockPhase != nil {
+			lockPhase.finish(0)
+		}
 	} else {
 		db.LockContentForWrite()
 		defer func() { db.UnlockContentForWriteTables(notifyTables) }()
+		if lockPhase != nil {
+			lockPhase.finish(0)
+			preparePhase = profile.start(rootID, "PREPARE", "write plan and rollback state")
+		}
 		// A direct ResultStream pins only its source table, not contentMu for
 		// the lifetime of a slow client. Detach a pinned target before WAL/DML
 		// planning records table pointers so this statement mutates a private
@@ -88,6 +109,9 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 			snapshot = db.SnapshotForStatement()
 		}
 		if snapshotErr != nil {
+			if preparePhase != nil {
+				preparePhase.finish(0)
+			}
 			recordAudit(ctx, db, tenant, stmt, snapshotErr)
 			return nil, snapshotErr
 		}
@@ -103,6 +127,9 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 		if refs, scoped := snapshot.RestoredTables(); scoped {
 			notifyTables = refs
 		}
+	}
+	if preparePhase != nil {
+		preparePhase.finish(0)
 	}
 	// Runs after the rollback defer below (defers unwind last-in-first-out), so
 	// the snapshot is only disarmed once it can no longer be needed. Without
@@ -126,8 +153,11 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 			}
 		}
 	}()
+	var runPhase, finalizePhase *queryPhase
 	defer func() {
 		if r := recover(); r != nil {
+			runPhase.finish(0)
+			finalizePhase.finish(0)
 			err = fmt.Errorf("internal error executing statement: %v", r)
 		}
 	}()
@@ -135,6 +165,14 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 	cache := newSubqueryResultCache()
 	defer releaseSubqueryResultCache(cache)
 	env := ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: cache, dml: plan, procedureOverride: procedure, rollbackArmed: snapshot != nil}
+	if profile != nil {
+		runPhase = profile.start(rootID, "RUN", profile.nodes[rootID-1].detail)
+		if _, isSelect := stmt.(*Select); isSelect {
+			// A Go procedure can launch concurrent child statements. Only
+			// SELECT propagates the synchronous collector to nested work.
+			env.profile, env.profileParent = profile, runPhase.index+1
+		}
+	}
 	var columnarHandled bool
 	if columns != nil {
 		columnarHandled, err = executeSimpleColumnarSelect(env, stmt.(*Select), columns)
@@ -144,6 +182,12 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 		if err == nil && columns != nil {
 			*columns = columnarFromRows(rs)
 		}
+	}
+	if runPhase != nil {
+		runPhase.finish(profileResultRows(rs))
+	}
+	if profile != nil && err == nil && !readOnly {
+		finalizePhase = profile.start(rootID, "FINALIZE", "commit, WAL and durability")
 	}
 	if err == nil {
 		err = statementWAL.commit()
@@ -189,6 +233,9 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 				}
 			}
 		}
+	}
+	if finalizePhase != nil {
+		finalizePhase.finish(0)
 	}
 	return rs, err
 }

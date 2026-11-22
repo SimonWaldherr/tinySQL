@@ -89,6 +89,32 @@ test('imports CSV and JSONL through the file input and queries their values', as
     await query(page, 'SELECT id, note FROM events ORDER BY id', [['1', "it's {color:blue}"], ['2', 'Grüße']]);
 });
 
+test('analyzes one selected read-only query without editing the script', async ({ page }) => {
+    await importFiles(page, [['people.csv', 'id,name\n1,Alice\n2,Bob\n']]);
+    const editor = page.getByRole('textbox', { name: 'SQL query editor' });
+    const analyze = page.getByRole('button', { name: 'Analyze SQL query', exact: true });
+    const select = 'SELECT name FROM people WHERE id >= 1 ORDER BY name;';
+    const script = `${select}\nDELETE FROM people;`;
+    const savedHistory = () => page.evaluate(() => localStorage.getItem('tinysql_query_history_v1'));
+    const history = await savedHistory();
+    await editor.fill(script);
+    await editor.evaluate((element, length) => element.setSelectionRange(0, length), select.length);
+    await analyze.click();
+    await expect(page.locator('#statusText')).toContainText('Analysis completed');
+    await expect(page.locator('#resultsContainer .result-table thead')).toContainText('self_ns');
+    await expect(page.locator('#resultsContainer .result-table tbody')).toContainText('SORT');
+    await expect(editor).toHaveValue(script);
+
+    await editor.evaluate(element => element.setSelectionRange(0, 0));
+    await analyze.click();
+    await expect(page.locator('#resultsContainer')).toContainText('Query analysis requires a single SELECT statement');
+    await editor.fill('DELETE FROM people');
+    await analyze.click();
+    await expect(page.locator('#resultsContainer')).toContainText('Query analysis requires a single SELECT statement');
+    expect(await savedHistory()).toBe(history);
+    await query(page, 'SELECT name FROM people ORDER BY id', [['Alice'], ['Bob']]);
+});
+
 test('restores an autosaved IndexedDB snapshot after reload', async ({ page }) => {
     const id = await page.locator('#workspaceSelect').inputValue();
     await importFiles(page, [['records.csv', 'id,value\n1,persisted\n2,after reload\n']]);

@@ -17,6 +17,44 @@ The result contains the estimated plan, measured execution stages, and a final
 Plain `EXPLAIN` still returns only `step`, `operation`, and `detail` and does
 not execute the query. `ANALYZE table` remains the separate statistics command.
 
+## Time a query and keep its result
+
+In the `tinysql` CLI, use `.timer profile` to show timings for subsequent
+statements, or `-profile` for a batch invocation. Results use the selected
+output format. Profile diagnostics go to standard error and show parsing,
+statement elapsed time, output time, and the measured execution stages.
+Profiling materializes the result before formatting so those times can be
+measured separately. Use `.timer off` to disable timing.
+
+```sh
+tinysql -profile -mode csv -cmd 'SELECT 1 AS n' > result.csv
+```
+
+The browser workspace offers **Analyze query** for one SELECT. It uses
+`EXPLAIN ANALYZE` and displays the measured plan in the result grid.
+
+Embedded Go callers can request the same split:
+
+```go
+result, profile, err := tinysql.ExecSQLWithProfile(ctx, db, "default", sql)
+```
+
+`profile.ParseTime` measures parsing from SQL text. For an already parsed
+statement, use `ExecuteWithProfile` and read `profile.Elapsed` for the full
+statement lifecycle, including permission checks, lock acquisition,
+execution, result materialization and finalization. An invalid SQL string
+returns its parsing time and the parse error. A failed execution returns its
+measured stages and the execution error.
+
+`profile.Stages` lists stages in order of first entry. `LOCK` measures lock
+acquisition, `PLAN/INDEX` covers planning and source access for simple SELECTs,
+and `RUN` contains the query's actual executor stages. Writes also show their
+preparation and durability steps when reached. `Parent` is the one-based
+position of the enclosing stage in the slice, with zero marking the root.
+`Total` includes measured children and `Self` subtracts their time. Values
+are Go `time.Duration`s measured by the monotonic clock. They describe elapsed
+time and include scheduling and garbage-collection pauses.
+
 ## Reading the result
 
 `EXPLAIN ANALYZE` adds these columns to the three existing columns:
@@ -33,10 +71,9 @@ not execute the query. `ANALYZE table` remains the separate statistics command.
 
 Plan-only rows and the final textual summary have NULL in these added columns.
 Start with `bottleneck=true`, then inspect `self_ns`, `percent`, and its parent
-path. Do not add inclusive `total_ns` values: a nested SELECT is already part
-of its enclosing source/filter/projection stage. Self times add up to the root
-total. `SELECT` self time includes dispatch, fast-path planning attempts, and
-work outside separately measured stages.
+path. Self times add up to the root total, while inclusive times include
+nested work. `SELECT` self time includes dispatch and work outside the
+measured stages.
 
 The analyzer follows the executor actually selected. General execution exposes
 source materialization, joins, WHERE, projection/grouping, DISTINCT, sorting,
@@ -50,17 +87,12 @@ Repeated stages with the same parent, operation, and detail are aggregated;
 Distinct subqueries with the same description under the same parent share a
 measurement row. This is a stage profile, not a unique AST-node trace.
 
-## Measurement scope
+## Measurement scope of EXPLAIN ANALYZE
 
-Timing is enabled only for `EXPLAIN ANALYZE`. Ordinary queries allocate no
-profile and read no profiling clock. Stage boundaries add a few conditional
-checks, not checks inside row/comparison loops. Query-local collectors do not
-modify cached plans, so concurrent executions of one statement remain separate.
-With profiling disabled, three alternating 200 ms benchmark runs against the
-previous executor showed unchanged allocation counts. Median COUNT(*) time
-changed from 1.797 to 1.816 µs; a 20-row LIMIT/OFFSET query from 4.063 to
-4.203 µs. A 20,000-row GROUP BY changed from 453.85 to 456.65 µs. This is a
-small but measurable overhead for short queries, not a zero-cost claim.
+`EXPLAIN ANALYZE` and the profile API enable timing explicitly. Ordinary
+queries allocate no profile and read no profiling clock. Timing checks are
+at stage boundaries. Query-local collectors leave cached plans available for
+concurrent use, with a separate profile per execution.
 
 The measured query runs once. Plan rendering happens afterwards so it cannot
 warm an index or query plan before the measured execution. Materialized views

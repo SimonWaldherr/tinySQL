@@ -63,6 +63,133 @@ func profileFixture(t *testing.T) *storage.DB {
 	return db
 }
 
+func checkExecutionProfile(t *testing.T, profile QueryProfile, rows int64) map[string]QueryStage {
+	t.Helper()
+	if profile.ParseTime != 0 || len(profile.Stages) == 0 {
+		t.Fatalf("invalid execution profile: %+v", profile)
+	}
+	root := profile.Stages[0]
+	if root.Operation != "EXECUTE" || root.Parent != 0 || root.Total != profile.Elapsed || root.Rows != rows {
+		t.Fatalf("invalid root: %+v", root)
+	}
+	operations := make(map[string]QueryStage)
+	var self time.Duration
+	for i, stage := range profile.Stages {
+		if stage.Calls < 1 || stage.Rows < 0 || stage.Self < 0 || stage.Self > stage.Total {
+			t.Fatalf("invalid accounting: %+v", stage)
+		}
+		if i > 0 && (stage.Parent < 1 || stage.Parent > i || profile.Stages[stage.Parent-1].Total < stage.Total) {
+			t.Fatalf("invalid parent at stage %d: %+v", i+1, stage)
+		}
+		self += stage.Self
+		operations[stage.Operation] = stage
+	}
+	if self != profile.Elapsed {
+		t.Fatalf("self time = %s, elapsed = %s", self, profile.Elapsed)
+	}
+	return operations
+}
+
+func TestExecuteWithProfileSelect(t *testing.T) {
+	db := profileFixture(t)
+	stmt := mustParse("SELECT id FROM profile_values WHERE v>1")
+	want, err := Execute(t.Context(), db, "default", stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, profile, err := ExecuteWithProfile(t.Context(), db, "default", stmt)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("profiled result = %#v, error %v; want %#v", got, err, want)
+	}
+	stages := checkExecutionProfile(t, profile, 2)
+	for _, operation := range []string{"LOCK", "RUN", "SELECT", "PLAN/INDEX", "SCAN/FILTER/PROJECT"} {
+		if _, ok := stages[operation]; !ok {
+			t.Errorf("missing %s: %+v", operation, profile)
+		}
+	}
+	if lock := stages["LOCK"]; lock.Parent != 1 || lock.Detail != "shared content lock" {
+		t.Errorf("read lock stage: %+v", lock)
+	}
+	if parent := stages["PLAN/INDEX"].Parent; parent > 0 && profile.Stages[parent-1].Operation != "SELECT" {
+		t.Errorf("planning stage parent: %+v", profile.Stages[parent-1])
+	}
+}
+
+func TestExecuteWithProfileWriteAndError(t *testing.T) {
+	db := profileFixture(t)
+	execSQL(t, db, "CREATE TABLE writes (id INT PRIMARY KEY)")
+	stmt := mustParse("INSERT INTO writes VALUES (1) RETURNING id")
+	result, profile, err := ExecuteWithProfile(t.Context(), db, "default", stmt)
+	if err != nil || result == nil || len(result.Rows) != 1 {
+		t.Fatalf("profiled INSERT result = %#v, error %v", result, err)
+	}
+	stages := checkExecutionProfile(t, profile, 1)
+	if lock := stages["LOCK"]; lock.Parent != 1 || lock.Detail != "exclusive content lock" {
+		t.Errorf("write lock stage: %+v", lock)
+	}
+	for _, operation := range []string{"PREPARE", "RUN", "FINALIZE"} {
+		if stages[operation].Parent != 1 {
+			t.Fatalf("missing %s stage: %+v", operation, profile)
+		}
+	}
+	_, profile, err = ExecuteWithProfile(t.Context(), db, "default", mustParse("INSERT INTO writes VALUES (2), (1)"))
+	if err == nil {
+		t.Fatal("duplicate key INSERT succeeded")
+	}
+	stages = checkExecutionProfile(t, profile, 0)
+	if stages["RUN"].Parent != 1 {
+		t.Fatalf("missing failure dispatch stage: %+v", profile)
+	}
+	if writes := execSQL(t, db, "SELECT id FROM writes"); len(writes.Rows) != 1 || writes.Rows[0]["id"] != 1 {
+		t.Fatalf("failed statement did not roll back: %#v", writes.Rows)
+	}
+}
+
+func TestExecuteWithProfileEarlyError(t *testing.T) {
+	db := profileFixture(t)
+	if err := db.Catalog().CreateUser("profile_user", "test-password", nil); err != nil {
+		t.Fatal(err)
+	}
+	_, profile, err := ExecuteWithProfile(t.Context(), db, "default", mustParse("SELECT id FROM profile_values"))
+	if err == nil {
+		t.Fatal("unauthenticated SELECT succeeded")
+	}
+	checkExecutionProfile(t, profile, 0)
+	if len(profile.Stages) != 1 {
+		t.Fatalf("unauthorized query entered the executor: %+v", profile)
+	}
+}
+
+func TestExecuteWithProfileSelectErrorFinishesScan(t *testing.T) {
+	db := profileFixture(t)
+	stmt := mustParse("SELECT id FROM profile_values WHERE 1 / (id-id) > 0")
+	_, profile, err := ExecuteWithProfile(t.Context(), db, "default", stmt)
+	if err == nil {
+		t.Fatal("division by zero succeeded")
+	}
+	stages := checkExecutionProfile(t, profile, 0)
+	if scan := stages["SCAN/FILTER/PROJECT"]; scan.Calls != 1 || scan.Rows != 0 {
+		t.Fatalf("failed scan accounting: %+v", profile)
+	}
+}
+
+func TestExecuteWithProfileRecoversFromSourcePanic(t *testing.T) {
+	db := profileFixture(t)
+	const source = "PROFILE_PANIC_SOURCE"
+	RegisterTableFunc(explainRefreshTableFunc{name: source, run: func() (*ResultSet, error) {
+		panic("interrupted source")
+	}})
+	t.Cleanup(func() { delete(tableFuncRegistry, source) })
+	_, profile, err := ExecuteWithProfile(t.Context(), db, "default", mustParse("SELECT n FROM "+source+"()"))
+	if err == nil {
+		t.Fatal("panicking source returned success")
+	}
+	stages := checkExecutionProfile(t, profile, 0)
+	if source := stages["SOURCE"]; source.Calls != 1 || source.Rows != 0 {
+		t.Fatalf("interrupted source accounting: %+v", profile)
+	}
+}
+
 func validateProfile(t *testing.T, rs *ResultSet, count int) map[string]bool {
 	t.Helper()
 	if len(rs.Cols) != 10 {

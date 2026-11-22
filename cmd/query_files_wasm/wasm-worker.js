@@ -11,7 +11,7 @@
     'use strict';
 
     const exportedMethods = [
-        'importFile', 'executeQuery', 'executeQueryStream', 'executeMulti', 'getResultPage',
+        'importFile', 'executeQuery', 'executeQueryStream', 'analyzeQueryStream', 'executeMulti', 'getResultPage',
         'clearDatabase', 'dropTable', 'listTables', 'exportResults',
         'getTableSchema', 'exportDatabase', 'exportDatabaseBytes',
         'importDatabase', 'importDatabaseBytes', 'validateDatabaseBytes',
@@ -180,7 +180,7 @@
         try {
             // The request id lets the Go stream job bind a cancellation context
             // without exposing worker protocol details to the page API.
-            const callArgs = method === 'executeQueryStream'
+            const callArgs = method === 'executeQueryStream' || method === 'analyzeQueryStream'
                 ? [requestId, ...args]
                 : args;
             const result = await Promise.resolve(fn(...callArgs));

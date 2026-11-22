@@ -58,6 +58,7 @@ func main() {
 	js.Global().Set("importFile", js.FuncOf(importFile))
 	js.Global().Set("executeQuery", js.FuncOf(executeQuery))
 	js.Global().Set("executeQueryStream", js.FuncOf(executeQueryStream))
+	js.Global().Set("analyzeQueryStream", js.FuncOf(analyzeQueryStream))
 	js.Global().Set("cancelQueryStream", js.FuncOf(cancelQueryStream))
 	js.Global().Set("executeMulti", js.FuncOf(executeMulti))
 	js.Global().Set("getResultPage", js.FuncOf(getResultPage))

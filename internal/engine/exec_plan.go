@@ -29,6 +29,11 @@ func buildSimpleSelectPlanInto(plan *simpleSelectPlan, env ExecEnv, s *Select) (
 	if !simpleSelectEligible(s) {
 		return false, nil
 	}
+	if env.profile != nil && env.profile.statementLifecycle {
+		var phase *queryPhase
+		env, phase = startQueryPhase(env, "PLAN/INDEX", "simple SELECT planning and source access")
+		defer phase.finish(0)
+	}
 
 	// ModePagedIndex exposes table schema and index roots without loading row
 	// pages. For a complete composite equality predicate, resolve the B+Tree
