@@ -83,8 +83,8 @@ type simpleAggregateState struct {
 	groupValues []any
 	counts      []int // COUNT result, or non-null sample count for SUM/AVG
 	sums        []sumAccumulator
-	minmax      []any
-	haveMinMax  []bool
+	sumStart    int   // projection index of the first SUM/AVG in sums
+	minmax      []any // nil marks a projection with no non-NULL samples
 	optional    *aggregateOptionalState
 }
 
@@ -194,7 +194,7 @@ func executeConstraintMaximum(env ExecEnv, plan *simpleAggregatePlan) (*ResultSe
 	}
 	cachePhase.finish(1)
 	state := newSimpleAggregateState(nil, 1)
-	state.minmax[0], state.haveMinMax[0] = value, value != nil
+	state.minmax[0] = value
 	rs, err := finalizeSimpleAggregateResultSet(env, plan, []*simpleAggregateState{state})
 	return rs, true, err
 }
@@ -401,8 +401,11 @@ func newSimpleAggregateState(groupValues []any, projections int) *simpleAggregat
 		counts:      make([]int, projections),
 		sums:        make([]sumAccumulator, projections),
 		minmax:      make([]any, projections),
-		haveMinMax:  make([]bool, projections),
 	}
+}
+
+func (state *simpleAggregateState) sumAt(projection int) *sumAccumulator {
+	return &state.sums[projection-state.sumStart]
 }
 
 // addSum accumulates one non-NULL SUM/AVG input for projection i. Integers
@@ -416,7 +419,7 @@ func (state *simpleAggregateState) addSum(i int, v any, projections int) {
 			state.counts[i]++
 			return
 		}
-	} else if state.sums[i].add(v) {
+	} else if state.sumAt(i).add(v) {
 		state.counts[i]++
 		return
 	}
@@ -433,7 +436,7 @@ func (state *simpleAggregateState) addSum(i int, v any, projections int) {
 	}
 	if !state.optional.useRat[i] {
 		// Migrate the exact integer/float total accumulated so far.
-		state.optional.sumRat[i] = state.sums[i].rat()
+		state.optional.sumRat[i] = state.sumAt(i).rat()
 		state.optional.useRat[i] = true
 	}
 	state.optional.sumRat[i].Add(state.optional.sumRat[i], new(big.Rat).Set(rv))
@@ -517,9 +520,8 @@ func accumulateSimpleAggregateState(env ExecEnv, rawPlan *simpleSelectPlan, raw 
 			if v == nil {
 				continue
 			}
-			if !state.haveMinMax[i] {
+			if state.minmax[i] == nil {
 				state.minmax[i] = v
-				state.haveMinMax[i] = true
 				continue
 			}
 			cmp, err := compare(v, state.minmax[i])
@@ -655,7 +657,7 @@ func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggr
 		if state.optional != nil && state.optional.useRat != nil && state.optional.useRat[i] {
 			return state.optional.sumRat[i]
 		}
-		return state.sums[i].sum()
+		return state.sumAt(i).sum()
 	case aggAvg:
 		if state.counts[i] == 0 {
 			return nil
@@ -663,11 +665,9 @@ func simpleAggregateProjectionValue(state *simpleAggregateState, proj simpleAggr
 		if state.optional != nil && state.optional.useRat != nil && state.optional.useRat[i] {
 			return new(big.Rat).Quo(state.optional.sumRat[i], big.NewRat(int64(state.counts[i]), 1))
 		}
-		return state.sums[i].average(state.counts[i])
+		return state.sumAt(i).average(state.counts[i])
 	case aggMin, aggMax:
-		if state.haveMinMax[i] {
-			return state.minmax[i]
-		}
+		return state.minmax[i]
 	}
 	return nil
 }

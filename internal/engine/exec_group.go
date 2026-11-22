@@ -593,9 +593,8 @@ func accumulateSimpleAggregateStateFromRow(r Row, state *simpleAggregateState, p
 			if v == nil {
 				continue
 			}
-			if !state.haveMinMax[i] {
+			if state.minmax[i] == nil {
 				state.minmax[i] = v
-				state.haveMinMax[i] = true
 				continue
 			}
 			cmp, err := compare(v, state.minmax[i])

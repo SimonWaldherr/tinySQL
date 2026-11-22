@@ -164,6 +164,11 @@ func BenchmarkJoinGroupBySingleColumnFastPath(b *testing.B) {
 	runBench(b, db, `SELECT l.id, COUNT(*) as n FROM l JOIN r ON l.id = r.id GROUP BY l.id`)
 }
 
+func BenchmarkJoinGroupByWithSum(b *testing.B) {
+	db := setupJoinTables(b, 5000, 5000)
+	runBench(b, db, `SELECT l.id, COUNT(*) AS n, SUM(r.id) AS total FROM l JOIN r ON l.id = r.id GROUP BY l.id`)
+}
+
 // ─────────────────────────── Row scan / allocation ─────────────────────────
 
 // BenchmarkSelectStarFullScan measures the cost of materializing every row

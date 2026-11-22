@@ -267,7 +267,7 @@ func copyAggregateBatchStates(states []*simpleAggregateState, ops []aggregateBat
 		for _, state := range states {
 			state.counts[op.projection] = state.counts[op.copyFrom-1]
 			if op.kind != aggCount {
-				state.sums[op.projection] = state.sums[op.copyFrom-1]
+				*state.sumAt(op.projection) = *state.sumAt(op.copyFrom - 1)
 			}
 		}
 	}
@@ -328,7 +328,7 @@ func accumulateWholeBatch(state *simpleAggregateState, n int, cols []aggregateBa
 		}
 		return
 	}
-	count, acc := state.counts[p], &state.sums[p]
+	count, acc := state.counts[p], state.sumAt(p)
 	switch {
 	case !col.hasInt && !col.hasFloat:
 		for i := 0; i < n; i++ {
@@ -385,9 +385,9 @@ func accumulateGroupedBatch(states []*simpleAggregateState, cols []aggregateBatc
 			continue
 		}
 		if col.isInt[i/64]&bit != 0 {
-			state.sums[p].addInt(col.ints[i])
+			state.sumAt(p).addInt(col.ints[i])
 		} else {
-			state.sums[p].addFloat(col.values[i])
+			state.sumAt(p).addFloat(col.values[i])
 		}
 	}
 }

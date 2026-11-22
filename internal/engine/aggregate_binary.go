@@ -83,7 +83,7 @@ func (arg *aggregateBinaryArg) accumulate(raw []any, state *simpleAggregateState
 			value, ok = mulInt64(li, ri)
 		}
 		if ok {
-			state.sums[projection].addInt(value)
+			state.sumAt(projection).addInt(value)
 			state.counts[projection]++
 			return true
 		}
@@ -113,7 +113,7 @@ func (arg *aggregateBinaryArg) accumulate(raw []any, state *simpleAggregateState
 	// Round the expression result before adding it, as the boxed evaluator
 	// does. An explicit conversion prevents fused multiply-add from changing
 	// the result when addFloat is inlined.
-	state.sums[projection].addFloat(float64(value))
+	state.sumAt(projection).addFloat(float64(value))
 	state.counts[projection]++
 	return true
 }

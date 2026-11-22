@@ -29,13 +29,21 @@ type textIntegerGroupKey struct {
 
 func newAggregateGroups(projs []simpleAggregateProjection, groupCount int) aggregateGroups {
 	groups := aggregateGroups{arena: aggregateStateArena{projections: len(projs), groupCount: groupCount}}
-	for _, proj := range projs {
+	sumStart, sumEnd := len(projs), 0
+	for i, proj := range projs {
 		switch proj.kind {
 		case aggSum, aggAvg:
-			groups.arena.needSums = true
+			sumStart = min(sumStart, i)
+			sumEnd = i + 1
 		case aggMin, aggMax:
 			groups.arena.needMinMax = true
 		}
+	}
+	if sumEnd > sumStart {
+		// Keep projection-relative indexing while omitting unused slots before
+		// the first and after the last numeric accumulator.
+		groups.arena.sumStart = sumStart
+		groups.arena.sumCount = sumEnd - sumStart
 	}
 	return groups
 }
@@ -229,7 +237,8 @@ func (g *aggregateGroups) newState(raw []any, cols []int) *simpleAggregateState 
 // Decimal and DISTINCT storage remains lazy on each state as before.
 type aggregateStateArena struct {
 	projections, groupCount int
-	needSums, needMinMax    bool
+	sumStart, sumCount      int
+	needMinMax              bool
 	remaining               []simpleAggregateState
 	blockSize               int
 }
@@ -242,24 +251,23 @@ func (a *aggregateStateArena) next() *simpleAggregateState {
 		values := make([]any, a.blockSize*a.groupCount)
 		var sums []sumAccumulator
 		var minmax []any
-		var haveMinMax []bool
-		if a.needSums {
-			sums = make([]sumAccumulator, a.blockSize*a.projections)
+		if a.sumCount > 0 {
+			sums = make([]sumAccumulator, a.blockSize*a.sumCount)
 		}
 		if a.needMinMax {
 			minmax = make([]any, a.blockSize*a.projections)
-			haveMinMax = make([]bool, a.blockSize*a.projections)
 		}
 		for i := range a.remaining {
 			state := &a.remaining[i]
 			start, end := i*a.projections, (i+1)*a.projections
 			state.counts = counts[start:end:end]
-			if a.needSums {
-				state.sums = sums[start:end:end]
+			if a.sumCount > 0 {
+				first, last := i*a.sumCount, (i+1)*a.sumCount
+				state.sums = sums[first:last:last]
+				state.sumStart = a.sumStart
 			}
 			if a.needMinMax {
 				state.minmax = minmax[start:end:end]
-				state.haveMinMax = haveMinMax[start:end:end]
 			}
 			start, end = i*a.groupCount, (i+1)*a.groupCount
 			state.groupValues = values[start:end:end]

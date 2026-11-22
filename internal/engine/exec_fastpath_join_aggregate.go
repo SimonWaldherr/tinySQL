@@ -61,9 +61,8 @@ func executeSimpleJoinAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, boo
 		_, probePhase = startQueryPhase(env, "JOIN PROBE/FILTER/AGGREGATE", "raw equi-join accumulation")
 		defer probePhase.finish(-1)
 	}
-	groups := make(map[string]*simpleAggregateState)
-	order := make([]*simpleAggregateState, 0)
-	keyBuf := make([]byte, 0, 32)
+	groups := newAggregateGroups(plan.projs, 1)
+	groupCols := [1]int{plan.groupCol}
 	for i, left := range plan.join.left.Rows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
 		if i&63 == 0 {
@@ -94,31 +93,23 @@ func executeSimpleJoinAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, boo
 				continue
 			}
 
-			var groupValue any
-			if plan.groupSide == 0 {
-				groupValue = left[plan.groupCol]
-			} else {
-				groupValue = right[plan.groupCol]
+			groupRow := left
+			if plan.groupSide == 1 {
+				groupRow = right
 			}
-			keyBuf = writeSingleGroupKey(keyBuf[:0], groupValue)
-			state, exists := groups[string(keyBuf)]
-			if !exists {
-				state = newSimpleAggregateState([]any{groupValue}, len(plan.projs))
-				groups[string(keyBuf)] = state
-				order = append(order, state)
-			}
+			state := groups.state(groupRow, groupCols[:])
 			if err := accumulateSimpleJoinAggregateState(plan.join, left, right, state, plan.projs); err != nil {
 				return nil, true, err
 			}
 		}
 	}
 
-	probePhase.finish(int64(len(order)))
+	probePhase.finish(int64(len(groups.order)))
 	var projectPhase *queryPhase
 	if env.profile != nil {
 		_, projectPhase = startQueryPhase(env, "PROJECT", "materialize join aggregate results")
 	}
-	result := simpleAggregateResultSet(plan.projs, plan.outputCols, order)
+	result := simpleAggregateResultSet(plan.projs, plan.outputCols, groups.order)
 	projectPhase.finish(int64(len(result.Rows)))
 	return result, true, nil
 }
@@ -126,7 +117,7 @@ func executeSimpleJoinAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, boo
 // simpleJoinAggregateCountStarOnly identifies the particularly common
 // `SELECT group_col, COUNT(*) ... GROUP BY group_col` shape. A regular
 // simpleAggregateState is deliberately general (it can hold decimal SUM/AVG
-// and MIN/MAX state), but needs five backing slices for each group. COUNT(*)
+// and MIN/MAX state). COUNT(*)
 // needs only a group value and an integer, so keeping that state compact makes
 // high-cardinality join/group queries substantially lighter on the allocator.
 func simpleJoinAggregateCountStarOnly(plan *simpleJoinAggregatePlan) bool {
@@ -290,9 +281,8 @@ func accumulateSimpleJoinAggregateState(join *simpleJoinPlan, left, right []any,
 			if v == nil {
 				continue
 			}
-			if !state.haveMinMax[i] {
+			if state.minmax[i] == nil {
 				state.minmax[i] = v
-				state.haveMinMax[i] = true
 				continue
 			}
 			cmp, err := compare(v, state.minmax[i])

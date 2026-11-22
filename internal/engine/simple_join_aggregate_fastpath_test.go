@@ -216,8 +216,7 @@ func TestJoinAggregateFastPathNullJoinKeyNeverMatches(t *testing.T) {
 // TestJoinAggregateFastPathGroupsNullValuesTogether confirms that once a
 // NULL *group* value (as opposed to a NULL *join key*, covered above) is
 // produced by a real join match, every row sharing that NULL group value
-// still collapses into a single group -- mirroring the plain aggregate fast
-// path's writeSingleGroupKey NULL handling.
+// still collapses into a single group.
 func TestJoinAggregateFastPathGroupsNullValuesTogether(t *testing.T) {
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE l (id INT, tag TEXT)`)
@@ -227,7 +226,7 @@ func TestJoinAggregateFastPathGroupsNullValuesTogether(t *testing.T) {
 	execSQL(t, db, `INSERT INTO l VALUES (1, 'x')`)
 	execSQL(t, db, `INSERT INTO r VALUES (1)`)
 
-	rs := execSQL(t, db, `SELECT l.tag AS tag, COUNT(*) AS n FROM l JOIN r ON l.id = r.id GROUP BY l.tag`)
+	rs := execSQL(t, db, `SELECT l.tag AS tag, COUNT(*) AS n, MIN(l.tag) AS first_tag FROM l JOIN r ON l.id = r.id GROUP BY l.tag`)
 	if len(rs.Rows) != 2 {
 		t.Fatalf("rows = %#v, want 2 groups (NULL tag and 'x' tag)", rs.Rows)
 	}
@@ -238,6 +237,9 @@ func TestJoinAggregateFastPathGroupsNullValuesTogether(t *testing.T) {
 		t.Fatalf("missing NULL tag group in %#v", rs.Rows)
 	}
 	expectInt(t, nullRow["n"], 2, "NULL group count")
+	if nullRow["first_tag"] != nil || byTag["x"]["first_tag"] != "x" {
+		t.Fatalf("minimum tag values = %#v, %#v", nullRow["first_tag"], byTag["x"]["first_tag"])
+	}
 }
 
 // TestJoinAggregateShapesStillFallThroughToGenericPath exercises query

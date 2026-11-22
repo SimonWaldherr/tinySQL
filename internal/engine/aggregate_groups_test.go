@@ -68,7 +68,9 @@ func TestAggregateGroupsBlockOwnershipAndPromotion(t *testing.T) {
 	for repeat := 0; repeat < 17; repeat++ {
 		for group := 0; group < 257; group++ {
 			var v any = group + repeat
-			if repeat == 10 && group%3 == 0 {
+			if group == 0 {
+				v = nil
+			} else if repeat == 10 && group%3 == 0 {
 				v = big.NewRat(int64(group+1), 3)
 			}
 			table.Rows = append(table.Rows, []any{group, v})
@@ -79,7 +81,7 @@ func TestAggregateGroupsBlockOwnershipAndPromotion(t *testing.T) {
 	}
 	for _, query := range []string{
 		`SELECT g,COUNT(*) AS n,SUM(v) AS s,AVG(v) AS a FROM many_groups GROUP BY g`,
-		`SELECT g,COUNT(DISTINCT v) AS n,SUM(v) AS s,AVG(v) AS a,MIN(v) AS lo,MAX(v) AS hi FROM many_groups GROUP BY g`,
+		`SELECT g,COUNT(DISTINCT v) AS n,SUM(v) AS s,MIN(v) AS lo,AVG(v) AS a,MAX(v) AS hi FROM many_groups GROUP BY g`,
 	} {
 		stmt := mustParse(query)
 		want := execSQL(t, db, strings.Replace(query, "FROM many_groups", "FROM (SELECT * FROM many_groups) AS many_groups", 1))
