@@ -8,7 +8,7 @@ SHELL := /usr/bin/env bash
 .PHONY: build-gh-pages-demo check-gh-pages-demo update-gh-pages push-gh-pages
 .PHONY: test-all test-unit test-integration test-jsonv2 test-semantics test-ci coverage build-check wasm-check wasm-smoke tinygo-wasm ci verify verify-ci
 .PHONY: test-query-files test-query-files-wasm test-query-files-browser test-fsql test-gorm test-sqlpackages test-sql-compat test-server
-.PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-tidy-check modules-verify bench bench-engine bench-hotpaths bench-stream bench-stream-guard release-check script-lint docker-build info
+.PHONY: run-wasm-browser run-wasm-node-demo deps deps-all update-deps tidy tidy-all modules-tidy-check modules-verify bench bench-engine bench-hotpaths bench-compare bench-stream bench-stream-guard release-check script-lint docker-build info
 .DEFAULT_GOAL := help
 
 # Variables
@@ -22,6 +22,11 @@ GO_BUILD_FLAGS := $(GOFLAGS) $(LDFLAGS)
 GO_TEST_FLAGS ?= -v
 COVERPROFILE ?= $(BINARY_DIR)/coverage.out
 BENCH_COUNT ?= 3
+BENCH_TIME ?= 1s
+BENCH_CPU ?= 2
+BENCH_PKG ?= ./internal/engine
+BENCH_FILTER ?= ^Benchmark(OrderByWithLimit|UpdateByPrimaryKey|InsertSelectedRows|UnionAliasedQuery|ParseBulkInsert)$$
+BASE ?= HEAD
 # The stream guard is deliberately generous on time for shared CI runners but
 # strict on allocation: a first result must not allocate a full 20k-row result
 # set before it can be observed. Override only with measured platform evidence.
@@ -335,24 +340,35 @@ coverage: test-all
 ## bench: Run benchmarks
 bench:
 	@echo "$(GREEN)Running benchmarks...$(NC)"
-	$(GO) test -bench=. -benchmem ./...
+	$(GO) test -run='^$$' -bench=. -benchmem -benchtime=$(BENCH_TIME) ./...
 
 ## bench-engine: Run all execution-engine microbenchmarks
 bench-engine:
 	@echo "$(GREEN)Running engine benchmarks...$(NC)"
-	$(GO) test -run=none -bench=. -benchmem ./internal/engine
+	$(GO) test -run='^$$' -bench=. -benchmem -benchtime=$(BENCH_TIME) ./internal/engine
 
-## bench-hotpaths: Benchmark optimized SELECT, INSERT, UPDATE, DELETE, and trigger hot paths
+## bench-hotpaths: Benchmark SELECT, JOIN, APPLY, UNION, and write hot paths
 bench-hotpaths:
 	@echo "$(GREEN)Running hot-path benchmarks ($(BENCH_COUNT)x)...$(NC)"
-	$(GO) test -run=none -bench='^(BenchmarkOrderByWithLimit|BenchmarkInsertIntoLargePKTable|BenchmarkUpdateByPrimaryKey|BenchmarkDeleteByPrimaryKey|BenchmarkTriggerBatchInsert)$$' -benchmem -count=$(BENCH_COUNT) ./internal/engine
-	$(GO) test -run=none -bench='^BenchmarkExecute_Insert$$' -benchmem -count=$(BENCH_COUNT) .
+	$(GO) test -run='^$$' -bench='^Benchmark(OrderByWithLimit|GeneralJoinRangePredicate|ApplySharedLookup|UnionAliasedQuery|ParseBulkInsert|InsertIntoLargePKTable|InsertSelectedRows|UpdateByPrimaryKey|UpdateReturningSelective|DeleteByPrimaryKey|TriggerBatchInsert)$$' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) ./internal/engine
+	$(GO) test -run='^$$' -bench='^BenchmarkExecute_Insert$$' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) .
+
+## bench-compare: Compare a Git revision with the working tree in alternating runs
+bench-compare: export GO := $(GO)
+bench-compare: export BASE := $(BASE)
+bench-compare: export BENCH_PKG := $(BENCH_PKG)
+bench-compare: export BENCH_FILTER := $(BENCH_FILTER)
+bench-compare: export BENCH_COUNT := $(BENCH_COUNT)
+bench-compare: export BENCH_TIME := $(BENCH_TIME)
+bench-compare: export BENCH_CPU := $(BENCH_CPU)
+bench-compare:
+	@bash ./scripts/bench-compare.sh
 
 ## bench-stream: Measure direct and materialized time-to-first-row paths
 bench-stream:
 	@echo "$(GREEN)Running streaming time-to-first-row benchmarks ($(BENCH_COUNT)x)...$(NC)"
-	$(GO) test -run='^$$' -bench='^Benchmark(Execute(Stream|Materialized)FirstRow|DriverStreamFirstRow|CLIStreamFirstRow)$$' -benchmem -count=$(BENCH_COUNT) ./internal/engine ./internal/driver ./cmd/tinysql
-	cd ./$(CMD_DIR)/server && $(GO) test -run='^$$' -bench='^BenchmarkServerStreamFirstRow$$' -benchmem -count=$(BENCH_COUNT) .
+	$(GO) test -run='^$$' -bench='^Benchmark(Execute(Stream|Materialized)FirstRow|DriverStreamFirstRow|CLIStreamFirstRow)$$' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) ./internal/engine ./internal/driver ./cmd/tinysql
+	cd ./$(CMD_DIR)/server && $(GO) test -run='^$$' -bench='^BenchmarkServerStreamFirstRow$$' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) .
 
 ## bench-stream-guard: Enforce bounded allocation and latency before first streamed row
 bench-stream-guard:
@@ -397,7 +413,7 @@ script-lint:
 	@if ! command -v shellcheck >/dev/null; then \
 		echo "$(YELLOW)shellcheck not installed, skipping$(NC)"; \
 	else \
-		shellcheck scripts/clean-root.sh scripts/demo-formats.sh cmd/query_files/demo.sh cmd/query_files_wasm/build.sh cmd/wasm_node/build.sh cmd/wasm_browser/build.sh; \
+		shellcheck scripts/bench-compare.sh scripts/clean-root.sh scripts/demo-formats.sh cmd/query_files/demo.sh cmd/query_files_wasm/build.sh cmd/wasm_node/build.sh cmd/wasm_browser/build.sh; \
 	fi
 
 ## fmt: Format all Go files

@@ -79,6 +79,7 @@ is dispatched manually; use focused local benchmarks when comparing a change.
 | `cd odbc && make linux` | Build the c-shared ODBC driver from its nested Go module. |
 | `make coverage` | Run tests and open an HTML coverage report. |
 | `make bench` | Benchmarks with allocation output. |
+| `make bench-compare` | Compare a Git revision with the working tree in alternating benchmark runs. |
 | `make bench-stream` | Repeated time-to-first-row measurements for engine, `database/sql`, CLI, and server (plus the materialized engine baseline). |
 | `make bench-stream-guard` | CI-safe first-row allocation/latency budget; limits are configurable with `STREAM_FIRST_ROW_MAX_B` and `STREAM_FIRST_ROW_MAX_NS`. |
 | `make release-check` | Cross-compile the published CLI targets (Linux, macOS, Windows; amd64/arm64) into a temporary directory. |
@@ -99,18 +100,26 @@ test matrix, and compiles all three standard-Go WASM targets. Run
 
 ## Benchmarking
 
-Use a focused benchmark and repeated samples when comparing changes:
+Use a focused benchmark and repeated samples when comparing changes.
 
 ```bash
-go test ./benchmarks -run '^$' -bench '^Benchmark(Join|Aggregate)$' -benchmem -count=5 > before.txt
-# Repeat on the changed revision into after.txt, then use benchstat if installed:
-benchstat before.txt after.txt
+make bench-compare BASE=HEAD BENCH_COUNT=6 BENCH_TIME=300ms \
+  BENCH_FILTER='^Benchmark(InsertSelectedRows|UnionAliasedQuery)$$'
 ```
 
-Run both revisions on the same machine with the same Go version, power settings,
-and background load. The query benchmarks populate each backend before timing;
-they include query parsing/execution and result retrieval, but exclude setup and
-cleanup. tinySQL materializes results while SQLite rows are scanned via
+The target builds a Git archive of `BASE` and the current working tree once,
+then alternates which binary runs first in each pair. Both use `BENCH_CPU`
+(default 2) and the same duration and filter. Set `BENCH_PKG` to a package
+directory relative to the repository root (default `./internal/engine`). The
+temporary result directory contains `before.txt`, `after.txt`, and `config.txt`.
+If `benchstat` is installed, the target also saves `comparison.txt`. Use a
+fixture that exists on both sides and measures the same workload. For an
+already committed change, use `BASE=HEAD^`.
+
+Keep the Go version, power settings and background load comparable. The query
+benchmarks populate each backend before timing. They measure query parsing,
+execution and result retrieval. Setup and cleanup are outside the timed region.
+tinySQL materializes results while SQLite rows are scanned via
 `database/sql`, and their query planners and storage settings differ, so these
 numbers are workload comparisons rather than isolated engine measurements.
 The `TestQueryBenchmarkFixtures` test checks expected result counts for each
