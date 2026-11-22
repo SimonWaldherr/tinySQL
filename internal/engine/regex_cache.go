@@ -18,8 +18,10 @@ var (
 
 type cachedRegexp struct {
 	re        *regexp.Regexp
+	literal   any // Nonempty plain pattern, boxed once for REGEXP_EXTRACT.
 	matchOnce sync.Once
 	match     func(string) bool
+	fixed     *fixedASCIIRegexp
 }
 
 // compileCachedRegexp returns a compiled regular expression from a global,
@@ -33,15 +35,23 @@ func compileCachedRegexp(pattern string) (*regexp.Regexp, error) {
 	return compiled.re, nil
 }
 
-// Boolean predicates can use a literal matcher while extraction/replacement
-// retain the original regexp, including its captures and match boundaries.
 func compileCachedRegexpMatcher(pattern string) (func(string) bool, error) {
 	compiled, err := loadCachedRegexp(pattern)
 	if err != nil {
 		return nil, err
 	}
-	compiled.matchOnce.Do(func() { compiled.match = compileRegexpStringMatcher(compiled.re) })
+	compiled.prepareMatcher()
 	return compiled.match, nil
+}
+
+func (re *cachedRegexp) prepareMatcher() {
+	re.matchOnce.Do(func() {
+		if literal, ok := re.literal.(string); ok {
+			re.match = func(text string) bool { return strings.Contains(text, literal) }
+			return
+		}
+		re.match = re.compileMatcher()
+	})
 }
 
 func loadCachedRegexp(pattern string) (*cachedRegexp, error) {
@@ -59,6 +69,11 @@ func loadCachedRegexp(pattern string) (*cachedRegexp, error) {
 		return nil, err
 	}
 	compiled = &cachedRegexp{re: re}
+	// LiteralPrefix can be marked complete for an anchored expression such as
+	// ^abc$. A plain pattern has no anchors or other regexp syntax to preserve.
+	if prefix, complete := re.LiteralPrefix(); complete && prefix != "" && prefix == pattern && regexp.QuoteMeta(pattern) == pattern {
+		compiled.literal = prefix
+	}
 	regexCacheMu.Lock()
 	defer regexCacheMu.Unlock()
 	if existing := regexCache[pattern]; existing != nil {

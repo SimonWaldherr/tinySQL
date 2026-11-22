@@ -389,7 +389,18 @@ func evalRawFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, erro
 			return handler(ExecEnv{now: plan.now}, ex, rawEmptyRow)
 		}
 		return evalFuncCall(ExecEnv{now: plan.now}, ex, rawEmptyRow)
-	case "DATE", "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH", "STRFTIME",
+	case "DATE":
+		if len(ex.Args) == 1 {
+			value, err := evalRawExpr(plan, raw, ex.Args[0])
+			if err != nil {
+				return nil, err
+			}
+			return dateTextValue(ExecEnv{now: plan.now}, value)
+		}
+		if len(ex.Args) > 1 {
+			return nil, rejectDateModifiers("DATE", ex.Args, 1)
+		}
+	case "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH", "STRFTIME",
 		"DATE_ADD", "DATE_SUB", "DATEADD", "DATESUB", "OVERLAPS", "EXTRACT", "DATE_TRUNC", "EOMONTH", "ADD_MONTHS":
 		if rawDateCallNeedsOrder(ex) {
 			return evalRawDateFuncCall(plan, raw, ex)

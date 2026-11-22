@@ -16,13 +16,15 @@ func TestCompiledRawScalarMatchesEvaluator(t *testing.T) {
 	columns := map[string]int{"a": 0, "b": 1, "c": 2}
 	plan := &simpleSelectPlan{colIndex: columns}
 	values := []any{nil, false, true, 0, 1, int64(math.MaxInt64), int64(9007199254740993),
-		0.0, 1.5, math.NaN(), math.Inf(1), "", "  α🙂 x  ", "\xffx\x80", "0", "FALSE",
+		0.0, 1.5, math.NaN(), math.Inf(1), "", "  α🙂 x  ", "\xffx\x80", "0", "FALSE", "İıKſΣς",
 		[]byte(nil), []byte{0, 255}, json.RawMessage(`{"v":1}`), big.NewRat(1, 2)}
 	for _, sql := range []string{
 		"ISNULL(a)", "ISNULL(NULLIF(a,b))", "NULLIF(a,b)", "COALESCE(NULLIF(a,b),c)",
 		"IF(a,b,1/0)", "IIF(a,1/0,b)", "IF(ISNULL(a),b,a)",
 		"TRIM(a)", "LTRIM(a,b)", "RTRIM(a,b)", "TRIM(a,CAST(b AS TEXT))",
 		"LENGTH(TRIM(a,b))", "LENGTH(a)", "LEN(a)", "CHAR_LENGTH(a)", "LOWER(a)", "UPPER(a)",
+		"LOWER(UPPER(a))", "UPPER(LOWER(a))", "UPPER(UPPER(a))",
+		"LEFT(a,2)", "RIGHT(a,2)", "SUBSTR(a,2)", "SUBSTRING(a,0,2)", "SUBSTR(a,99,0)",
 		"COALESCE(a,LENGTH(LOWER(b)),0)", "COALESCE(TRIM(a),b)",
 		"(a+1) BETWEEN b AND c", "COALESCE(a,b) BETWEEN b AND c",
 		"IF(ISNULL(a),b,a) NOT BETWEEN b AND c",
@@ -61,6 +63,7 @@ func TestCompiledRawScalarLazinessAndFallback(t *testing.T) {
 		"TRIM(a,missing)", "IF(a,7,ABS(a))", "COALESCE(a,LOWER(NOW()))",
 		"NULLIF(a,NOW())", "LENGTH(unknown_function(a))", "(a+1) BETWEEN 0 AND missing",
 		"ISNULL(CONVERT(DATE,a,a))",
+		"LEFT(a,a)", "SUBSTR(a,1,1/0)",
 	} {
 		expr := mustParse("SELECT " + sql).(*Select).Projs[0].Expr
 		if compileRawValue(columns, expr) != nil {

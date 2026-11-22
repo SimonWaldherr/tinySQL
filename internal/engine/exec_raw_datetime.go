@@ -6,7 +6,7 @@ import "fmt"
 // evaluating those literals early cannot expose a discarded expression error.
 func rawDateCallNeedsOrder(ex *FuncCall) bool {
 	switch ex.Name {
-	case "DATE", "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH":
+	case "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH":
 		return len(ex.Args) > 1
 	case "STRFTIME":
 		if len(ex.Args) == 1 {
@@ -66,7 +66,7 @@ func evalRawDateFuncCall(plan *simpleSelectPlan, raw []any, ex *FuncCall) (any, 
 		name = "DATE_SUB"
 	}
 	switch name {
-	case "DATE", "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH":
+	case "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH":
 		if err := rejectDateModifiers(ex.Name, ex.Args, 1); err != nil {
 			return nil, err
 		}

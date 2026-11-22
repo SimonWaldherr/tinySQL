@@ -92,3 +92,26 @@ func TestFixedDateMonthBoundaries(t *testing.T) {
 		}
 	}
 }
+
+func TestDateTextMatchesParsedTimestamp(t *testing.T) {
+	env := ExecEnv{now: time.Date(2024, 2, 29, 23, 0, 0, 0, time.FixedZone("local", -5*3600))}
+	for _, value := range []any{
+		nil, "0000-02-29", "2024-02-29 01:02:03,001", "2024-12-31T23:59:59.12345678999Z",
+		"2024-12-31T23:59:59-05:00", "02/29/2024", " now ", env.now,
+		"2100-02-29", "2024-02-30T00:00:00Z", "2024-02-29 23:59:60", "2024-02-29 01:02:03Z",
+	} {
+		got, err := dateTextValue(env, value)
+		var want any
+		var wantErr error
+		if value != nil {
+			date, parseErr := parseSQLiteTimeValue(env, value)
+			wantErr = parseErr
+			if parseErr == nil {
+				want = date.Format("2006-01-02")
+			}
+		}
+		if got != want || fmt.Sprint(err) != fmt.Sprint(wantErr) {
+			t.Fatalf("DATE(%v) = %v, %v; want %v, %v", value, got, err, want, wantErr)
+		}
+	}
+}

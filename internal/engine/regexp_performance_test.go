@@ -2,14 +2,32 @@ package engine
 
 import (
 	"context"
-	"github.com/SimonWaldherr/tinySQL/internal/storage"
 	"regexp"
 	"testing"
+
+	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
 func BenchmarkRegexpMatchFunctionScan(b *testing.B) {
 	db := setupPerfTable(b, 20000)
 	runBench(b, db, `SELECT id FROM t WHERE REGEXP_MATCH(note, 'number [0-9]{3}0')`)
+}
+
+func BenchmarkRegexpProjection(b *testing.B) {
+	db := setupPerfTable(b, 20_000)
+	b.Cleanup(func() { _ = db.Close() })
+	for _, tc := range []struct{ name, expr string }{
+		{"MatchClass", `REGEXP_MATCH(note, 'number [0-9]{3}0')`},
+		{"ExtractLiteral", `REGEXP_EXTRACT(note, 'lorem')`},
+		{"ExtractClass", `REGEXP_EXTRACT(note, '[0-9]+')`},
+		{"ExtractFixed", `REGEXP_EXTRACT(note, 'number [0-9]{3}0')`},
+		{"ReplaceLiteral", `REGEXP_REPLACE(note, 'lorem', 'word')`},
+		{"ReplaceFixed", `REGEXP_REPLACE(note, 'number [0-9]{3}0', 'number #')`},
+		{"ReplaceCaptures", `REGEXP_REPLACE(note, 'number ([0-9]+)', 'id=$1')`},
+		{"ReplaceAbsent", `REGEXP_REPLACE(note, 'missing [0-9]+', 'word')`},
+	} {
+		b.Run(tc.name, func(b *testing.B) { runBench(b, db, "SELECT "+tc.expr+" FROM t") })
+	}
 }
 
 func TestRegexpMatchRawFilter(t *testing.T) {

@@ -1,17 +1,18 @@
 package engine
 
 import (
-	"regexp"
 	"regexp/syntax"
 	"strings"
 	"unicode/utf8"
 )
 
-// compileRegexpStringMatcher specializes boolean matching only. Analyze the
+// compileMatcher specializes matching and records fixed-width spans. Analyze the
 // parsed regexp, never its spelling: escaped anchors, scoped flags and groups
 // must keep their Go regexp meanings. Anything outside literal runs, text
-// anchors and uniform dot-stars uses the original matcher.
-func compileRegexpStringMatcher(re *regexp.Regexp) func(string) bool {
+// anchors, uniform dot-stars and short, fixed-width ASCII classes uses the
+// original matcher.
+func (cached *cachedRegexp) compileMatcher() func(string) bool {
+	re := cached.re
 	expr, err := syntax.Parse(re.String(), syntax.Perl)
 	if err != nil {
 		return re.MatchString
@@ -65,6 +66,12 @@ func compileRegexpStringMatcher(re *regexp.Regexp) func(string) bool {
 			dotMode = mode
 			parts = append(parts, literal.String())
 			literal.Reset()
+		case syntax.OpCharClass, syntax.OpRepeat:
+			if fixed := compileFixedASCIIRegexp(nodes, start, end); fixed != nil {
+				cached.fixed = fixed
+				return fixed.match
+			}
+			return re.MatchString
 		default:
 			return re.MatchString
 		}

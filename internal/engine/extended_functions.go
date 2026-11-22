@@ -421,17 +421,12 @@ func evalRegexpExtract(env ExecEnv, args []Expr, row Row) (any, error) {
 	str := valueText(strVal)
 	pattern := valueText(patternVal)
 
-	re, err := compileCachedRegexp(pattern)
+	re, err := loadCachedRegexp(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP_EXTRACT: %v", err)
 	}
 
-	match := re.FindString(str)
-	if match == "" {
-		return nil, nil
-	}
-
-	return match, nil
+	return re.extractText(str), nil
 }
 
 // evalRegexpReplaceFunc replaces matches of a regex pattern
@@ -470,12 +465,12 @@ func evalRegexpReplace(env ExecEnv, args []Expr, row Row) (any, error) {
 	pattern := valueText(patternVal)
 	replacement := valueText(replVal)
 
-	re, err := compileCachedRegexp(pattern)
+	re, err := loadCachedRegexp(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("REGEXP_REPLACE: %v", err)
 	}
 
-	return re.ReplaceAllString(str, replacement), nil
+	return re.replaceText(strVal, str, replacement), nil
 }
 
 // ==================== Array Functions ====================

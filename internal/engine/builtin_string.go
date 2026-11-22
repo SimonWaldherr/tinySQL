@@ -328,16 +328,18 @@ func caseStringValue(val any, upper bool) any {
 		return nil
 	}
 	str := valueText(val)
-	var converted string
-	if upper {
-		converted = strings.ToUpper(str)
-	} else {
-		converted = strings.ToLower(str)
-	}
+	converted := mapStringCase(str, upper)
 	if _, ok := val.(string); ok && converted == str {
 		return val
 	}
 	return converted
+}
+
+func mapStringCase(str string, upper bool) string {
+	if upper {
+		return strings.ToUpper(str)
+	}
+	return strings.ToLower(str)
 }
 
 // stringEdge only decodes the requested edge, rather than allocating every rune.
@@ -355,16 +357,23 @@ func stringEdge(val any, str string, n int, right bool) any {
 		if (!right && boundary == len(str)) || (right && boundary == 0) {
 			break
 		}
-		var r rune
-		var width int
 		if right {
-			r, width = utf8.DecodeLastRuneInString(str[:boundary])
+			if str[boundary-1] < utf8.RuneSelf {
+				boundary--
+				continue
+			}
+			r, width := utf8.DecodeLastRuneInString(str[:boundary])
 			boundary -= width
+			invalid = invalid || (r == utf8.RuneError && width == 1)
 		} else {
-			r, width = utf8.DecodeRuneInString(str[boundary:])
+			if str[boundary] < utf8.RuneSelf {
+				boundary++
+				continue
+			}
+			r, width := utf8.DecodeRuneInString(str[boundary:])
 			boundary += width
+			invalid = invalid || (r == utf8.RuneError && width == 1)
 		}
-		invalid = invalid || (r == utf8.RuneError && width == 1)
 	}
 	if (!right && boundary == len(str)) || (right && boundary == 0) {
 		if _, ok := val.(string); ok {
@@ -508,21 +517,7 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("SUBSTRING start position must be an integer")
 	}
-	// Positive positions only need the prefix leading up to the requested
-	// window. Negative positions additionally need the total character count.
-	switch {
-	case start > 0:
-		start--
-	case start < 0:
-		start += utf8.RuneCountInString(str)
-	}
-	if start < 0 {
-		start = 0
-	}
-	startByte := substringByteOffset(str, start)
-	endByte := len(str)
-
-	// Get length if provided
+	var length int
 	if len(args) == 3 {
 		lengthVal, err := evalExpr(env, args[2], row)
 		if err != nil {
@@ -535,26 +530,40 @@ func evalSubstring(env ExecEnv, args []Expr, row Row) (any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("SUBSTRING length must be numeric")
 		}
-		length, ok := lengthAny.(int)
+		length, ok = lengthAny.(int)
 		if !ok {
 			return nil, fmt.Errorf("SUBSTRING length must be an integer")
 		}
+	}
+	return substringText(str, start, length, len(args) == 3), nil
+}
 
-		if length <= 0 {
-			return "", nil
-		}
+func substringText(str string, start, length int, limited bool) string {
+	if limited && length <= 0 {
+		return ""
+	}
+	// Positive positions only need the prefix leading up to the window.
+	// Negative positions additionally need the total character count.
+	switch {
+	case start > 0:
+		start--
+	case start < 0:
+		start += stringCharCount(str)
+	}
+	startByte := substringByteOffset(str, max(0, start))
+	endByte := len(str)
+	if limited {
 		endByte = startByte + substringByteOffset(str[startByte:], length)
 	}
-
 	part := str[startByte:endByte]
 	if !utf8.ValidString(part) {
 		// Preserve the original []rune conversion's handling of malformed UTF-8.
-		return string([]rune(part)), nil
+		return string([]rune(part))
 	}
 	if len(str) > 4096 && len(part) < len(str)/4 {
 		part = strings.Clone(part)
 	}
-	return part, nil
+	return part
 }
 
 // substringByteOffset locates a character boundary without scanning the suffix.

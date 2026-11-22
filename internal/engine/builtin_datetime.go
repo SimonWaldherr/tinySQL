@@ -13,7 +13,27 @@ import (
 	"time"
 )
 
-// parseTimeFixedDigits parses the fixed-width layouts "2006-01-02 15:04:05",
+type fixedDateTime struct {
+	year                             uint16
+	month, day, hour, minute, second uint8
+	nanosecond                       uint32
+}
+
+func (d fixedDateTime) time() time.Time {
+	return time.Date(int(d.year), time.Month(d.month), int(d.day), int(d.hour), int(d.minute), int(d.second), int(d.nanosecond), time.UTC)
+}
+
+func parseTimeFixedDigits(s string) (time.Time, bool) {
+	return parseFixedTimestamp(s, nil)
+}
+
+func parseFixedDateTime(s string) (fixedDateTime, bool) {
+	var fields fixedDateTime
+	_, ok := parseFixedTimestamp(s, &fields)
+	return fields, ok
+}
+
+// parseFixedTimestamp parses the fixed-width layouts "2006-01-02 15:04:05",
 // "2006-01-02T15:04:05" and "2006-01-02", including fractional seconds
 // and RFC3339 UTC timestamps, directly without going through
 // time.Parse's layout interpreter. Timestamp columns in analytical/RAG
@@ -23,8 +43,9 @@ import (
 // anything that does not match exactly — including out-of-range components,
 // which time.Date would silently normalize (e.g. month 13 → January) where
 // time.Parse reports an error — so callers fall back to the general path
-// and error behavior is unchanged.
-func parseTimeFixedDigits(s string) (time.Time, bool) {
+// and error behavior is unchanged. A caller that supplies fields receives
+// the validated components directly, without constructing a time.Time.
+func parseFixedTimestamp(s string, fields *fixedDateTime) (time.Time, bool) {
 	// SQL timestamps may include a fractional second. Validate every digit,
 	// truncating beyond nanoseconds just like time.Parse. Restrict the optional
 	// Z suffix to RFC3339's T separator; SQL space-separated timestamps with Z
@@ -110,7 +131,14 @@ func parseTimeFixedDigits(s string) (time.Time, bool) {
 	if d > lastDay {
 		return time.Time{}, false
 	}
-	return time.Date(y, time.Month(m), d, hh, mm, ss, nanos, time.UTC), true
+	if fields == nil {
+		return time.Date(y, time.Month(m), d, hh, mm, ss, nanos, time.UTC), true
+	}
+	*fields = fixedDateTime{
+		year: uint16(y), month: uint8(m), day: uint8(d),
+		hour: uint8(hh), minute: uint8(mm), second: uint8(ss), nanosecond: uint32(nanos),
+	}
+	return time.Time{}, true
 }
 
 func parseTimeValue(val any) (time.Time, error) {
@@ -318,8 +346,44 @@ func evalStrftime(env ExecEnv, args []Expr, row Row) (any, error) {
 }
 
 func evalDate(env ExecEnv, args []Expr, row Row) (any, error) {
-	t, null, err := sqliteTimeArg(env, "DATE", args, 0, row)
-	if err != nil || null {
+	if err := rejectDateModifiers("DATE", args, 1); err != nil {
+		return nil, err
+	}
+	if len(args) == 0 {
+		return envNow(env).Format("2006-01-02"), nil
+	}
+	val, err := evalExpr(env, args[0], row)
+	if err != nil {
+		return nil, err
+	}
+	return dateTextValue(env, val)
+}
+
+func dateTextValue(env ExecEnv, val any) (any, error) {
+	if val == nil {
+		return nil, nil
+	}
+	var t time.Time
+	var err error
+	if text, ok := val.(string); ok {
+		if _, valid := parseFixedDateTime(text); valid {
+			if len(text) == 10 {
+				return val, nil
+			}
+			if len(text) > 4096 {
+				return strings.Clone(text[:10]), nil
+			}
+			return text[:10], nil
+		}
+		if strings.EqualFold(strings.TrimSpace(text), "now") {
+			t = envNow(env)
+		} else {
+			t, err = parseDateTimeFallback(text)
+		}
+	} else {
+		t, err = parseDateTime(val)
+	}
+	if err != nil {
 		return nil, err
 	}
 	return t.Format("2006-01-02"), nil
@@ -388,9 +452,43 @@ func evalDateComponent(name string, args []Expr, eval func(Expr) (any, error)) (
 	if err != nil || value == nil {
 		return nil, err
 	}
-	date, err := parseDateTime(value)
+	part, err := dateComponentInt(name, value)
 	if err != nil {
 		return nil, err
+	}
+	return part, nil
+}
+
+func dateComponentInt(name string, value any) (int, error) {
+	var date time.Time
+	var err error
+	if text, ok := value.(string); ok {
+		if fields, valid := parseFixedDateTime(text); valid {
+			switch name {
+			case "YEAR":
+				return int(fields.year), nil
+			case "MONTH":
+				return int(fields.month), nil
+			case "DAY":
+				return int(fields.day), nil
+			case "HOUR":
+				return int(fields.hour), nil
+			case "MINUTE":
+				return int(fields.minute), nil
+			case "SECOND":
+				return int(fields.second), nil
+			case "QUARTER":
+				return (int(fields.month)-1)/3 + 1, nil
+			}
+			date = fields.time()
+		} else {
+			date, err = parseDateTimeFallback(text)
+		}
+	} else {
+		date, err = parseDateTime(value)
+	}
+	if err != nil {
+		return 0, err
 	}
 	switch name {
 	case "YEAR":
@@ -417,7 +515,7 @@ func evalDateComponent(name string, args []Expr, eval func(Expr) (any, error)) (
 	case "QUARTER":
 		return (int(date.Month())-1)/3 + 1, nil
 	}
-	return nil, fmt.Errorf("unknown date component %q", name)
+	return 0, fmt.Errorf("unknown date component %q", name)
 }
 
 func evalYear(env ExecEnv, args []Expr, row Row) (any, error) {
@@ -476,6 +574,10 @@ func parseDateTime(val any) (time.Time, error) {
 	if t, ok := parseTimeFixedDigits(str); ok {
 		return t, nil
 	}
+	return parseDateTimeFallback(str)
+}
+
+func parseDateTimeFallback(str string) (time.Time, error) {
 	// These legacy layouts cannot overlap ISO timestamps. Try their matching
 	// shape before allocating errors for all the preceding ISO layouts.
 	var legacyLayout string

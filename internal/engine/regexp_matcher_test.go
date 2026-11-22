@@ -23,11 +23,15 @@ func TestRegexpMatcherMatchesGo(t *testing.T) {
 		`a|bc`, `(?:a|b).*c`, `[[:alpha:]]+`, `^\p{L}+$`, `\babc\b`,
 		`a{0,3}`, `^a.+b$`, `a.*\x{FFFD}`, `^�$`, `\x{FFFD}`, `[^\n]*`, `(?s:[^x])*`,
 		`^é.*🙂$`, `a.*ab`, `^ab.*bc$`, `.*a.*a`, `a$^`, `^a^`, `a$$`,
+		`number [0-9]{3}0`, `^item-[[:digit:]]{4}$`, `\A[AB]{2}_\d{2}\z`, `([0-9]{2})z$`,
+		`^a[0-9]`, `aa[0-9]`, `x([a-c]){2}z`, `^a[^0-9]{2}$`, `(?i)^k[a-z]{2}$`, `(?m)^a[0-9]$`,
 	}
 	texts := []string{
 		"", "a", "b", "abc", "abbc", "ab", "aa", "xaabcy", "a\nb", "a\nbc", "a\rbc", "ab\n",
 		"\n", "\nabc", "abc\n", "abc\nabc", "a\nb\nc", "a.*b$", "^a", "a\x00b",
 		"é🙂", "é\n🙂", "K", "Σ", "ς", "�", "\xff", "a\xffb", "a\xc0\xafbc", "\xc3a",
+		"number 1230", "number 1231", "number 1231 number 0120", "item-0007", "item-１２３４", "AA_01", "BA_08",
+		"aaa5", "0xaabz", "a9\xff", "\xffaa5\xff", "a9", "a9\n", "\nitem-0007\n", "99z",
 	}
 	check := func(pattern string, inputs []string) {
 		t.Helper()

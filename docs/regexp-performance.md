@@ -1,4 +1,4 @@
-# REGEXP filter performance
+# REGEXP performance
 
 `WHERE REGEXP_MATCH(column, 'constant pattern')` binds a compiled boolean matcher
 to the raw-row filter. Each row accesses the column directly, avoiding generic
@@ -8,15 +8,23 @@ query-result cache is introduced.
 The existing `REGEXP`, `RLIKE` and `SIMILAR TO` constant-pattern predicates
 already bind their patterns this way. Bound parameters remain dynamic rather
 than being captured as constants. Other expression shapes use the existing
-general evaluator and share the same matcher. `REGEXP_EXTRACT` and
-`REGEXP_REPLACE` keep the original compiled Go regexp and its capture/match
-boundaries; they do not build the boolean optimization unless it is requested.
+general evaluator and share the same matcher. `REGEXP_MATCH`, `REGEXP_EXTRACT`
+and `REGEXP_REPLACE` can also bind constant patterns in raw-row projections.
+Extraction and replacement use string operations for plain literal patterns
+where applicable. Capture substitutions and empty matches use Go regexp.
+Replacement can return the original string if a required literal prefix is
+absent.
 
 Literal patterns such as `ERROR_`, `^ERROR_`, `timeout$` and `^ERROR_timeout$`
 use direct string searches. Literal runs separated by `.*` use ordered searches
 with non-overlapping segments. The optimization analyzes the parsed regexp,
-including escaped literals and text anchors. Case folding, multiline anchors,
-character classes, alternatives and other unsupported shapes retain Go regexp.
+including escaped literals and text anchors. Short, fixed-width ASCII classes
+such as `number [0-9]{3}0` can use byte masks when the pattern has an anchor or
+literal prefix. Case folding, multiline anchors and variable-width classes use
+Go regexp.
+The same fixed-width matcher supplies the first match for `REGEXP_EXTRACT`
+and successive non-overlapping matches for `REGEXP_REPLACE` with literal
+replacement text. Capture substitutions use Go regexp.
 Dot-star matching respects newlines: `(?s)^ERROR_.*timeout$` permits them,
 while `^ERROR_.*timeout$` does not.
 
@@ -31,6 +39,7 @@ so NULL inputs still short-circuit errors as before.
 go test ./internal/engine -run 'TestRegexp'
 go test ./internal/engine -run '^$' -bench '^BenchmarkRegexpMatchFilter$' -benchmem -count=3 -benchtime=700ms
 go test ./internal/engine -run '^$' -bench 'BenchmarkRegexp(MatchFunction|Row)Scan$' -benchmem -count=3 -benchtime=500ms
+go test ./internal/engine -run '^$' -bench '^BenchmarkRegexpProjection$' -benchmem -count=4 -benchtime=150ms
 go test ./internal/engine -run '^$' -bench '^BenchmarkRegexpLikeSubstr$' -benchmem -count=3 -benchtime=500ms
 go test ./internal/engine -run '^TestTextSearchAlternativeFilters$'
 go test ./internal/engine -run '^$' -bench '^BenchmarkTextSearchAlternatives$' -benchmem -count=3 -benchtime=300ms
@@ -67,7 +76,19 @@ supports word/phrase/boolean queries, so it is not a literal substring substitut
 and is not included in the equivalent-filter timings. LEVENSHTEIN measures edit
 distance and is useful for typo tolerance rather than wildcard matching.
 
-On Apple M2 Max, darwin/arm64, Go 1.27.1, the isolated benchmark's three-run
-medians were 334.4 ns/op (generic) and 151.2 ns/op (bound), approximately 55%
-less filter time. Both paths allocated 0 B/op. This measures the filter only,
-not a general speedup for extraction, replacement or complete SQL queries.
+On Apple M2 Max with Go 1.27.4 and `GOMAXPROCS=2`, four alternating runs of the
+20,000-row scan and projection workloads recorded these medians. Projection
+times include constructing the result rows.
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| Fixed-width `REGEXP` filter | 1.92 ms | 0.68 ms |
+| Literal `REGEXP_EXTRACT` | 6.11 ms | 2.37 ms |
+| Literal `REGEXP_REPLACE` | 8.15 ms | 4.04 ms |
+| `REGEXP_REPLACE` with absent prefix | 6.53 ms | 3.14 ms |
+
+A separate comparison against the boolean-only optimization used the same
+20,000-row fixture and the pattern `number [0-9]{3}0`. Reusing the matcher
+for extraction reduced the median from 4.51 to 2.82 ms. Replacing matches
+with `number #` took 3.06 ms, down from 6.05 ms, and used about 62,000 fewer
+allocations per query.

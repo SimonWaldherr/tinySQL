@@ -9,7 +9,13 @@ func compileRawScalar(columns map[string]int, call *FuncCall) rawValueEvaluator 
 		return nil
 	}
 	switch call.Name {
-	case "ISNULL", "LENGTH", "LEN", "CHAR_LENGTH", "LOWER", "UPPER":
+	case "LOWER", "UPPER":
+		return compileRawCaseConversion(columns, call)
+	case "LEFT", "RIGHT", "SUBSTR", "SUBSTRING":
+		return compileRawStringSlice(columns, call)
+	case "REGEXP_MATCH", "REGEXP_EXTRACT", "REGEXP_REPLACE":
+		return compileRawRegexp(columns, call)
+	case "ISNULL", "LENGTH", "LEN", "CHAR_LENGTH":
 		if len(call.Args) != 1 {
 			return nil
 		}
@@ -34,22 +40,13 @@ func compileRawScalar(columns map[string]int, call *FuncCall) rawValueEvaluator 
 				}
 				return isNull(v), nil
 			}
-		case "LENGTH", "LEN", "CHAR_LENGTH":
+		default:
 			return func(raw []any) (any, error) {
 				v, err := value(raw)
 				if err != nil {
 					return nil, err
 				}
 				return stringLengthValue(v), nil
-			}
-		default:
-			upper := call.Name == "UPPER"
-			return func(raw []any) (any, error) {
-				v, err := value(raw)
-				if err != nil {
-					return nil, err
-				}
-				return caseStringValue(v, upper), nil
 			}
 		}
 	case "NULLIF":
@@ -118,7 +115,107 @@ func compileRawScalar(columns map[string]int, call *FuncCall) rawValueEvaluator 
 			return jsonGetByParts(value, parts), nil
 		}
 	}
+	if date := compileRawDateComponent(columns, call); date != nil {
+		return func(raw []any) (any, error) {
+			value, err := date(raw)
+			if err != nil {
+				return nil, err
+			}
+			return value.toAny(), nil
+		}
+	}
 	return nil
+}
+
+func compileRawCaseConversion(columns map[string]int, call *FuncCall) rawValueEvaluator {
+	if len(call.Args) != 1 {
+		return nil
+	}
+	upper := call.Name == "UPPER"
+	if nested, ok := call.Args[0].(*FuncCall); ok && len(nested.Args) == 1 &&
+		nested.Over == nil && nested.Filter == nil && (nested.Name == "UPPER" || nested.Name == "LOWER") {
+		if value := compileRawValue(columns, nested.Args[0]); value != nil {
+			nestedUpper := nested.Name == "UPPER"
+			return func(raw []any) (any, error) {
+				v, err := value(raw)
+				if err != nil || v == nil {
+					return nil, err
+				}
+				if text, ok := v.(string); ok && stringIsASCII(text) {
+					return caseStringValue(v, upper), nil
+				}
+				// Unicode's upper and lower mappings are not inverses. Keep
+				// both mappings and pass the intermediate as a plain string.
+				return mapStringCase(mapStringCase(valueText(v), nestedUpper), upper), nil
+			}
+		}
+	}
+	value := compileRawValue(columns, call.Args[0])
+	if value == nil {
+		return nil
+	}
+	return func(raw []any) (any, error) {
+		v, err := value(raw)
+		if err != nil {
+			return nil, err
+		}
+		return caseStringValue(v, upper), nil
+	}
+}
+
+// Literal positions cannot fail during evaluation. Bound parameters and
+// dynamic positions keep the existing evaluator and argument ordering.
+func compileRawStringSlice(columns map[string]int, call *FuncCall) rawValueEvaluator {
+	substring := call.Name == "SUBSTR" || call.Name == "SUBSTRING"
+	if len(call.Args) != 2 && !(substring && len(call.Args) == 3) {
+		return nil
+	}
+	position, ok := rawStringPosition(call.Args[1])
+	if !ok {
+		return nil
+	}
+	limited := len(call.Args) == 3
+	var length int
+	if limited {
+		length, ok = rawStringPosition(call.Args[2])
+		if !ok {
+			return nil
+		}
+	}
+	value := compileRawValue(columns, call.Args[0])
+	if value == nil {
+		return nil
+	}
+	right := call.Name == "RIGHT"
+	return func(raw []any) (any, error) {
+		v, err := value(raw)
+		if err != nil || v == nil {
+			return nil, err
+		}
+		text := valueText(v)
+		if substring {
+			return substringText(text, position, length, limited), nil
+		}
+		return stringEdge(v, text, position, right), nil
+	}
+}
+
+func rawStringPosition(expr Expr) (int, bool) {
+	literal, ok := expr.(*Literal)
+	if !ok || literal.Parameter {
+		return 0, false
+	}
+	// Do not read mutable decimal values at plan time. Numeric literals
+	// parsed from SQL use int, int64 or float64.
+	switch val := literal.Val.(type) {
+	case int:
+		return val, true
+	case int64:
+		return int(val), true
+	case float64:
+		return int(val), true
+	}
+	return 0, false
 }
 
 func compileRawTrim(columns map[string]int, call *FuncCall) rawValueEvaluator {

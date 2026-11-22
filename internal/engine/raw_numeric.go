@@ -100,6 +100,8 @@ func compileRawNumeric(columns map[string]int, expr Expr) rawNumericEvaluator {
 			return nil
 		}
 		return makeRawColNumericEvaluator(colIdx, ex.Name)
+	case *FuncCall:
+		return compileRawDateComponent(columns, ex)
 	case *Unary:
 		if ex.Op == "+" {
 			return compileRawNumeric(columns, ex.Expr)
@@ -239,6 +241,30 @@ func compileRawNumeric(columns map[string]int, expr Expr) rawNumericEvaluator {
 		}
 	}
 	return nil
+}
+
+func compileRawDateComponent(columns map[string]int, call *FuncCall) rawNumericEvaluator {
+	if len(call.Args) != 1 || call.Over != nil || call.Filter != nil {
+		return nil
+	}
+	name := call.Name
+	switch name {
+	case "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DAYOFWEEK", "DAYOFYEAR", "WEEKOFYEAR", "QUARTER", "ISODOW":
+	default:
+		return nil
+	}
+	value := compileRawValue(columns, call.Args[0])
+	if value == nil {
+		return nil
+	}
+	return func(raw []any) (rawNum, error) {
+		v, err := value(raw)
+		if err != nil || v == nil {
+			return rawNum{isNull: true}, err
+		}
+		part, err := dateComponentInt(name, v)
+		return rawNum{intVal: int64(part)}, err
+	}
 }
 
 func compareFloatUnboxed(ax, f float64) int {
