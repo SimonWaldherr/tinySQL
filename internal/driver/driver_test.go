@@ -1415,16 +1415,25 @@ func TestServerPersistDebounceCoalescesBurst(t *testing.T) {
 		t.Fatalf("expected no autosave file before the debounce window elapses, stat err=%v", err)
 	}
 
-	time.Sleep(6 * window)
+	// The debounce window schedules a sync. Writing and renaming the file
+	// can take longer, so wait for the completed autosave.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := os.Stat(path)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) || time.Now().After(deadline) {
+			t.Fatalf("expected autosave file after the debounced sync: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	s.persistMu.Lock()
 	finalCount := s.persistSyncCount
 	s.persistMu.Unlock()
 	if finalCount != 1 {
 		t.Fatalf("expected exactly 1 actual sync for %d debounced persist() calls, got %d", calls, finalCount)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected autosave file once the debounce window elapsed: %v", err)
 	}
 }
 
