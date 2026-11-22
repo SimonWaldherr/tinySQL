@@ -3204,6 +3204,36 @@ async function importSingleFile(file) {
     }
 }
 
+const fileLibraries = {
+    XLSX: 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js',
+    shp: 'https://cdn.jsdelivr.net/npm/shpjs@6.2.0/dist/shp.min.js',
+};
+const pendingFileLibraries = new Map();
+
+function loadFileLibrary(name) {
+    const pending = pendingFileLibraries.get(name);
+    if (pending) return pending;
+    if (globalThis[name]) return Promise.resolve(globalThis[name]);
+
+    const loading = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = fileLibraries[name];
+        const finish = () => {
+            clearTimeout(timeout);
+            script.remove();
+            const library = globalThis[name];
+            if (library) resolve(library);
+            else reject(new Error(`Could not load ${name}`));
+        };
+        const timeout = setTimeout(finish, 15000);
+        script.onload = finish;
+        script.onerror = finish;
+        document.head.appendChild(script);
+    }).finally(() => pendingFileLibraries.delete(name));
+    pendingFileLibraries.set(name, loading);
+    return loading;
+}
+
 // Import Excel file using SheetJS
 async function importExcelFile(file) {
     const workspaceAtStart = activeWorkspaceId;
@@ -3213,26 +3243,24 @@ async function importExcelFile(file) {
     let attempted = false;
     let firstImportedTable = '';
     let failureStatus = '';
-    if (typeof XLSX === 'undefined') {
-        showToast('Excel support is unavailable right now. Try CSV or JSON, or refresh the page.', 'error');
-        updateStatus('Excel support unavailable');
-        return false;
-    }
-
     updateStatus(`Reading Excel file: ${file.name}...`);
 
     try {
+        const xlsx = await loadFileLibrary('XLSX');
+        if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
+            return false;
+        }
         const data = new Uint8Array(await readFile(file, 'readAsArrayBuffer'));
         if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
             return false;
         }
-        const workbook = XLSX.read(data, { type: 'array' });
+        const workbook = xlsx.read(data, { type: 'array' });
         for (const sheetName of workbook.SheetNames) {
             if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
                 return false;
             }
             const worksheet = workbook.Sheets[sheetName];
-            const jsonData = XLSX.utils.sheet_to_json(worksheet);
+            const jsonData = xlsx.utils.sheet_to_json(worksheet);
             if (jsonData.length === 0) {
                 continue;
             }
@@ -3304,15 +3332,13 @@ async function importShapefileFile(file) {
     let attempted = false;
     let firstImportedTable = '';
     let failureStatus = '';
-    if (typeof shp !== 'function') {
-        showToast('Shapefile support is unavailable right now. Try GeoJSON, or refresh the page.', 'error');
-        updateStatus('Shapefile support unavailable');
-        return false;
-    }
-
     updateStatus(`Reading shapefile: ${file.name}...`);
 
     try {
+        const shp = await loadFileLibrary('shp');
+        if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
+            return false;
+        }
         const data = await readFile(file, 'readAsArrayBuffer');
         if (workspaceAtStart !== activeWorkspaceId || epochAtStart !== workspaceEpoch || !requireStableWorkspace('import files')) {
             return false;
@@ -4724,7 +4750,15 @@ async function doExport(format) {
     // Client-side fallback
     if (format === 'csv') exportCSV(visible);
     else if (format === 'tsv') exportTSV(visible);
-    else if (format === 'xlsx') exportXLSX(visible);
+    else if (format === 'xlsx') {
+        const epochAtStart = workspaceEpoch;
+        try {
+            await loadFileLibrary('XLSX');
+            if (epochAtStart === workspaceEpoch) exportXLSX(visible);
+        } catch (error) {
+            showToast(`Excel export failed: ${error.message}`, 'error');
+        }
+    }
     else if (format === 'md') exportMarkdown(visible);
     else if (format === 'json') exportJSON(visible);
     else if (format === 'xml') exportXML(visible);

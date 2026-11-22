@@ -89,6 +89,62 @@ test('imports CSV and JSONL through the file input and queries their values', as
     await query(page, 'SELECT id, note FROM events ORDER BY id', [['1', "it's {color:blue}"], ['2', 'Grüße']]);
 });
 
+test('loads file parsers only when needed and retries a failed load', async ({ page }) => {
+    const requests = [];
+    const parserRequests = () => page.evaluate(() => performance.getEntriesByType('resource')
+        .filter(entry => /cdn\.jsdelivr\.net\/npm\/(xlsx|shpjs)@/.test(entry.name))
+        .map(entry => entry.name));
+    expect(await parserRequests()).toEqual([]);
+    await query(page, 'SELECT 1 AS ready', [['1']]);
+    expect(await parserRequests()).toEqual([]);
+
+    let excelRequests = 0;
+    await page.route('https://cdn.jsdelivr.net/npm/xlsx@*/dist/xlsx.full.min.js', route => {
+        requests.push('excel');
+        if (++excelRequests === 1) return route.abort();
+        return route.fulfill({ contentType: 'text/javascript', body: `
+            globalThis.XLSX = {
+                read: () => ({SheetNames: ['SheetOne'], Sheets: {SheetOne: {}}}),
+                utils: {
+                    sheet_to_json: () => [{value: 'from workbook'}],
+                    aoa_to_sheet: () => ({}),
+                    book_new: () => ({}),
+                    book_append_sheet: () => {},
+                },
+                write: () => Uint8Array.from([80, 75]),
+            };
+        ` });
+    });
+    await page.route('https://cdn.jsdelivr.net/npm/shpjs@*/dist/shp.min.js', route => {
+        requests.push('shapefile');
+        return route.fulfill({ contentType: 'text/javascript', body: `
+            globalThis.shp = async () => ({
+                type: 'FeatureCollection', fileName: 'sample_shape',
+                features: [{type: 'Feature', properties: {label: 'marker'},
+                            geometry: {type: 'Point', coordinates: [11.57, 48.13]}}],
+            });
+        ` });
+    });
+    page.on('dialog', dialog => dialog.dismiss());
+    const input = page.locator('#fileInput');
+    const workbook = {name: 'demo.xlsx', mimeType: 'application/octet-stream', buffer: Buffer.from('stub')};
+    await input.setInputFiles(workbook);
+    await expect(page.locator('#statusText')).toHaveText('Excel import failed');
+    await expect(input).toHaveValue('');
+    await page.locator('#resultsExportTrigger').click();
+    const download = page.waitForEvent('download');
+    await page.getByRole('menuitem', {name: 'Excel (.xlsx, page)'}).click();
+    expect((await download).suggestedFilename()).toBe('query_results.xlsx');
+    await input.setInputFiles(workbook);
+    await expect(page.locator('#statusText')).toHaveText('Excel file imported: 1 sheet(s)');
+    await expect(input).toHaveValue('');
+    await query(page, 'SELECT value FROM sheetone', [['from workbook']]);
+    await input.setInputFiles({...workbook, name: 'demo.zip'});
+    await expect(page.locator('#statusText')).toContainText('1 layer(s)');
+    await query(page, 'SELECT label FROM sample_shape', [['marker']]);
+    expect(requests).toEqual(['excel', 'excel', 'shapefile']);
+});
+
 test('analyzes one selected read-only query without editing the script', async ({ page }) => {
     await importFiles(page, [['people.csv', 'id,name\n1,Alice\n2,Bob\n']]);
     const editor = page.getByRole('textbox', { name: 'SQL query editor' });

@@ -6,8 +6,10 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/tinysql-pages-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 REPO="$TMP/source"
 WORKTREE="$TMP/pages"
-mkdir -p "$REPO/scripts" "$REPO/cmd/query_files_wasm"
-cp "$ROOT/scripts/gh-pages.sh" "$REPO/scripts/"
+mkdir -p "$REPO/scripts" "$REPO/cmd/query_files_wasm" "$REPO/docs/reference"
+cp "$ROOT/scripts/gh-pages.sh" "$ROOT/scripts/stage-pages-reference.py" "$REPO/scripts/"
+printf '<a href="functions.sql">SQL source</a>\n' > "$REPO/docs/reference/functions.html"
+printf 'SELECT 1;\n' > "$REPO/docs/reference/functions.sql"
 cp "$ROOT/cmd/query_files_wasm/pages-assets.txt" "$REPO/cmd/query_files_wasm/"
 ASSETS="$REPO/cmd/query_files_wasm"
 while IFS= read -r file; do
@@ -79,11 +81,16 @@ cmp "$TMP/expected-build.log" "$PAGES_TEST_LOG"
 
 "$PAGES" stage "$TMP/staged"
 [ -f "$TMP/staged/.nojekyll" ]
+cmp "$REPO/docs/reference/functions.sql" "$TMP/staged/docs/reference/functions.sql"
 printf 'protected\n' > "$TMP/protected"
 mkdir "$TMP/symlinked"
 ln -s "$TMP/protected" "$TMP/symlinked/index.html"
 expect_failure "$PAGES" stage "$TMP/symlinked"
 [ "$(cat "$TMP/protected")" = protected ]
+rm "$TMP/symlinked/index.html"
+ln -s "$TMP" "$TMP/symlinked/docs"
+expect_failure "$PAGES" stage "$TMP/symlinked"
+[ ! -e "$TMP/reference" ]
 printf 'invalid javascript (\n' > "$ASSETS/tiles-demo-bavaria.js"
 expect_failure "$PAGES" check
 git -C "$REPO" restore cmd/query_files_wasm/tiles-demo-bavaria.js
@@ -98,6 +105,8 @@ git -C "$REPO" restore cmd/query_files_wasm/query_files.wasm.gz
 
 "$PAGES" update "$WORKTREE" gh-pages 'Update demo' > "$TMP/update.log" 2>&1
 [ "$(cat "$WORKTREE/bavaria-snapshot.b64")" = 'keep the separate dataset' ]
+cmp "$TMP/staged/docs/reference/functions.html" "$WORKTREE/docs/reference/functions.html"
+git -C "$WORKTREE" ls-files --error-unmatch docs/reference/functions.sql > /dev/null
 head="$(git -C "$WORKTREE" rev-parse HEAD)"
 "$PAGES" update "$WORKTREE" gh-pages 'Unnecessary commit' >> "$TMP/update.log" 2>&1
 [ "$(git -C "$WORKTREE" rev-parse HEAD)" = "$head" ]

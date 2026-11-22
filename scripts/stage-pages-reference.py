@@ -21,6 +21,9 @@ class Links(HTMLParser):
 def stage_reference(site, repository):
     source = repository / "docs" / "reference"
     destination = site / "docs" / "reference"
+    for path in (destination.parent, destination, destination / "functions.html", destination / "functions.sql"):
+        if path.is_symlink():
+            raise ValueError(f"refusing to overwrite symlink: {path}")
     destination.mkdir(parents=True, exist_ok=True)
     html = (source / "functions.html").read_text(encoding="utf-8")
     html = html.replace('href="../sql-semantics.md"',
@@ -55,7 +58,11 @@ def main():
         return 2
     site = Path(sys.argv[1])
     repository = Path(__file__).resolve().parent.parent
-    stage_reference(site, repository)
+    try:
+        stage_reference(site, repository)
+    except (OSError, ValueError) as error:
+        print(error, file=sys.stderr)
+        return 1
     errors = validate_links(site)
     if errors:
         print("\n".join(errors), file=sys.stderr)

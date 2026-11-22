@@ -34,6 +34,7 @@ GO
 cat > "$TMP/bin/wasm-opt" <<'OPT'
 #!/usr/bin/env bash
 if [ "$1" = --version ]; then cat "$WASM_BUILD_TEST_DIR/optimizer-version"; exit; fi
+printf '%s\n' "$@" > "$WASM_BUILD_TEST_DIR/optimizer-flags"
 # An optional optimizer failure must preserve the valid Go output.
 exit 1
 OPT
@@ -50,6 +51,9 @@ unchanged() { cmp -s "$TMP/saved.wasm" "$DEMO/query_files.wasm" && cmp -s "$TMP/
 
 run_build
 [ "$(builds)" = 1 ]
+grep -qx -- '--mvp-features' "$TMP/optimizer-flags"
+grep -qx -- '--enable-nontrapping-float-to-int' "$TMP/optimizer-flags"
+if grep -qx -- '--all-features' "$TMP/optimizer-flags"; then exit 1; fi
 run_build
 [ "$(builds)" = 1 ]
 grep -q 'skipping rebuild' "$TMP/build.log"

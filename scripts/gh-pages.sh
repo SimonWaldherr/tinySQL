@@ -6,6 +6,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 SOURCE_DIR="${GH_PAGES_SOURCE_DIR:-$REPO_ROOT/cmd/query_files_wasm}"
 MANIFEST="${GH_PAGES_MANIFEST:-$REPO_ROOT/cmd/query_files_wasm/pages-assets.txt}"
 REMOTE="${GH_PAGES_REMOTE:-origin}"
+REFERENCE_ASSETS=(docs/reference/functions.html docs/reference/functions.sql)
 
 die() { echo "gh-pages: $*" >&2; exit 1; }
 
@@ -67,6 +68,11 @@ copy_assets() {
     touch "$destination/.nojekyll"
 }
 
+stage_site() {
+    copy_assets "$1"
+    python3 "$REPO_ROOT/scripts/stage-pages-reference.py" "$1"
+}
+
 common_dir() {
     local directory
     directory="$(git -C "$1" rev-parse --git-common-dir)" || return 1
@@ -103,8 +109,8 @@ update_branch() {
     elif ! git -C "$worktree" merge-base --is-ancestor "$remote_ref" "$head"; then
         die "$branch has diverged from $REMOTE/$branch; refusing to overwrite local commits"
     fi
-    copy_assets "$worktree"
-    git -C "$worktree" add -- .nojekyll "${ASSETS[@]}"
+    stage_site "$worktree"
+    git -C "$worktree" add -- .nojekyll "${ASSETS[@]}" "${REFERENCE_ASSETS[@]}"
     if git -C "$worktree" diff --cached --quiet; then
         echo "gh-pages: $branch already up to date"
     else
@@ -114,7 +120,7 @@ update_branch() {
 
 case "${1:-}" in
     check) [ "$#" -le 2 ] || die "usage: $0 check [directory]"; check_assets "${2:-$SOURCE_DIR}" ;;
-    stage) [ "$#" -eq 2 ] || die "usage: $0 stage directory"; check_assets "$SOURCE_DIR"; copy_assets "$2"; check_assets "$2" ;;
+    stage) [ "$#" -eq 2 ] || die "usage: $0 stage directory"; check_assets "$SOURCE_DIR"; stage_site "$2"; check_assets "$2" ;;
     update) [ "$#" -eq 4 ] || die "usage: $0 update worktree branch message"; update_branch "$2" "$3" "$4" ;;
     *) die "usage: $0 {check [directory]|stage directory|update worktree branch message}" ;;
 esac

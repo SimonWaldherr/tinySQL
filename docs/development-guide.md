@@ -181,10 +181,11 @@ starts a new Pages run explicitly: a branch push using `GITHUB_TOKEN` alone
 does not trigger a Pages build.
 
 Use `make build-gh-pages-demo` for a local build and `make check-gh-pages-demo`
-to validate existing output. The compatible `make update-gh-pages` and
-`make push-gh-pages` targets remain available for repositories configured to
-publish from a branch. With the Actions source, commit source changes to `main`
-to publish the current application.
+to validate existing output. `make update-gh-pages` commits the playground and
+SQL reference to a separate worktree and preserves the existing dataset.
+`make push-gh-pages` also pushes that branch for branch-based publication.
+With the Actions source, push source changes to `main` to publish the current
+application.
 
 ## Releases
 

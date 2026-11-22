@@ -202,10 +202,11 @@ if ! $SKIP_BUILD; then
 
         ORIGINAL_SIZE=$(filesize "$BUILD_TMP/$WASM_OUT")
         TMP_OUT="$BUILD_TMP/optimized.wasm"
-        # Go emits bulk-memory and non-trapping float-to-int operations.
-        # --all-features lets Binaryen validate those instructions; the former
-        # --enable-bulk-memory-only invocation silently rejected the module.
-        if wasm-opt --all-features -Oz --strip-debug -o "$TMP_OUT" "$BUILD_TMP/$WASM_OUT"; then
+        # Allow the Go module's extensions without letting Binaryen emit
+        # experimental instructions or import kinds browsers cannot decode.
+        if wasm-opt --mvp-features --enable-mutable-globals --enable-sign-ext \
+            --enable-bulk-memory --enable-nontrapping-float-to-int \
+            -Oz --strip-debug -o "$TMP_OUT" "$BUILD_TMP/$WASM_OUT"; then
             OPTIMIZED_SIZE=$(filesize "$TMP_OUT")
             if [ "$OPTIMIZED_SIZE" -gt 0 ] &&
                [ "$OPTIMIZED_SIZE" -lt "$ORIGINAL_SIZE" ] &&

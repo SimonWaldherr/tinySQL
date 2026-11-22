@@ -17,6 +17,7 @@ function fixture(responses) {
         XLSX: { read: () => ({ SheetNames: ['first', 'second'], Sheets: {first: {}, second: {}} }),
             utils: { sheet_to_json: () => [{id: 1}] } },
         shp: async () => [{fileName: 'first', features: [{}]}, {fileName: 'second', features: [{}]}],
+        loadFileLibrary: async name => sandbox[name],
         readFile: async () => new ArrayBuffer(1),
         sanitizeTableName: name => name, quoteSqlIdentifier: name => `"${name}"`,
         wasmApi: { importFile: async () => { const response = responses.shift(); if (response instanceof Error) throw response; return response; } },

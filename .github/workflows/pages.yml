@@ -39,12 +39,11 @@ jobs:
         with:
           node-version: '24'
       - name: Check documentation and build the site
-        run: |
-          make docs-check test-pages-tooling build-gh-pages-demo
-          scripts/gh-pages.sh stage "$RUNNER_TEMP/pages"
+        run: make docs-check test-pages-tooling build-gh-pages-demo
       - name: Preserve the same-origin Bavaria snapshot
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pages"
           if git ls-remote --exit-code origin refs/heads/gh-pages > "$RUNNER_TEMP/pages-ref"; then
             git fetch --no-tags --depth=1 origin refs/heads/gh-pages
             if git cat-file -e FETCH_HEAD:bavaria-snapshot.b64; then
@@ -60,8 +59,8 @@ jobs:
             if [ "$status" -ne 2 ]; then exit "$status"; fi
             echo "No gh-pages data branch yet."
           fi
-      - name: Stage and validate the SQL reference
-        run: python3 scripts/stage-pages-reference.py "$RUNNER_TEMP/pages"
+      - name: Stage the playground and SQL reference
+        run: scripts/gh-pages.sh stage "$RUNNER_TEMP/pages"
       - name: Upload the checked site
         uses: actions/upload-pages-artifact@v4
         with:

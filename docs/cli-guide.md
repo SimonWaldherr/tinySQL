@@ -39,7 +39,9 @@ from `cmd/query_files_wasm` and runs tinySQL as WebAssembly with no backend:
   procedure examples;
 - shareable demo URLs with SQL and sample data encoded in the URL hash;
 - a pre-compressed WASM companion with a streaming-decompression loader for
-  lower static-host download cost, plus an uncompressed fallback.
+  lower static-host download cost, plus an uncompressed fallback;
+- Excel and Shapefile parsers loaded from the CDN on first use. The SQL
+  engine and ordinary CSV and JSON imports can start without them.
 
 ```bash
 make build-gh-pages-demo
