@@ -3,9 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	tinysql "github.com/SimonWaldherr/tinySQL"
 	"reflect"
 	"testing"
+
+	tinysql "github.com/SimonWaldherr/tinySQL"
 )
 
 func boardLive(t *testing.T, db *tinysql.DB) map[[2]int]bool {
@@ -34,6 +35,7 @@ func TestSQLGameOfLife(t *testing.T) {
 		{"blinker", map[[2]int]bool{{1, 2}: true, {2, 2}: true, {3, 2}: true}, map[[2]int]bool{{2, 1}: true, {2, 2}: true, {2, 3}: true}},
 		{"block", map[[2]int]bool{{1, 1}: true, {1, 2}: true, {2, 1}: true, {2, 2}: true}, map[[2]int]bool{{1, 1}: true, {1, 2}: true, {2, 1}: true, {2, 2}: true}},
 		{"wrap", map[[2]int]bool{{4, 2}: true, {0, 2}: true, {1, 2}: true}, map[[2]int]bool{{0, 1}: true, {0, 2}: true, {0, 3}: true}},
+		{"empty board", nil, map[[2]int]bool{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := tinysql.NewDB()

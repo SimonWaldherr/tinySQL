@@ -21,7 +21,7 @@
 //	demo [OPTIONS]
 //	  -dsn string        Storage DSN (default: in-memory)
 //	  -seed              Populate sample tables (default: true)
-//	  -script FILE       Execute SQL statements from FILE
+//	  -script FILE       Execute SQL statements from FILE (or stdin with -)
 //	  -interactive       Start interactive SQL shell after setup
 //	  -timer             Print execution time for every statement
 //	  -quiet             Suppress DDL/DML output; show only query results
@@ -48,7 +48,7 @@ import (
 var (
 	flagDSN         = flag.String("dsn", "mem://?tenant=default", "DSN (mem:// or file:/path.db?tenant=...&autosave=1)")
 	flagSeed        = flag.Bool("seed", true, "Populate sample tables (users, orders) before running")
-	flagScript      = flag.String("script", "", "Path to a SQL script file to execute")
+	flagScript      = flag.String("script", "", "SQL script path, or - to read from stdin")
 	flagInteractive = flag.Bool("interactive", false, "Start an interactive SQL shell after setup")
 	flagTimer       = flag.Bool("timer", false, "Print execution time for every statement")
 	flagQuiet       = flag.Bool("quiet", false, "Suppress DDL/DML confirmation output; show only SELECT results")
@@ -139,6 +139,15 @@ func newExecutor(db *sql.DB, timer, quiet bool, output string) *executor {
 	return &executor{db: db, timer: timer, quiet: quiet, output: output}
 }
 
+func (e *executor) messages() io.Writer {
+	switch e.output {
+	case "csv", "json", "ndjson":
+		return os.Stderr
+	default:
+		return os.Stdout
+	}
+}
+
 // run executes a single SQL statement and prints results.
 func (e *executor) run(q string) error {
 	q = strings.TrimSpace(q)
@@ -154,16 +163,22 @@ func (e *executor) run(q string) error {
 			return err
 		}
 		defer func() { _ = rows.Close() }()
-		cols, _ := rows.Columns()
+		cols, err := rows.Columns()
+		if err != nil {
+			return err
+		}
 		switch e.output {
 		case "csv":
-			printRowsCSV(os.Stdout, rows, cols)
+			err = printRowsCSV(os.Stdout, rows, cols)
 		case "json":
-			printRowsJSON(os.Stdout, rows, cols)
+			err = printRowsJSON(os.Stdout, rows, cols)
 		case "ndjson":
-			printRowsNDJSON(os.Stdout, rows, cols)
+			err = printRowsNDJSON(os.Stdout, rows, cols)
 		default:
-			printRows(os.Stdout, rows, cols)
+			err = printRows(os.Stdout, rows, cols)
+		}
+		if err != nil {
+			return err
 		}
 	} else {
 		res, err := e.db.Exec(q)
@@ -173,15 +188,15 @@ func (e *executor) run(q string) error {
 		if !e.quiet {
 			n, _ := res.RowsAffected()
 			if n > 0 {
-				fmt.Printf("(ok, %d row(s) affected)\n", n)
+				fmt.Fprintf(e.messages(), "(ok, %d row(s) affected)\n", n)
 			} else {
-				fmt.Println("(ok)")
+				fmt.Fprintln(e.messages(), "(ok)")
 			}
 		}
 	}
 
 	if e.timer {
-		fmt.Printf("-- %.3fms\n", float64(time.Since(start).Microseconds())/1000.0)
+		fmt.Fprintf(e.messages(), "-- %.3fms\n", float64(time.Since(start).Microseconds())/1000.0)
 	}
 	return nil
 }
@@ -240,6 +255,9 @@ func runFeatureTour(exec *executor) error {
 	}
 	steps := []step{
 		{"DISTINCT values", `SELECT DISTINCT active FROM users ORDER BY active ASC`},
+		{"ISO weekday and regex extraction", `
+SELECT ISODOW('2026-11-20') AS friday,
+       REGEXP_EXTRACT('order-1234', '[0-9]+') AS order_number`},
 		{"JSON extraction", `SELECT id, JSON_GET(meta, 'device') AS device FROM orders ORDER BY id`},
 		{"CTE: paid orders grouped by customer", `
 WITH paid AS (SELECT user_id, amount FROM orders WHERE status = 'PAID')
@@ -265,6 +283,16 @@ SELECT u.name AS user, o.id AS order_id
 FROM users u
 FULL OUTER JOIN orders o ON u.id = o.user_id
 ORDER BY user, order_id`},
+		{"OUTER APPLY: latest paid order per user", `
+SELECT u.name, latest.order_id
+FROM users u
+OUTER APPLY (
+    SELECT o.id AS order_id
+    FROM orders o
+    WHERE o.user_id = u.id AND o.status = 'PAID'
+    ORDER BY order_id DESC LIMIT 1
+) AS latest
+ORDER BY u.id`},
 		{"CROSS JOIN (Cartesian product: every user paired with every order)", `
 SELECT u.name AS user, o.id AS order_id
 FROM users u
@@ -317,18 +345,18 @@ HAVING SUM(o.amount) >= 150`},
 		{"Final state", `SELECT * FROM users ORDER BY id`},
 	}
 
-	fmt.Println("=== tinySQL Feature Tour ===")
-	fmt.Println("(Sample tables: users, orders)")
-	fmt.Println()
+	out := exec.messages()
+	fmt.Fprintln(out, "=== tinySQL Feature Tour ===")
+	fmt.Fprintln(out)
 
 	for _, s := range steps {
-		fmt.Printf("-- %s\n", s.label)
+		fmt.Fprintf(out, "-- %s\n", s.label)
 		q := strings.TrimSpace(s.sql)
-		fmt.Println(q)
+		fmt.Fprintln(out, q)
 		if err := exec.run(q); err != nil {
 			return fmt.Errorf("%s: %w", s.label, err)
 		}
-		fmt.Println()
+		fmt.Fprintln(out)
 	}
 	return nil
 }
@@ -337,6 +365,9 @@ HAVING SUM(o.amount) >= 150`},
 
 // runScriptFile reads SQL statements from path and executes them.
 func runScriptFile(exec *executor, path string) error {
+	if path == "-" {
+		return runScript(exec, os.Stdin, "stdin")
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -345,52 +376,21 @@ func runScriptFile(exec *executor, path string) error {
 	return runScript(exec, f, path)
 }
 
-// runScript executes SQL statements from reader, splitting on semicolons.
+// runScript executes each statement in a SQL script in order.
 func runScript(exec *executor, r io.Reader, name string) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 1024), 4*1024*1024)
-
-	var buf strings.Builder
-	lineNo := 0
-
-	for scanner.Scan() {
-		lineNo++
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-
-		// Skip blank lines and SQL comments outside a statement buffer.
-		if buf.Len() == 0 && (trimmed == "" || strings.HasPrefix(trimmed, "--") || strings.HasPrefix(trimmed, "/*")) {
-			continue
-		}
-
-		buf.WriteString(line)
-		buf.WriteByte('\n')
-
-		if strings.HasSuffix(trimmed, ";") {
-			stmt := strings.TrimSpace(buf.String())
-			stmt = strings.TrimSuffix(stmt, ";")
-			buf.Reset()
-			if stmt == "" {
-				continue
-			}
-			fmt.Println(stmt + ";")
-			if err := exec.run(stmt); err != nil {
-				return fmt.Errorf("%s line ~%d: %w", name, lineNo, err)
-			}
-			fmt.Println()
-		}
+	script, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", name, err)
 	}
-
-	// Execute any trailing statement that lacks a final semicolon.
-	if s := strings.TrimSpace(buf.String()); s != "" {
-		fmt.Println(s)
-		if err := exec.run(s); err != nil {
-			return fmt.Errorf("%s: %w", name, err)
+	out := exec.messages()
+	for i, stmt := range sqlutil.SplitStatements(string(script)) {
+		fmt.Fprintln(out, stmt+";")
+		if err := exec.run(stmt); err != nil {
+			return fmt.Errorf("%s, statement %d: %w", name, i+1, err)
 		}
-		fmt.Println()
+		fmt.Fprintln(out)
 	}
-
-	return scanner.Err()
+	return nil
 }
 
 // ---- interactive REPL -------------------------------------------------------
@@ -852,134 +852,119 @@ func sanitizeIdent(s string) string {
 
 // ---- output helpers ---------------------------------------------------------
 
-//nolint:gocyclo // Printer handles formatting, scanning, and alignment in one pass.
-func printRows(out io.Writer, rows *sql.Rows, cols []string) {
-	data := scanRows(rows, cols)
-	cell := func(v any) string {
-		if v == nil {
-			return "NULL"
-		}
-		return fmt.Sprintf("%v", v)
-	}
-
+func printRows(out io.Writer, rows *sql.Rows, cols []string) error {
 	width := make([]int, len(cols))
 	for i, c := range cols {
 		width[i] = len(c)
 	}
-	for _, r := range data {
-		for i, c := range cols {
-			if w := len(cell(r[c])); w > width[i] {
-				width[i] = w
+	var data [][]string
+	if err := scanDemoRows(rows, len(cols), func(cells []any) error {
+		row := make([]string, len(cells))
+		for i, v := range cells {
+			row[i] = "NULL"
+			if v != nil {
+				row[i] = fmt.Sprint(v)
 			}
+			width[i] = max(width[i], len(row[i]))
 		}
+		data = append(data, row)
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	// Header
-	for i, c := range cols {
-		_, _ = fmt.Fprint(out, padRight(c, width[i]))
-		if i < len(cols)-1 {
-			_, _ = fmt.Fprint(out, "  ")
-		}
-	}
-	_, _ = fmt.Fprintln(out)
-	for i := range cols {
-		_, _ = fmt.Fprint(out, strings.Repeat("-", width[i]))
-		if i < len(cols)-1 {
-			_, _ = fmt.Fprint(out, "  ")
-		}
-	}
-	_, _ = fmt.Fprintln(out)
-
-	// Rows
-	for _, r := range data {
-		for i, c := range cols {
-			_, _ = fmt.Fprint(out, padRight(cell(r[c]), width[i]))
-			if i < len(cols)-1 {
-				_, _ = fmt.Fprint(out, "  ")
+	w := bufio.NewWriter(out)
+	writeRow := func(row []string) {
+		for i, c := range row {
+			if i > 0 {
+				w.WriteString("  ")
 			}
+			w.WriteString(padRight(c, width[i]))
 		}
-		_, _ = fmt.Fprintln(out)
+		w.WriteByte('\n')
 	}
-	_, _ = fmt.Fprintf(out, "(%d row(s))\n", len(data))
+	writeRow(cols)
+	separator := make([]string, len(cols))
+	for i, n := range width {
+		separator[i] = strings.Repeat("-", n)
+	}
+	writeRow(separator)
+	for _, row := range data {
+		writeRow(row)
+	}
+	fmt.Fprintf(w, "(%d row(s))\n", len(data))
+	return w.Flush()
 }
 
 // printRowsCSV writes rows as CSV.
-func printRowsCSV(out io.Writer, rows *sql.Rows, cols []string) {
-	data := scanRows(rows, cols)
+func printRowsCSV(out io.Writer, rows *sql.Rows, cols []string) error {
 	w := csv.NewWriter(out)
-	_ = w.Write(cols)
-	for _, r := range data {
-		var record []string
-		for _, c := range cols {
-			v := r[c]
-			if v == nil {
-				record = append(record, "")
-			} else {
-				record = append(record, fmt.Sprintf("%v", v))
+	if err := w.Write(cols); err != nil {
+		return err
+	}
+	record := make([]string, len(cols))
+	if err := scanDemoRows(rows, len(cols), func(cells []any) error {
+		for i, v := range cells {
+			record[i] = ""
+			if v != nil {
+				record[i] = fmt.Sprint(v)
 			}
 		}
-		_ = w.Write(record)
+		return w.Write(record)
+	}); err != nil {
+		return err
 	}
 	w.Flush()
+	return w.Error()
 }
 
 // printRowsJSON writes rows as a JSON array.
-func printRowsJSON(out io.Writer, rows *sql.Rows, cols []string) {
-	data := scanRows(rows, cols)
-	var jsonData []map[string]any
-	for _, r := range data {
-		m := make(map[string]any)
-		for _, c := range cols {
-			m[c] = r[c]
+func printRowsJSON(out io.Writer, rows *sql.Rows, cols []string) error {
+	var data []map[string]any
+	if err := scanDemoRows(rows, len(cols), func(cells []any) error {
+		row := make(map[string]any, len(cols))
+		for i, col := range cols {
+			row[col] = cells[i]
 		}
-		jsonData = append(jsonData, m)
+		data = append(data, row)
+		return nil
+	}); err != nil {
+		return err
 	}
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(jsonData)
+	return enc.Encode(data)
 }
 
 // printRowsNDJSON writes one JSON object per row. It avoids a result-sized
 // JSON array and is the suitable format for pipes and incremental consumers.
-func printRowsNDJSON(out io.Writer, rows *sql.Rows, cols []string) {
+func printRowsNDJSON(out io.Writer, rows *sql.Rows, cols []string) error {
 	enc := json.NewEncoder(out)
-	for rows.Next() {
-		cells := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range cells {
-			ptrs[i] = &cells[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			continue
-		}
-		row := make(map[string]any, len(cols))
+	row := make(map[string]any, len(cols))
+	return scanDemoRows(rows, len(cols), func(cells []any) error {
 		for i, col := range cols {
-			row[col] = dePtr(ptrs[i])
+			row[col] = cells[i]
 		}
-		_ = enc.Encode(row)
-	}
+		return enc.Encode(row)
+	})
 }
 
-// scanRows reads all rows into a slice of maps.
-func scanRows(rows *sql.Rows, cols []string) []map[string]any {
-	type rowMap = map[string]any
-	var data []rowMap
-	for rows.Next() {
-		cells := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range cells {
-			ptrs[i] = &cells[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			continue
-		}
-		m := rowMap{}
-		for i, c := range cols {
-			m[c] = dePtr(ptrs[i])
-		}
-		data = append(data, m)
+// scanDemoRows reuses the scan buffer. consume may retain values, but not cells.
+func scanDemoRows(rows *sql.Rows, width int, consume func(cells []any) error) error {
+	cells := make([]any, width)
+	ptrs := make([]any, width)
+	for i := range cells {
+		ptrs[i] = &cells[i]
 	}
-	return data
+	for rows.Next() {
+		if err := rows.Scan(ptrs...); err != nil {
+			return err
+		}
+		if err := consume(cells); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 func padRight(s string, w int) string {

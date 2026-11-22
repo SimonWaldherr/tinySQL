@@ -8,30 +8,23 @@ if ! command -v go >/dev/null 2>&1; then
     exit 1
 fi
 
-SQL_FILE="$(mktemp "${TMPDIR:-/tmp}/tinysql-demo-formats.XXXXXX.sql")"
-trap 'rm -f "$SQL_FILE"' EXIT
-
-cat >"$SQL_FILE" <<'EOF'
-SELECT 'Alice' as name, 30 as age, 'Engineer' as job;
-EOF
+demo_tmp="$(mktemp -d "${TMPDIR:-/tmp}/tinysql-demo-formats.XXXXXX")"
+trap 'rm -rf "$demo_tmp"' EXIT
+go build -o "$demo_tmp/repl" ./cmd/repl
 
 run_format() {
     local title="$1"
     local format="$2"
-    local lines="$3"
-
     echo "==================== ${title} ===================="
-    if [[ -n "$format" ]]; then
-        go run ./cmd/repl --format="$format" --echo <"$SQL_FILE" 2>&1 | tail -n "$lines"
-    else
-        go run ./cmd/repl --echo <"$SQL_FILE" 2>&1 | tail -n "$lines"
-    fi
+    "$demo_tmp/repl" --format="$format" <<'SQL'
+SELECT 'Alice' AS name, 30 AS age, 'Engineer' AS job;
+SQL
     echo ""
 }
 
-run_format "TABLE (default)" "" 8
-run_format "JSON" "json" 6
-run_format "YAML" "yaml" 7
-run_format "CSV" "csv" 5
-run_format "TSV" "tsv" 5
-run_format "MARKDOWN" "markdown" 7
+run_format "TABLE (default)" table
+run_format JSON json
+run_format YAML yaml
+run_format CSV csv
+run_format TSV tsv
+run_format MARKDOWN markdown

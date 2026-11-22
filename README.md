@@ -67,6 +67,9 @@ see [language bindings](docs/language-bindings.md).
 | Maps and files | Document/tabular/geospatial imports, geometry, tiles, and routing. [Geospatial guide](docs/geospatial-standards.md), [routing](docs/osm-routing.md), [file queries](cmd/query_files/README.md). |
 | Applications | [CLI](docs/cli-guide.md), [HTTP/gRPC server](cmd/server/README.md), [browser workspace](cmd/query_files_wasm/README.md), and [command index](cmd/README.md). |
 
+The [demo index](demos/README.md) lists runnable examples, from the SQL
+playground to offline RAG and routing.
+
 SQLite, GeoPackage, and MBTiles need the `sqliteimport` build tag; Shapefile
 needs `shapefile`. The `tinysql_minimal` tag omits optional features for smaller
 WASM builds; see the [browser build guide](cmd/wasm_browser/README.md).

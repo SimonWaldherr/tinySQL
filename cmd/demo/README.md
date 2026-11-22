@@ -8,8 +8,10 @@ explore it via a guided feature tour, a SQL script, or an interactive REPL.
 
 ## Build
 
+Run from the repository root.
+
 ```bash
-go build -o demo .
+go build -o bin/demo ./cmd/demo
 ```
 
 ## Usage
@@ -21,7 +23,7 @@ Options:
   -dsn string       Storage DSN (default: mem://?tenant=default)
                       file:/tmp/mydb.db?tenant=main&autosave=1
   -seed             Populate sample tables (default: true)
-  -script FILE      Execute SQL statements from FILE
+  -script FILE      Execute SQL statements from FILE; use - for stdin
   -interactive      Start interactive SQL shell after setup
   -timer            Print execution time for every statement
   -quiet            Suppress DDL/DML confirmation output; only SELECT results
@@ -29,22 +31,30 @@ Options:
 ```
 
 Without `-script` or `-interactive`, the default run is a feature tour covering
-joins, PIVOT/window functions, JSON, triggers, full-text search, vector search,
-CTEs, geospatial distance and bearing, temp tables, and UPDATE/DELETE.
+joins and APPLY, PIVOT and window functions, JSON, date and regex functions,
+triggers, full-text and vector search, CTEs, geospatial distance and bearing,
+temp tables, and UPDATE/DELETE.
 
 ## Examples
 
 ```bash
-./demo                                   # feature tour on freshly seeded data
-./demo -script my_queries.sql            # run a script against seeded tables
-./demo -interactive                      # seed, then open a REPL
-./demo -timer -script heavy_queries.sql  # time every statement
-./demo -output ndjson -script report.sql | jq -c .
+bin/demo                                   # feature tour on freshly seeded data
+bin/demo -script my_queries.sql            # run a script against seeded tables
+bin/demo -interactive                      # seed, then open a REPL
+bin/demo -timer -script heavy_queries.sql  # time every statement
+printf '%s\n' 'SELECT id, name FROM users ORDER BY id;' |
+  bin/demo -script - -output ndjson -quiet | jq -c .
 
 # Persist to a file, then reuse it without reseeding
-./demo -dsn "file:/tmp/mydb.db?tenant=main" -interactive
-./demo -dsn "file:/tmp/mydb.db?tenant=main" -seed=false -script report.sql
+bin/demo -dsn "file:/tmp/mydb.db?tenant=main" -interactive
+bin/demo -dsn "file:/tmp/mydb.db?tenant=main" -seed=false -script report.sql
 ```
+
+Scripts accept multiple statements on a line, multiline triggers, and a final
+statement without a semicolon. In script and tour modes, CSV, JSON, and NDJSON
+write results to stdout and SQL echoes, confirmations, and timing to stderr.
+For a single JSON array or CSV header, run a script with one result-producing
+statement. NDJSON emits one object per row across all results.
 
 REPL session:
 

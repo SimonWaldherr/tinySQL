@@ -22,14 +22,27 @@ func TestBuildDemo(t *testing.T) {
 	// bound is here to catch a hung toolchain, not to police build speed.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	out := filepath.Join(os.TempDir(), "tiny_demo_bin")
+	out := filepath.Join(t.TempDir(), "demo")
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, ".")
 	cmd.Env = os.Environ()
 	if outp, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(out)
 		t.Fatalf("go build failed: %v\n%s", err, string(outp))
 	}
-	_ = os.Remove(out)
+
+	cmd = exec.CommandContext(ctx, out, "-seed=false", "-script", "-", "-output", "ndjson", "-timer")
+	cmd.Stdin = strings.NewReader("CREATE TABLE t (x INT); INSERT INTO t VALUES (42); SELECT x FROM t;")
+	var diagnostics bytes.Buffer
+	cmd.Stderr = &diagnostics
+	got, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("demo failed: %v\n%s", err, &diagnostics)
+	}
+	if string(got) != "{\"x\":42}\n" {
+		t.Fatalf("stdout = %q, want one NDJSON row", got)
+	}
+	if !strings.Contains(diagnostics.String(), "ms\n") {
+		t.Fatalf("missing timing on stderr: %s", &diagnostics)
+	}
 }
 
 // openMemDB opens a fresh in-memory tinySQL database for testing.
@@ -77,9 +90,12 @@ func TestRunScript(t *testing.T) {
 	db := openMemDB(t)
 	exec := newExecutor(db, false, true, "table")
 
-	script := `CREATE TABLE t (x INT);
-INSERT INTO t VALUES (42);
-SELECT x FROM t;`
+	script := `/* Setup; comment */ CREATE TABLE t (x INT); CREATE TABLE audit (event TEXT);
+CREATE TRIGGER log_insert AFTER INSERT ON t FOR EACH ROW BEGIN
+    INSERT INTO audit VALUES ('created; ok');
+END;
+INSERT INTO t VALUES (42); -- read the audit entry next
+SELECT x FROM t`
 
 	if err := runScript(exec, strings.NewReader(script), "<test>"); err != nil {
 		t.Fatalf("runScript: %v", err)
@@ -99,6 +115,10 @@ SELECT x FROM t;`
 	}
 	if x != 42 {
 		t.Fatalf("expected x=42, got %d", x)
+	}
+	var event string
+	if err := db.QueryRow("SELECT event FROM audit").Scan(&event); err != nil || event != "created; ok" {
+		t.Fatalf("audit event = %q, error = %v", event, err)
 	}
 }
 
@@ -186,16 +206,27 @@ func TestPadRight(t *testing.T) {
 
 func TestOutputCSV(t *testing.T) {
 	db := openMemDB(t)
-	exec := newExecutor(db, false, true, "csv")
 	if _, err := db.Exec("CREATE TABLE csv_test (a TEXT, b INT)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("INSERT INTO csv_test VALUES ('hello', 42)"); err != nil {
+	if _, err := db.Exec("INSERT INTO csv_test VALUES ('hello, world', 42), (NULL, 43)"); err != nil {
 		t.Fatal(err)
 	}
-	// CSV output should not panic
-	if err := exec.run("SELECT a, b FROM csv_test"); err != nil {
-		t.Fatalf("run csv: %v", err)
+	rows, err := db.Query("SELECT a, b FROM csv_test ORDER BY b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := printRowsCSV(&buf, rows, cols); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := buf.String(), "a,b\n\"hello, world\",42\n,43\n"; got != want {
+		t.Fatalf("CSV = %q, want %q", got, want)
 	}
 }
 

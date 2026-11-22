@@ -28,21 +28,24 @@ func createBoard(ctx context.Context, db *tinysql.DB, width, height int, live ma
 	if _, err := query(ctx, db, `CREATE TABLE cells (x INT, y INT, alive INT)`); err != nil {
 		return err
 	}
-	var values []string
+	var values strings.Builder
+	values.WriteString("INSERT INTO cells VALUES ")
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			alive := 0
 			if live[[2]int{x, y}] {
 				alive = 1
 			}
-			values = append(values, fmt.Sprintf("(%d,%d,%d)", x, y, alive))
+			if x != 0 || y != 0 {
+				values.WriteByte(',')
+			}
+			fmt.Fprintf(&values, "(%d,%d,%d)", x, y, alive)
 		}
 	}
-	if _, err := query(ctx, db, "INSERT INTO cells VALUES "+strings.Join(values, ",")); err != nil {
+	if _, err := query(ctx, db, values.String()); err != nil {
 		return err
 	}
-	// Eight offsets generate neighboring contributions in O(8 * cells) before
-	// aggregation; modulo implements the same toroidal board as the source demo.
+	// Only live cells contribute to neighbor counts. Modulo wraps the board.
 	_, err := query(ctx, db, fmt.Sprintf(`CREATE VIEW neighbor_counts AS
  WITH offsets AS (
  SELECT -1 AS dx, -1 AS dy UNION ALL SELECT 0, -1 UNION ALL SELECT 1, -1
@@ -50,9 +53,9 @@ func createBoard(ctx context.Context, db *tinysql.DB, width, height int, live ma
  UNION ALL SELECT -1, 1 UNION ALL SELECT 0, 1 UNION ALL SELECT 1, 1
  ), contributions AS (
  SELECT (c.x + o.dx + %d) %% %d AS nx,
-        (c.y + o.dy + %d) %% %d AS ny, c.alive AS alive
- FROM cells c CROSS JOIN offsets o
- ) SELECT nx AS x, ny AS y, SUM(alive) AS neighbor_count
+        (c.y + o.dy + %d) %% %d AS ny
+ FROM (SELECT x, y FROM cells WHERE alive = 1) c CROSS JOIN offsets o
+ ) SELECT nx AS x, ny AS y, COUNT(*) AS neighbor_count
  FROM contributions GROUP BY nx, ny`, width, width, height, height))
 	if err != nil {
 		return err
@@ -66,9 +69,22 @@ func createBoard(ctx context.Context, db *tinysql.DB, width, height int, live ma
 }
 
 func registerStep() error {
+	var steps []tinysql.Statement
+	for _, sql := range []string{
+		`CREATE TEMP TABLE next_cells AS SELECT x, y, alive FROM next_generation`,
+		`DELETE FROM cells`,
+		`INSERT INTO cells (x, y, alive) SELECT x, y, alive FROM next_cells`,
+		`DROP TABLE next_cells`,
+	} {
+		stmt, err := tinysql.ParseSQL(sql)
+		if err != nil {
+			return err
+		}
+		steps = append(steps, stmt)
+	}
 	return tinysql.RegisterStoredProcedureWithOptions("life_step", tinysql.StoredProcedureOptions{Atomic: true, Parameters: []tinysql.StoredProcedureParameter{}}, func(pc tinysql.ProcedureContext, _ []any) (*tinysql.ResultSet, error) {
-		for _, sql := range []string{`CREATE TEMP TABLE next_cells AS SELECT x, y, alive FROM next_generation`, `DELETE FROM cells`, `INSERT INTO cells (x, y, alive) SELECT x, y, alive FROM next_cells`, `DROP TABLE next_cells`} {
-			if _, err := pc.ExecuteSQL(sql); err != nil {
+		for _, stmt := range steps {
+			if _, err := pc.Execute(stmt); err != nil {
 				return nil, err
 			}
 		}
@@ -120,6 +136,7 @@ func run() error {
 		return err
 	}
 	db := tinysql.NewDB()
+	defer db.Close()
 	ctx := context.Background()
 	if err := registerStep(); err != nil {
 		return err
@@ -127,8 +144,10 @@ func run() error {
 	if err := createBoard(ctx, db, *width, *height, live); err != nil {
 		return err
 	}
+	rows := tinysql.MustParseSQL(`SELECT alive FROM cells ORDER BY y, x`)
+	next := tinysql.MustParseSQL(`CALL life_step()`)
 	for step := 0; step <= *steps; step++ {
-		rs, err := query(ctx, db, `SELECT alive FROM cells ORDER BY y, x`)
+		rs, err := tinysql.Execute(ctx, db, "default", rows)
 		if err != nil {
 			return err
 		}
@@ -138,7 +157,7 @@ func run() error {
 		}
 		fmt.Fprintf(&out, "Generation %d\n", step)
 		for i, row := range rs.Rows {
-			if fmt.Sprint(row["alive"]) == "1" {
+			if row["alive"] == 1 {
 				out.WriteString("█")
 			} else {
 				out.WriteByte(' ')
@@ -147,11 +166,13 @@ func run() error {
 				out.WriteByte('\n')
 			}
 		}
-		fmt.Print(out.String())
+		if _, err := fmt.Print(out.String()); err != nil {
+			return err
+		}
 		if step == *steps {
 			break
 		}
-		if _, err := query(ctx, db, `CALL life_step()`); err != nil {
+		if _, err := tinysql.Execute(ctx, db, "default", next); err != nil {
 			return err
 		}
 		time.Sleep(*interval)
