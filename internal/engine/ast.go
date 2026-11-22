@@ -349,6 +349,10 @@ const (
 	JoinFull
 	// JoinCross represents CROSS JOIN (unconditional Cartesian product; no ON clause).
 	JoinCross
+	// JoinCrossApply evaluates the right source for each left row.
+	JoinCrossApply
+	// JoinOuterApply also keeps left rows for which the right source is empty.
+	JoinOuterApply
 )
 
 // String returns the SQL keyword form of the join type, e.g. "LEFT JOIN".
@@ -362,6 +366,10 @@ func (t JoinType) String() string {
 		return "FULL OUTER JOIN"
 	case JoinCross:
 		return "CROSS JOIN"
+	case JoinCrossApply:
+		return "CROSS APPLY"
+	case JoinOuterApply:
+		return "OUTER APPLY"
 	case JoinInner:
 		return "JOIN"
 	default:
@@ -476,7 +484,7 @@ type FromItem struct {
 	TableFunc *TableFuncCall // Wenn FROM eine table-valued function ist
 }
 
-// JoinClause holds a JOIN type with the right side and join condition.
+// JoinClause holds a JOIN or APPLY type, the right source, and any join condition.
 type JoinClause struct {
 	Type  JoinType
 	Right FromItem

@@ -854,10 +854,32 @@ func executeSimpleSelectOrderedFastPath(env ExecEnv, plan *simpleSelectPlan) (*R
 			return rs, true, err
 		}
 	}
+	// A single stored column of one type (INT, TEXT, ...) sorts unboxed. Mixed,
+	// NaN or unsupported values decline and reach the generic path below.
+	if column, ok := simpleTypedOrderColumn(plan); ok {
+		rs, handled, err := executeTypedOrderedSelect(env, plan, sourceRows, column, keepCount)
+		if err != nil || handled {
+			return rs, true, err
+		}
+	}
+	// Several direct columns compare as encoded key bytes, equivalent to the
+	// generic per-key comparison. Unsupported values decline to the generic path.
+	if columns, ok := simpleTypedMultiOrderColumns(plan); ok {
+		rs, handled, err := executeTypedMultiOrderedSelect(env, plan, sourceRows, columns, keepCount)
+		if err != nil || handled {
+			return rs, true, err
+		}
+	}
+	return executeSimpleSelectRawOrder(env, plan, sourceRows, rowCount, keepCount, fullSort)
+}
 
+// executeSimpleSelectRawOrder is the generic ordered path. It collects raw
+// ordering keys, then keeps a bounded heap or sorts every candidate, and
+// projects only the requested page.
+func executeSimpleSelectRawOrder(env ExecEnv, plan *simpleSelectPlan, sourceRows [][]any, rowCount, keepCount int, fullSort bool) (*ResultSet, bool, error) {
 	// Keep bindings local to this execution. Unsupported expressions (including
 	// statement-clock calls) still evaluate against the execution's raw plan.
-	// Direct columns and the specialized float scorers above need no callbacks.
+	// Direct columns and the specialized float scorers in the dispatcher need no callbacks.
 	var orderValues []rawValueEvaluator
 	if plan.orderCols == nil {
 		orderValues = make([]rawValueEvaluator, len(plan.orderExprs))

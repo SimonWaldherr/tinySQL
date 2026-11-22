@@ -283,6 +283,7 @@ func (h *HashJoinOptimizer) processCrossJoin(leftRows, rightRows []Row, joinType
 
 // processNestedLoopJoin handles complex join conditions that can't be optimized
 func (h *HashJoinOptimizer) processNestedLoopJoin(leftRows, rightRows []Row, condition Expr, joinType OptimizedJoinType) ([]Row, error) {
+	predicate := compileJoinPredicate(h.env, condition)
 	result := make([]Row, 0, len(leftRows))
 
 	for _, leftRow := range leftRows {
@@ -292,18 +293,12 @@ func (h *HashJoinOptimizer) processNestedLoopJoin(leftRows, rightRows []Row, con
 
 		matched := false
 		for _, rightRow := range rightRows {
-			merged := mergeRows(leftRow, rightRow)
-
-			shouldInclude := true
-			if condition != nil {
-				val, err := evalExpr(h.env, condition, merged)
-				if err != nil {
-					return nil, err
-				}
-				shouldInclude = (toTri(val) == tvTrue)
+			merged, err := mergeMatchingJoinRows(h.env, leftRow, rightRow, condition, nil, nil, predicate)
+			if err != nil {
+				return nil, err
 			}
 
-			if shouldInclude {
+			if merged != nil {
 				result = append(result, merged)
 				matched = true
 			}

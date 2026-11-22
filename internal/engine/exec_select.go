@@ -13,6 +13,9 @@ import (
 )
 
 func executeSelect(env ExecEnv, s *Select) (result *ResultSet, err error) {
+	if env.applyOuter != nil {
+		env.applyLocal = s
+	}
 	if env.profile != nil {
 		var phase *queryPhase
 		detail := s.From.Table
@@ -61,7 +64,7 @@ func executeSelect(env ExecEnv, s *Select) (result *ResultSet, err error) {
 	// an active CTE; otherwise recursive and chained CTEs are treated as
 	// missing physical tables.
 	referencesCTE := selectReferencesCTE(cteEnv, s)
-	if !referencesCTE {
+	if env.applyOuter == nil && !referencesCTE {
 		// Tried before the plain join and plain aggregate fast paths: both of
 		// those deliberately reject any query that has both a JOIN and a
 		// GROUP BY (see their eligibility checks), so this is the only fast
@@ -80,7 +83,7 @@ func executeSelect(env ExecEnv, s *Select) (result *ResultSet, err error) {
 		if rs, ok, err := executeSimpleSelectFastPath(cteEnv, s); ok || err != nil {
 			return rs, err
 		}
-	} else {
+	} else if env.applyOuter == nil {
 		if rs, ok, err := executeCTEAggregateFastPath(cteEnv, s); ok || err != nil {
 			return rs, err
 		}
@@ -122,6 +125,12 @@ func executeSelect(env ExecEnv, s *Select) (result *ResultSet, err error) {
 				cteEnv.tableFuncColumns = make(map[*TableFuncCall][]string)
 				break
 			}
+		}
+	}
+	for _, join := range s.Joins {
+		if isApply(join.Type) && join.Right.Subquery != nil {
+			cteEnv.applyColumns = make(map[*Select][]string)
+			break
 		}
 	}
 	// FROM (Tabelle, CTE oder Subselect) - now optional

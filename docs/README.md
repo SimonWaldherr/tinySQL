@@ -108,6 +108,8 @@ current behavior and keep performance claims scoped to the workload they measure
   deduplication, mixed-type counts and reuse of integer join keys.
 - [Query optimizer research](query-optimizer-research.md) — PostgreSQL, DuckDB
   and SQLite techniques assessed against tinySQL, with adaptive large-page sorts.
+- [Ordered SELECT performance](ordered-select-performance.md) — unboxed single-column
+  keys, encoded multi-column full sorts, and the bounded-page cutover.
 - [CTE alignment](cte-performance.md), [CTE and indexed SELECT](cte-select-performance.md),
   [ORDER BY and aggregates](order-aggregate-performance.md), and
   [windows, DISTINCT, and LIMIT](window-distinct-limit-performance.md).

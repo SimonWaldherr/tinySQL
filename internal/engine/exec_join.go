@@ -12,6 +12,14 @@ import (
 
 func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 	for _, j := range joins {
+		if isApply(j.Type) && (j.Right.Subquery != nil || j.Right.TableFunc != nil) {
+			var err error
+			cur, err = processApply(env, j, cur)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
 		var rightRows []Row
 		var rightTable *storage.Table
 		var err error
@@ -88,7 +96,13 @@ func processJoins(env ExecEnv, joins []JoinClause, cur []Row) ([]Row, error) {
 			cur, err = processRightJoin(env, cur, rightRows, j.On)
 		case JoinFull:
 			cur, err = processFullOuterJoin(env, cur, rightRows, j.On, aliasOr(j.Right), rightTable)
-		case JoinCross:
+		case JoinOuterApply:
+			if len(rightRows) == 0 {
+				cur, err = addStaticApplyNulls(env, cur, j.Right, rightTable)
+				break
+			}
+			fallthrough
+		case JoinCross, JoinCrossApply:
 			// CROSS JOIN has no ON condition by construction, so (like the
 			// onCondition == nil case in processInnerJoin) its output size is
 			// the full Cartesian product; guard against materializing it here.
@@ -135,6 +149,7 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 	if err != nil {
 		return nil, err
 	}
+	predicate := compileAdditionalJoinPredicate(env, onCondition, equality)
 	capacity := len(leftRows) * len(rightRows) / 4
 	if lookup != nil {
 		capacity = len(leftRows)
@@ -147,14 +162,9 @@ func processInnerJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 				return nil, err
 			}
 		}
-		candidates, count := lookup.candidates(i, len(rightRows))
-		for j := 0; j < count; j++ {
-			ri := j
-			if candidates != nil {
-				ri = candidates[j]
-			}
-			r := rightRows[ri]
-			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
+		for position := lookup.firstCandidate(i, len(rightRows)); position != 0; position = lookup.nextCandidate(position, len(rightRows)) {
+			r := rightRows[position-1]
+			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality, lookup, predicate)
 			if err != nil {
 				return nil, err
 			}
@@ -191,6 +201,7 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 	if err != nil {
 		return nil, err
 	}
+	predicate := compileAdditionalJoinPredicate(env, onCondition, equality)
 	joined := make([]Row, 0, len(leftRows)) // At least one row per left row
 	for i, l := range leftRows {
 		// Check context cancellation every 64 rows to reduce channel-select overhead.
@@ -200,14 +211,9 @@ func processLeftJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr, r
 			}
 		}
 		matched := false
-		candidates, count := lookup.candidates(i, len(rightRows))
-		for j := 0; j < count; j++ {
-			ri := j
-			if candidates != nil {
-				ri = candidates[j]
-			}
-			r := rightRows[ri]
-			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
+		for position := lookup.firstCandidate(i, len(rightRows)); position != 0; position = lookup.nextCandidate(position, len(rightRows)) {
+			r := rightRows[position-1]
+			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality, lookup, predicate)
 			if err != nil {
 				return nil, err
 			}
@@ -263,31 +269,36 @@ func mergedJoinValue(left, right Row, column string) (any, bool) {
 	return value, ok
 }
 
-func mergeMatchingJoinRows(env ExecEnv, left, right Row, condition Expr, equality *joinEquality) (Row, error) {
+func mergeMatchingJoinRows(env ExecEnv, left, right Row, condition Expr, equality *joinEquality, lookup *joinCandidateLookup, predicate joinPredicate) (Row, error) {
+	if lookup != nil {
+		// The lookup admits only unambiguous keys whose hash equality matches
+		// SQL equality. Every indexed candidate is already a match.
+		return mergeRows(left, right), nil
+	}
 	if equality != nil {
 		leftValue, leftOK := mergedJoinValue(left, right, equality.leftColumn)
 		rightValue, rightOK := mergedJoinValue(left, right, equality.rightColumn)
 		if leftOK && rightOK {
 			value, err := evalComparisonBinary("=", leftValue, rightValue)
-			if err != nil {
+			if err != nil || toTri(value) != tvTrue {
 				return nil, err
-			}
-			if toTri(value) != tvTrue {
-				return nil, nil
 			}
 			return mergeRows(left, right), nil
 		}
-		// Missing keys must use the evaluator for trigger-row resolution and
-		// its original unknown-column errors, including column suggestions.
+		// Missing keys use the general evaluator for bindings and suggestions.
+	}
+	if predicate != nil {
+		match, err := predicate(left, right)
+		if err != nil || match != tvTrue {
+			return nil, err
+		}
+		return mergeRows(left, right), nil
 	}
 	merged := mergeRows(left, right)
 	if condition != nil {
 		value, err := evalExpr(env, condition, merged)
-		if err != nil {
+		if err != nil || toTri(value) != tvTrue {
 			return nil, err
-		}
-		if toTri(value) != tvTrue {
-			return nil, nil
 		}
 	}
 	return merged, nil
@@ -299,6 +310,7 @@ func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 	if err != nil {
 		return nil, err
 	}
+	predicate := compileAdditionalJoinPredicate(env, onCondition, equality)
 	joined := make([]Row, 0, len(rightRows)) // At least one row per right row
 	var leftKeys []string
 	if len(leftRows) > 0 {
@@ -312,14 +324,9 @@ func processRightJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Expr) 
 			}
 		}
 		matched := false
-		candidates, count := lookup.candidates(i, len(leftRows))
-		for j := 0; j < count; j++ {
-			ri := j
-			if candidates != nil {
-				ri = candidates[j]
-			}
-			l := leftRows[ri]
-			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
+		for position := lookup.firstCandidate(i, len(leftRows)); position != 0; position = lookup.nextCandidate(position, len(leftRows)) {
+			l := leftRows[position-1]
+			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality, lookup, predicate)
 			if err != nil {
 				return nil, err
 			}
@@ -351,6 +358,7 @@ func processFullOuterJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Ex
 	if err != nil {
 		return nil, err
 	}
+	predicate := compileAdditionalJoinPredicate(env, onCondition, equality)
 	matchedRight := make([]bool, len(rightRows))
 	joined := make([]Row, 0, len(leftRows)+len(rightRows))
 
@@ -367,14 +375,10 @@ func processFullOuterJoin(env ExecEnv, leftRows, rightRows []Row, onCondition Ex
 			}
 		}
 		matchedAny := false
-		candidates, count := lookup.candidates(i, len(rightRows))
-		for j := 0; j < count; j++ {
-			ri := j
-			if candidates != nil {
-				ri = candidates[j]
-			}
+		for position := lookup.firstCandidate(i, len(rightRows)); position != 0; position = lookup.nextCandidate(position, len(rightRows)) {
+			ri := position - 1
 			r := rightRows[ri]
-			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality)
+			m, err := mergeMatchingJoinRows(env, l, r, onCondition, equality, lookup, predicate)
 			if err != nil {
 				return nil, err
 			}
@@ -406,7 +410,11 @@ func applyWhereClause(env ExecEnv, where Expr, rows []Row) ([]Row, error) {
 	if where == nil {
 		return rows, nil
 	}
-	if filter := buildRowWhereFilter(where); filter != nil {
+	var filter rowWhereTriFilter
+	if env.applyOuter == nil {
+		filter = buildRowWhereFilter(where)
+	}
+	if filter != nil {
 		filtered := make([]Row, 0, len(rows)/2)
 		for i, r := range rows {
 			if i&63 == 0 {

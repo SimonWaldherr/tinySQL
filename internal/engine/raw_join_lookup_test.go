@@ -14,6 +14,15 @@ import (
 func TestRawJoinLookupMatchesSliceBuckets(t *testing.T) {
 	keys := []any{1, 2, 1, nil, int64(1), 1.0, "1", []byte("a"),
 		1, 2, []byte("a"), math.NaN(), 0.0, math.Copysign(0, -1), true, true}
+	// Build additional distinct keys and duplicates on both sides of the
+	// filtered capacity sample boundary.
+	for i := len(keys); i < 180; i++ {
+		key := i
+		if i%11 == 0 {
+			key = 1
+		}
+		keys = append(keys, key)
+	}
 	rows := make([][]any, len(keys))
 	want := make(map[any][][]any)
 	for i, key := range keys {

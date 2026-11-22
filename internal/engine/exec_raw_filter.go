@@ -262,6 +262,9 @@ func buildRawExprFilter(colIndex map[string]int, e Expr) func([]any) (bool, erro
 	if filter := buildRawTrimComparisonFilter(colIndex, e); filter != nil {
 		return filter
 	}
+	if filter := buildRawCaseComparisonFilter(colIndex, e); filter != nil {
+		return filter
+	}
 	if binary, ok := e.(*Binary); ok && isComparisonOp(binary.Op) {
 		if filter := compileRawNumericComparisonFilter(colIndex, binary); filter != nil {
 			return filter

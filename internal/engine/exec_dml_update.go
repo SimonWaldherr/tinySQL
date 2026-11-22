@@ -70,6 +70,10 @@ func executeGeneralUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 	if candidates != nil {
 		candidateCount = len(candidates)
 	}
+	var compareRow func([]any) (bool, error)
+	if candidateCount >= 64 {
+		compareRow = bindUpdateComparison(keys, s.Where)
+	}
 	for candidate := 0; candidate < candidateCount; candidate++ {
 		ri := candidate
 		if candidates != nil {
@@ -79,9 +83,19 @@ func executeGeneralUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
+		comparisonBound := compareRow != nil && len(r) >= len(keys.key)
+		if comparisonBound {
+			match, err := compareRow(r)
+			if err != nil {
+				return nil, err
+			}
+			if !match {
+				continue
+			}
+		}
 		row := buildTableRow(keys, r)
 		ok := true
-		if s.Where != nil {
+		if s.Where != nil && !comparisonBound {
 			v, err := evalExpr(env, s.Where, row)
 			if err != nil {
 				return nil, err
@@ -194,6 +208,50 @@ func executeGeneralUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
 	return &ResultSet{Cols: []string{"updated"}, Rows: []Row{{"updated": n}}}, nil
+}
+
+// Bind a simple comparison before scanning a general UPDATE, including
+// UPDATE RETURNING. Rejected rows then need no Row map. Keep the interpreter's
+// comparison and operand order so mixed types and NULLs behave identically.
+func bindUpdateComparison(keys tableRowKeys, expr Expr) func([]any) (bool, error) {
+	binary, ok := expr.(*Binary)
+	if !ok || !isComparisonOp(binary.Op) {
+		return nil
+	}
+	ref, isRef := binary.Left.(*VarRef)
+	literal, isLiteral := binary.Right.(*Literal)
+	literalFirst := !isRef || !isLiteral
+	if literalFirst {
+		ref, isRef = binary.Right.(*VarRef)
+		literal, isLiteral = binary.Left.(*Literal)
+	}
+	if !isRef || !isLiteral {
+		return nil
+	}
+	key := ref.Lower
+	if key == "" {
+		key = strings.ToLower(ref.Name)
+	}
+	column := -1
+	// fillTableRow writes columns in order, so the last matching key wins.
+	for i := len(keys.key) - 1; i >= 0; i-- {
+		if key == keys.key[i] || key == keys.prefix[i] {
+			column = i
+			break
+		}
+	}
+	if column < 0 {
+		return nil
+	}
+	op := binary.Op
+	return func(row []any) (bool, error) {
+		left, right := row[column], literal.Val
+		if literalFirst {
+			left, right = right, left
+		}
+		result, err := evalComparisonBinary(op, left, right)
+		return toTri(result) == tvTrue, err
+	}
 }
 
 // rawIndexNames collects a table's secondary index names, unsorted. Callers

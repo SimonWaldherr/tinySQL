@@ -150,7 +150,7 @@ func (p *Parser) parseInsertValueRows() ([][]Expr, error) {
 		// instead of growing their expression slices for every column.
 		vals := make([]Expr, 0, rowWidth)
 		for {
-			e, err := p.parseExpr()
+			e, err := p.parseInsertValue()
 			if err != nil {
 				return nil, err
 			}
@@ -173,6 +173,24 @@ func (p *Parser) parseInsertValueRows() ([][]Expr, error) {
 		break
 	}
 	return rows, nil
+}
+
+// A literal followed by a VALUES delimiter cannot have an operator or
+// suffix. Parse it directly while sharing the same conversion and depth
+// limit as other expressions.
+func (p *Parser) parseInsertValue() (Expr, error) {
+	if p.depth < maxParseDepth && p.peek.Typ == tSymbol && (p.peek.Val == "," || p.peek.Val == ")") {
+		switch p.cur.Typ {
+		case tNumber, tString, tBlob:
+			return p.parsePrimary()
+		case tKeyword:
+			switch p.cur.Val {
+			case "NULL", "TRUE", "FALSE":
+				return p.parsePrimary()
+			}
+		}
+	}
+	return p.parseExpr()
 }
 
 func (p *Parser) parseUpdate() (Statement, error) {

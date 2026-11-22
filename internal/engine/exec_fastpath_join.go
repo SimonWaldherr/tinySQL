@@ -5,6 +5,7 @@ package engine
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -77,19 +78,14 @@ func executeSimpleJoinFastPath(env ExecEnv, s *Select) (*ResultSet, bool, error)
 
 // Row IDs are one-based so zero is both a missing bucket and the end of a
 // chain. Unique keys need only a map entry; the shared link array is allocated
-// lazily on the first duplicate. Appending to each bucket's tail preserves
-// right-input encounter order without a separate slice allocation per key.
-type simpleJoinMatchRange struct {
-	first, last int
-}
-
+// lazily on the first duplicate.
 type simpleJoinRightIndex struct {
 	rows  [][]any
-	byKey map[any]simpleJoinMatchRange
+	byKey map[any]int
 	next  []int
 }
 
-func (index *simpleJoinRightIndex) first(key any) int { return index.byKey[key].first }
+func (index *simpleJoinRightIndex) first(key any) int { return index.byKey[key] }
 
 func (index *simpleJoinRightIndex) after(rowID int) int {
 	if index.next == nil {
@@ -120,11 +116,24 @@ func (p *simpleJoinPlan) rightRowsByKey() (*simpleJoinRightIndex, error) {
 	if cache.table == p.right && cache.version == p.right.Version {
 		return cache.index, nil
 	}
-	index := &simpleJoinRightIndex{
-		rows:  p.right.Rows,
-		byKey: make(map[any]simpleJoinMatchRange, len(p.right.Rows)),
+	rows := p.right.Rows
+	capacity := len(rows)
+	// The predicate can discard nearly the whole relation. Sample while
+	// building the first buckets, so each predicate still runs only once.
+	const sample = 128
+	if p.rightFilter != nil {
+		capacity = min(capacity, sample)
 	}
-	for i, right := range index.rows {
+	index := &simpleJoinRightIndex{rows: rows, byKey: make(map[any]int, capacity)}
+	var tails []int
+	for i, right := range rows {
+		if i == sample && p.rightFilter != nil && len(index.byKey) >= sample/2 {
+			distinct := len(index.byKey)
+			estimated := len(rows)/sample*distinct + min(len(rows)%sample, distinct)
+			grown := make(map[any]int, estimated)
+			maps.Copy(grown, index.byKey)
+			index.byKey = grown
+		}
 		if p.rightFilter != nil {
 			match, err := p.rightFilter(right)
 			if err != nil {
@@ -143,17 +152,23 @@ func (p *simpleJoinPlan) rightRowsByKey() (*simpleJoinRightIndex, error) {
 		}
 		key := comparableKeyPart(keyVal)
 		rowID := i + 1
-		bucket := index.byKey[key]
-		if bucket.first == 0 {
-			bucket.first = rowID
-		} else {
-			if index.next == nil {
-				index.next = make([]int, len(index.rows))
-			}
-			index.next[bucket.last-1] = rowID
+		head := index.byKey[key]
+		if head == 0 {
+			index.byKey[key] = rowID
+			continue
 		}
-		bucket.last = rowID
-		index.byKey[key] = bucket
+		if index.next == nil {
+			index.next = make([]int, len(rows))
+			tails = make([]int, len(rows))
+		}
+		// Track tails by head position during the build. Appending only
+		// updates the arrays, leaving the hash bucket unchanged.
+		tail := tails[head-1]
+		if tail == 0 {
+			tail = head
+		}
+		index.next[tail-1] = rowID
+		tails[head-1] = rowID
 	}
 	cache.table = p.right
 	cache.version = p.right.Version

@@ -32,6 +32,19 @@ func BenchmarkAggregateCompositeLookup(b *testing.B) {
 	}
 }
 
+func BenchmarkGroupByTextAndInteger(b *testing.B) {
+	db := setupPerfTable(b, 20000)
+	b.Cleanup(func() { _ = db.Close() })
+	table, err := db.Get("default", "t")
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i, row := range table.Rows {
+		row[0] = i / 50 % 7
+	}
+	runBench(b, db, `SELECT grp, id, COUNT(*) AS n, AVG(val) AS a FROM t GROUP BY grp, id`)
+}
+
 func TestCompositeGroupLookupMatchesEncodedKeys(t *testing.T) {
 	values := []any{
 		"", "a", "b", "a\x1fb", "b\x1fc", "a;b", "S1:a;", "N;", "1",

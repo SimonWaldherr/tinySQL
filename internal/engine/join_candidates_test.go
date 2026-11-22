@@ -157,8 +157,11 @@ func TestJoinCandidateLookupPreservesInterleavedBuckets(t *testing.T) {
 				want = append(want, position)
 			}
 		}
-		got, count := lookup.candidates(i, len(inner))
-		if count != len(want) || !reflect.DeepEqual(got, want) {
+		var got []int
+		for position := lookup.firstCandidate(i, len(inner)); position != 0; position = lookup.nextCandidate(position, len(inner)) {
+			got = append(got, position-1)
+		}
+		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("key %d: candidates %v, want %v", i, got, want)
 		}
 	}

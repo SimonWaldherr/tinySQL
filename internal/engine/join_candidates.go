@@ -9,16 +9,34 @@ import (
 // key's inner-row order. Positions also identify duplicates for FULL JOIN's
 // unmatched-right bookkeeping. The lookup belongs to one execution only.
 type joinCandidateLookup struct {
-	keys      []any
-	positions map[any][]int
+	keys  []any
+	first map[any]int
+	next  []int
 }
 
-func (lookup *joinCandidateLookup) candidates(row, innerCount int) ([]int, int) {
+// Row positions are one-based, with zero marking the end of the candidates.
+// A missing lookup visits the entire inner relation in nested-loop order.
+func (lookup *joinCandidateLookup) firstCandidate(row, innerCount int) int {
 	if lookup == nil {
-		return nil, innerCount
+		if innerCount != 0 {
+			return 1
+		}
+		return 0
 	}
-	positions := lookup.positions[lookup.keys[row]]
-	return positions, len(positions)
+	return lookup.first[lookup.keys[row]]
+}
+
+func (lookup *joinCandidateLookup) nextCandidate(position, innerCount int) int {
+	if lookup == nil {
+		if position < innerCount {
+			return position + 1
+		}
+		return 0
+	}
+	if lookup.next == nil {
+		return 0
+	}
+	return lookup.next[position-1]
 }
 
 // Only hash domains whose equality exactly matches SQL compare are admitted.
@@ -104,16 +122,28 @@ func buildJoinCandidateLookup(env ExecEnv, equality *joinEquality, outer, inner 
 			}
 		}
 	}
-	positions := make(map[any][]int, len(inner))
-	for i, key := range keys[len(outer):] {
+	// Build from the end to preserve encounter order when prepending positions.
+	// Unique keys need only a map entry. Duplicate buckets share one link
+	// array, allocated lazily, instead of growing one slice per key.
+	lookup := &joinCandidateLookup{keys: keys[:len(outer)], first: make(map[any]int, len(inner))}
+	innerKeys := keys[len(outer):]
+	for i := len(innerKeys) - 1; i >= 0; i-- {
 		if i&63 == 0 {
 			if err := checkCtx(env.ctx); err != nil {
 				return nil, err
 			}
 		}
-		if key != nil {
-			positions[key] = append(positions[key], i)
+		key := innerKeys[i]
+		if key == nil {
+			continue
 		}
+		if previous := lookup.first[key]; previous != 0 {
+			if lookup.next == nil {
+				lookup.next = make([]int, len(inner))
+			}
+			lookup.next[i] = previous
+		}
+		lookup.first[key] = i + 1
 	}
-	return &joinCandidateLookup{keys: keys[:len(outer)], positions: positions}, nil
+	return lookup, nil
 }

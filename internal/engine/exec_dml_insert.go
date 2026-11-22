@@ -19,11 +19,11 @@ import (
 func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 	rows := insertRowSource{values: s.Rows}
 	if s.Select != nil {
-		rs, err := execStmt(env, s.Select)
+		var err error
+		rows, err = executeInsertSource(env, s.Select)
 		if err != nil {
 			return nil, err
 		}
-		rows = insertRowsFromResultSet(rs)
 	}
 	if rows.len() == 0 && s.Select == nil {
 		return nil, fmt.Errorf("INSERT requires at least one VALUES clause")
@@ -42,12 +42,45 @@ func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 	return executeInsertSpecificColumns(env, s, t, tmp, &rows)
 }
 
+func executeInsertSource(env ExecEnv, sel *Select) (insertRowSource, error) {
+	if env.applyOuter == nil && !selectReferencesCTE(env, sel) && directInsertSourceProjections(sel.Projs) {
+		// Materialize the complete source before mutating the destination, which
+		// may be the source table itself. Simple projections can keep positional
+		// values instead of allocating a Row map per source row.
+		var result ColumnarResultSet
+		handled, err := executeSimpleColumnarSelect(env, sel, &result)
+		if err != nil {
+			return insertRowSource{}, err
+		}
+		if handled {
+			rows := insertRowSource{columnar: &result}
+			rows.prepareSlots(len(result.Cols))
+			return rows, nil
+		}
+	}
+	rs, err := execStmt(env, sel)
+	if err != nil {
+		return insertRowSource{}, err
+	}
+	return insertRowsFromResultSet(rs), nil
+}
+
+func directInsertSourceProjections(projs []SelectItem) bool {
+	for _, p := range projs {
+		if _, column := p.Expr.(*VarRef); !column && !p.Star {
+			return false
+		}
+	}
+	return true
+}
+
 // insertRowSource borrows one selected row at a time through a reusable set
 // of literal slots. INSERT consumes it synchronously before advancing; stored
 // rows and RETURNING maps retain values, never the temporary expressions.
 type insertRowSource struct {
 	values      [][]Expr
 	selected    *ResultSet
+	columnar    *ColumnarResultSet
 	columns     []string
 	expressions []Expr
 	literals    []Literal
@@ -59,16 +92,28 @@ func insertRowsFromResultSet(rs *ResultSet) insertRowSource {
 		return rows
 	}
 	rows.columns = make([]string, len(rs.Cols))
-	rows.expressions = make([]Expr, len(rs.Cols))
-	rows.literals = make([]Literal, len(rs.Cols))
+	rows.prepareSlots(len(rs.Cols))
 	for i, column := range rs.Cols {
 		rows.columns[i] = strings.ToLower(column)
-		rows.expressions[i] = &rows.literals[i]
 	}
 	return rows
 }
 
+func (s *insertRowSource) prepareSlots(width int) {
+	if s.len() == 0 {
+		return
+	}
+	s.expressions = make([]Expr, width)
+	s.literals = make([]Literal, width)
+	for i := range s.expressions {
+		s.expressions[i] = &s.literals[i]
+	}
+}
+
 func (s *insertRowSource) len() int {
+	if s.columnar != nil {
+		return s.columnar.RowCount
+	}
 	if s.selected != nil {
 		return len(s.selected.Rows)
 	}
@@ -76,6 +121,12 @@ func (s *insertRowSource) len() int {
 }
 
 func (s *insertRowSource) at(i int) []Expr {
+	if s.columnar != nil {
+		for j, values := range s.columnar.Values {
+			s.literals[j].Val = values[i]
+		}
+		return s.expressions
+	}
 	if s.selected == nil {
 		return s.values[i]
 	}

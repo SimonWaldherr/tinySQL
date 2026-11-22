@@ -3,8 +3,10 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
-	"strconv"
+	"math"
+	"slices"
 	"strings"
 )
 
@@ -18,8 +20,7 @@ func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCo
 	resultCols := leftCols
 	var unionDistinct *setOperationDistinctAccumulator
 
-	current := union
-	for current != nil {
+	for current := union; current != nil; current = current.Next {
 		// Adjacent UNION terms can share their membership set. Other set
 		// operations change membership or multiplicity and end that run.
 		if current.Type != UnionDistinct {
@@ -37,60 +38,67 @@ func processUnionClauses(env ExecEnv, union *UnionClause, leftRows []Row, leftCo
 				len(resultCols), len(rightResult.Cols))
 		}
 
-		// SQL set operations line up result values by position, while the
-		// internal Row representation is keyed by output name.  The left-most
-		// SELECT defines the names exposed by the compound result, so remap each
-		// right-hand row before appending it or comparing set membership.  Without
-		// this, e.g. `SELECT 1 AS a UNION SELECT 1 AS b` compared `a` to a
-		// missing key on the right and returned an incorrect NULL-valued row.
-		rightRows, err := alignSetOperationRowsWithContext(env.ctx, rightResult.Rows, rightResult.Cols, resultCols)
-		if err != nil {
-			return nil, nil, err
-		}
 		addCompoundOrderAliases(orderAliases, rightResult.Cols, resultCols)
 
-		// Process the union based on type
 		switch current.Type {
 		case UnionAll:
-			// UNION ALL: Just append all rows
-			resultRows, err = appendRowsWithContext(env.ctx, resultRows, rightRows)
-			if err != nil {
-				return nil, nil, err
-			}
+			resultRows, err = appendUnionAllRows(env.ctx, resultRows, rightResult, resultCols)
 
 		case UnionDistinct:
 			// Hash the accumulated left result only once per UNION run.
 			// Rehashing it for every term makes a growing chain quadratic.
 			if unionDistinct == nil {
-				unionDistinct = newSetOperationDistinctAccumulator(resultCols, len(resultRows)+len(rightRows))
+				unionDistinct = newSetOperationDistinctAccumulator(resultCols, len(resultRows)+len(rightResult.Rows))
 				if err := unionDistinct.appendRows(env.ctx, resultRows); err != nil {
 					return nil, nil, err
 				}
 			}
-			if err := unionDistinct.appendRows(env.ctx, rightRows); err != nil {
-				return nil, nil, err
-			}
+			err = unionDistinct.appendTerm(env.ctx, rightResult, resultCols)
 			resultRows = unionDistinct.rows
 
-		case Except:
-			// EXCEPT: Remove rows that exist in the right result
-			resultRows, err = exceptRowsWithContext(env.ctx, resultRows, rightRows, resultCols)
+		case Except, Intersect:
+			var rightRows []Row
+			rightRows, err = alignSetOperationRowsWithContext(env.ctx, rightResult.Rows, rightResult.Cols, resultCols)
 			if err != nil {
 				return nil, nil, err
 			}
-
-		case Intersect:
-			// INTERSECT: Keep only rows that exist in both results
-			resultRows, err = intersectRowsWithContext(env.ctx, resultRows, rightRows, resultCols)
-			if err != nil {
-				return nil, nil, err
+			if current.Type == Except {
+				resultRows, err = exceptRowsWithContext(env.ctx, resultRows, rightRows, resultCols)
+			} else {
+				resultRows, err = intersectRowsWithContext(env.ctx, resultRows, rightRows, resultCols)
 			}
 		}
-
-		current = current.Next
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	return resultRows, resultCols, nil
+}
+
+// Appending renamed rows directly avoids an intermediate slice proportional
+// to the right-hand term. Every row still contributes to UNION ALL.
+func appendUnionAllRows(ctx context.Context, dst []Row, term *ResultSet, targetCols []string) ([]Row, error) {
+	if sameSetOperationColumns(term.Cols, targetCols) {
+		return appendRowsWithContext(ctx, dst, term.Rows)
+	}
+	if len(term.Rows) == 0 {
+		return dst, nil
+	}
+	if err := checkCtx(ctx); err != nil {
+		return nil, err
+	}
+	dst = slices.Grow(dst, len(term.Rows))
+	sourceKeys, targetKeys := setOperationColumnKeys(term.Cols), setOperationColumnKeys(targetCols)
+	for i, row := range term.Rows {
+		if i&(setOperationContextBatchRows-1) == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return nil, err
+			}
+		}
+		dst = append(dst, copySetOperationRow(row, sourceKeys, targetKeys))
+	}
+	return dst, nil
 }
 
 // appendRowsWithContext combines compound-select terms in small batches.
@@ -162,13 +170,17 @@ func alignSetOperationRowsWithContext(ctx context.Context, rows []Row, sourceCol
 				return nil, err
 			}
 		}
-		out := make(Row, len(targetCols))
-		for colIdx, sourceKey := range sourceKeys {
-			out[targetKeys[colIdx]] = row[sourceKey]
-		}
-		aligned[rowIdx] = out
+		aligned[rowIdx] = copySetOperationRow(row, sourceKeys, targetKeys)
 	}
 	return aligned, nil
+}
+
+func copySetOperationRow(row Row, sourceKeys, targetKeys []string) Row {
+	out := make(Row, len(targetKeys))
+	for i, source := range sourceKeys {
+		out[targetKeys[i]] = row[source]
+	}
+	return out
 }
 
 func sameSetOperationColumns(left, right []string) bool {
@@ -301,17 +313,44 @@ func newSetOperationDistinctAccumulator(cols []string, capacity int) *setOperati
 }
 
 func (a *setOperationDistinctAccumulator) appendRows(ctx context.Context, rows []Row) error {
+	return a.appendWithKeys(ctx, rows, a.columnKeys, false)
+}
+
+func (a *setOperationDistinctAccumulator) appendTerm(ctx context.Context, term *ResultSet, targetCols []string) error {
+	if len(term.Rows) == 0 || sameSetOperationColumns(term.Cols, targetCols) {
+		return a.appendRows(ctx, term.Rows)
+	}
+	sourceKeys := setOperationColumnKeys(term.Cols)
+	if len(sourceKeys) > 1 {
+		// The last source column wins if multiple output names lower to the
+		// same key. Bind signature positions as though the row was remapped.
+		bindings := make(map[string]string, len(sourceKeys))
+		for i, key := range a.columnKeys {
+			bindings[key] = sourceKeys[i]
+		}
+		for i, key := range a.columnKeys {
+			sourceKeys[i] = bindings[key]
+		}
+	}
+	return a.appendWithKeys(ctx, term.Rows, sourceKeys, true)
+}
+
+func (a *setOperationDistinctAccumulator) appendWithKeys(ctx context.Context, rows []Row, sourceKeys []string, rename bool) error {
 	for i, row := range rows {
 		if i&(setOperationContextBatchRows-1) == 0 {
 			if err := checkCtx(ctx); err != nil {
 				return err
 			}
 		}
-		a.key = appendSetOperationSignature(a.key[:0], row, a.columnKeys)
+		a.key = appendSetOperationSignature(a.key[:0], row, sourceKeys)
 		if _, found := a.seen[string(a.key)]; found {
 			continue
 		}
 		a.seen[string(a.key)] = struct{}{}
+		if rename {
+			// A discarded duplicate needs neither a result map nor alias copies.
+			row = copySetOperationRow(row, sourceKeys, a.columnKeys)
+		}
 		a.rows = append(a.rows, row)
 	}
 	return nil
@@ -338,13 +377,15 @@ func appendSetOperationSignature(buf []byte, row Row, columnKeys []string) []byt
 		}
 		value := row[col]
 		if number, ok := numeric(value); ok {
-			// Normalize negative zero as compare treats -0.0 and 0.0 as equal.
-			if number == 0 {
-				number = 0
+			// Collapse signed zero and NaN payloads as the textual key did.
+			bits := math.Float64bits(number)
+			switch {
+			case number == 0:
+				bits = 0
+			case math.IsNaN(number):
+				bits = math.Float64bits(math.NaN())
 			}
-			buf = append(buf, 'N')
-			buf = strconv.AppendFloat(buf, number, 'g', -1, 64)
-			buf = append(buf, ';')
+			buf = binary.LittleEndian.AppendUint64(append(buf, 'D'), bits)
 			continue
 		}
 		buf = writeFmtKeyPart(buf, value)

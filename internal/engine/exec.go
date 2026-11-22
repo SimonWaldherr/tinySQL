@@ -212,6 +212,9 @@ type ExecEnv struct {
 	// separate executions, even of the same cached/compiled statement.
 	subqueryCache *subqueryResultCache
 	viewDepth     int
+	applyOuter    *applyRowScope
+	applyLocal    *Select
+	applyColumns  map[*Select][]string
 	// triggerRow binds new.<col>/old.<col>/bare-col pseudo-columns while
 	// executing a trigger body statement (see executeTrigger and
 	// triggerRowBinding in triggers.go), so NEW.col/OLD.col resolve even

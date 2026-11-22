@@ -32,6 +32,13 @@ func TestSetOperationMaterializersHonorCanceledContext(t *testing.T) {
 			},
 		},
 		{
+			name: "union-all-renamed-append",
+			run: func(ctx context.Context) error {
+				_, err := appendUnionAllRows(ctx, values[:1], &ResultSet{Rows: aliased, Cols: []string{"other_value"}}, []string{"value"})
+				return err
+			},
+		},
+		{
 			name: "align",
 			run: func(ctx context.Context) error {
 				_, err := alignSetOperationRowsWithContext(ctx, aliased, []string{"other_value"}, []string{"value"})
@@ -43,6 +50,14 @@ func TestSetOperationMaterializersHonorCanceledContext(t *testing.T) {
 			run: func(ctx context.Context) error {
 				_, err := distinctSetOperationRowsWithContext(ctx, values, []string{"value"})
 				return err
+			},
+		},
+		{
+			name: "distinct-renamed",
+			run: func(ctx context.Context) error {
+				cols := []string{"value"}
+				acc := newSetOperationDistinctAccumulator(cols, len(aliased))
+				return acc.appendTerm(ctx, &ResultSet{Rows: aliased, Cols: []string{"other_value"}}, cols)
 			},
 		},
 		{

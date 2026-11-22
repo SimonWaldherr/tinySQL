@@ -27,7 +27,10 @@ func BenchmarkJoinCandidateBuild(b *testing.B) {
 					if err != nil || lookup == nil {
 						b.Fatalf("lookup not built: %v", err)
 					}
-					_, count := lookup.candidates(0, len(inner))
+					count := 0
+					for position := lookup.firstCandidate(0, len(inner)); position != 0; position = lookup.nextCandidate(position, len(inner)) {
+						count++
+					}
 					if count != len(inner)/distinct {
 						b.Fatal("unexpected candidate count", count)
 					}

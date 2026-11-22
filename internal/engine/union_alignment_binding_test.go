@@ -77,6 +77,59 @@ func TestUnionAlignmentBoundKeysOwnOutput(t *testing.T) {
 	}
 }
 
+func TestUnionDistinctRenamingUsesLastOutputColumn(t *testing.T) {
+	left := []Row{{"same": int64(1), "other": "left"}}
+	right := &ResultSet{
+		Cols: []string{"First", "Last", "Label"},
+		Rows: []Row{{"first": 2, "last": 1.0, "label": "left"},
+			{"first": 2, "last": nil, "label": "new", "hidden": true},
+			{"first": 1, "last": nil, "label": "new"}},
+	}
+	cols := []string{"SAME", "Same", "Other"}
+	acc := newSetOperationDistinctAccumulator(cols, len(left)+len(right.Rows))
+	if err := acc.appendRows(t.Context(), left); err != nil {
+		t.Fatal(err)
+	}
+	if err := acc.appendTerm(t.Context(), right, cols); err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{{"same": int64(1), "other": "left"}, {"same": nil, "other": "new"}}
+	if !reflect.DeepEqual(acc.rows, want) {
+		t.Fatalf("rows = %#v, want %#v", acc.rows, want)
+	}
+	if len(right.Rows[1]) != 4 || right.Rows[1]["first"] != 2 || right.Rows[1]["hidden"] != true {
+		t.Fatalf("remapping changed the right input: %#v", right.Rows)
+	}
+}
+
+func TestSetOperationNumericSignatureEquivalence(t *testing.T) {
+	groups := [][]any{
+		{0, int64(0), 0.0, math.Copysign(0, -1)},
+		{1, int64(1), 1.0},
+		{int64(9007199254740992), int64(9007199254740993), float64(9007199254740992)},
+		{math.NaN(), math.Float64frombits(0xfff8000000001234)},
+		{math.Inf(1)}, {math.Inf(-1)}, {math.SmallestNonzeroFloat64},
+		{nil}, {"1"}, {true}, {[]byte("1")},
+	}
+	identified := make(map[string]bool)
+	cols := []string{"v", "tail"}
+	for _, group := range groups {
+		var first string
+		for i, value := range group {
+			key := string(appendSetOperationSignature(nil, Row{"v": value, "tail": "N;|D\x00"}, cols))
+			if i == 0 {
+				if identified[key] {
+					t.Fatalf("signature collision for %T %v", value, value)
+				}
+				identified[key] = true
+				first = key
+			} else if key != first {
+				t.Fatalf("signature differs for equivalent %T %v and %T %v", group[0], group[0], value, value)
+			}
+		}
+	}
+}
+
 func legacyIntersectMembership(left, right []Row, columns []string) []Row {
 	keys := setOperationColumnKeys(columns)
 	rightSet, seen := make(map[string]bool), make(map[string]bool)

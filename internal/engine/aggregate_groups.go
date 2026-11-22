@@ -3,21 +3,28 @@ package engine
 import "math"
 
 // aggregateGroups belongs to one execution. Single-column keys avoid text
-// formatting, as do pairs of text or int values. Other composite and unusual
-// values retain the framed encoding used by the general GROUP BY evaluator.
+// formatting, as do common pairs of text and integer values. Other composite
+// and unusual values retain the framed encoding used by the general GROUP BY
+// evaluator.
 // Separate key kinds preserve the distinction between int, int64, float64,
 // bool and NULL groups.
 type aggregateGroups struct {
-	text      map[string]*simpleAggregateState
-	textPairs map[[2]string]*simpleAggregateState
-	intPairs  map[[2]int]*simpleAggregateState
-	numbers   [3]map[uint64]*simpleAggregateState // int, int64, float64
-	fixed     [3]*simpleAggregateState            // NULL, false, true
-	other     map[string]*simpleAggregateState
-	key       []byte
-	order     []*simpleAggregateState
-	whole     *simpleAggregateState
-	arena     aggregateStateArena
+	text             map[string]*simpleAggregateState
+	textPairs        map[[2]string]*simpleAggregateState
+	intPairs         map[[2]int]*simpleAggregateState
+	textIntegerPairs [4]map[textIntegerGroupKey]*simpleAggregateState // text first/second, int/int64
+	numbers          [3]map[uint64]*simpleAggregateState              // int, int64, float64
+	fixed            [3]*simpleAggregateState                         // NULL, false, true
+	other            map[string]*simpleAggregateState
+	key              []byte
+	order            []*simpleAggregateState
+	whole            *simpleAggregateState
+	arena            aggregateStateArena
+}
+
+type textIntegerGroupKey struct {
+	text    string
+	integer int64
 }
 
 func newAggregateGroups(projs []simpleAggregateProjection, groupCount int) aggregateGroups {
@@ -88,21 +95,63 @@ func (g *aggregateGroups) state(raw []any, cols []int) *simpleAggregateState {
 		return state
 	}
 	if len(cols) == 2 {
-		// Text and integer pairs are common dimension keys. Hash them directly
-		// instead of formatting and copying a framed composite key per group.
-		// Other type combinations retain the canonical typed encoding below.
-		left, leftText := raw[cols[0]].(string)
-		right, rightText := raw[cols[1]].(string)
-		if leftText && rightText {
-			return g.textPairState(left, right, raw, cols)
-		}
-		leftInt, leftInteger := raw[cols[0]].(int)
-		rightInt, rightInteger := raw[cols[1]].(int)
-		if leftInteger && rightInteger {
-			return g.intPairState(leftInt, rightInt, raw, cols)
+		if state := g.pairState(raw, cols); state != nil {
+			return state
 		}
 	}
 	return g.encodedState(raw, cols)
+}
+
+// pairState shares direct key lookups across scalar and batched aggregation.
+// Unhandled pairs use the caller's framed encoding buffer.
+func (g *aggregateGroups) pairState(raw []any, cols []int) *simpleAggregateState {
+	leftValue, rightValue := raw[cols[0]], raw[cols[1]]
+	left, leftText := leftValue.(string)
+	right, rightText := rightValue.(string)
+	switch {
+	case leftText && rightText:
+		return g.textPairState(left, right, raw, cols)
+	case leftText:
+		return g.textIntegerPairState(left, rightValue, false, raw, cols)
+	case rightText:
+		return g.textIntegerPairState(right, leftValue, true, raw, cols)
+	}
+	leftInt, leftInteger := leftValue.(int)
+	rightInt, rightInteger := rightValue.(int)
+	if leftInteger && rightInteger {
+		return g.intPairState(leftInt, rightInt, raw, cols)
+	}
+	return nil
+}
+
+// A mixed dimension key keeps its column order and the canonical distinction
+// between int and int64 without formatting the integer and copying the text.
+func (g *aggregateGroups) textIntegerPairState(text string, value any, textSecond bool, raw []any, cols []int) *simpleAggregateState {
+	key := textIntegerGroupKey{text: text}
+	kind := 0
+	if textSecond {
+		kind = 2
+	}
+	switch number := value.(type) {
+	case int:
+		key.integer = int64(number)
+	case int64:
+		key.integer = number
+		kind++
+	default:
+		return nil
+	}
+	pairs := g.textIntegerPairs[kind]
+	if state := pairs[key]; state != nil {
+		return state
+	}
+	if pairs == nil {
+		pairs = make(map[textIntegerGroupKey]*simpleAggregateState)
+		g.textIntegerPairs[kind] = pairs
+	}
+	state := g.newState(raw, cols)
+	pairs[key] = state
+	return state
 }
 
 // Integer dimension pairs can be hashed without formatting a composite key.

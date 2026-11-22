@@ -85,9 +85,33 @@ WITH-prefixed UPDATE, DELETE or INSERT VALUES. Data-modifying CTE bodies are
 also outside this implementation.
 
 Views use their existing expansion/depth-limit and materialized-refresh
-behavior. A CTE of the same name takes precedence. This does not add lateral
-or correlated JOIN sources. The Game of Life demo now exercises `%` and a
-direct join against a view: `go run ./cmd/gameoflife -steps 100`.
+behavior. A CTE of the same name takes precedence. The Game of Life demo
+exercises `%` and a direct join against a view: `go run ./cmd/gameoflife -steps 100`.
+
+## Correlated table sources with APPLY
+
+`CROSS APPLY` evaluates its right source for each left row and emits the
+matching pairs. `OUTER APPLY` keeps left rows whose right source is empty,
+with NULLs in the right columns. A derived SELECT or table-function argument
+can refer to an earlier source. Give derived SELECTs an alias and place any
+correlated filter inside the SELECT.
+
+```sql
+SELECT c.id, latest.amount
+FROM customers AS c
+OUTER APPLY (
+    SELECT o.amount FROM orders AS o WHERE o.customer_id = c.id
+    ORDER BY o.created_at DESC LIMIT 1
+) AS latest;
+```
+
+A single qualified equality against a stored table can share one lookup
+across left rows. SQL still applies the right SELECT's ORDER BY and LIMIT
+separately for each left row. `EXPLAIN ANALYZE` labels the right-side lookup
+and APPLY timings when these stages run. A table function supplies its column
+names with its result, so include them when returning an empty row set. If
+the left input is empty, `SELECT *` only includes columns known without
+executing the right side.
 
 ## Subquery membership and pagination
 

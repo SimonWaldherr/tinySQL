@@ -14,6 +14,9 @@ import (
 // resolveFromClause resolves the FROM clause of a SELECT statement and returns the initial rows.
 // It handles: no FROM (dummy row), subqueries, table functions, CTEs, catalog tables, sys tables, and regular tables.
 func resolveFromClause(env ExecEnv, cteEnv ExecEnv, s *Select) ([]Row, error) {
+	if scope := env.applyOuter; scope != nil && scope.lookupSelect == s {
+		return scope.lookupRows, nil
+	}
 	// Check if FROM clause exists
 	if s.From.Table == "" && s.From.Subquery == nil && s.From.TableFunc == nil {
 		// No FROM clause - create a single dummy row for expression evaluation
@@ -595,6 +598,7 @@ func ensureMaterializedViewCache(env ExecEnv, sourceName string, mv *storage.Cat
 	}
 
 	if needsRefresh {
+		env.applyOuter = nil // Materialized data cannot capture caller-side names.
 		if err := refreshMaterializedView(env, sourceName); err != nil && !cacheExists {
 			return nil, err
 		}
@@ -637,6 +641,7 @@ func resolveViewResult(env ExecEnv, source FromItem) (*ResultSet, bool, error) {
 	}
 	viewEnv := env
 	viewEnv.ctes = nil
+	viewEnv.applyOuter = nil // A catalog view cannot capture caller-side names.
 	viewEnv.viewDepth++
 	rs, err := executeSelect(viewEnv, sel)
 	if err != nil {

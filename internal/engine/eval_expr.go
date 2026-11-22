@@ -125,6 +125,15 @@ func evalVarRef(env ExecEnv, ex *VarRef, row Row) (any, error) {
 	} else if v, ok := getVal(row, ex.Name); ok {
 		return v, nil
 	}
+	if env.applyOuter != nil {
+		key := ex.Lower
+		if key == "" {
+			key = strings.ToLower(ex.Name)
+		}
+		if v, ok := lookupApplyColumn(env, key); ok {
+			return v, nil
+		}
+	}
 	// Trigger bodies reference NEW.col/OLD.col, which aren't part of the row
 	// being built by the statement the trigger body itself is executing (an
 	// INSERT into a different table, say) — env.triggerRow carries them

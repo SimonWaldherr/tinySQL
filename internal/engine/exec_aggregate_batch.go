@@ -208,16 +208,8 @@ func executeAggregateBatches(env ExecEnv, plan *simpleAggregatePlan, source *sim
 				for i, id := range selected[:count] {
 					raw := rows[id]
 					if len(plan.groupCols) == 2 {
-						left, leftText := raw[plan.groupCols[0]].(string)
-						right, rightText := raw[plan.groupCols[1]].(string)
-						if leftText && rightText {
-							states[i] = groups.textPairState(left, right, raw, plan.groupCols)
-							continue
-						}
-						leftInt, leftInteger := raw[plan.groupCols[0]].(int)
-						rightInt, rightInteger := raw[plan.groupCols[1]].(int)
-						if leftInteger && rightInteger {
-							states[i] = groups.intPairState(leftInt, rightInt, raw, plan.groupCols)
+						if state := groups.pairState(raw, plan.groupCols); state != nil {
+							states[i] = state
 							continue
 						}
 					}

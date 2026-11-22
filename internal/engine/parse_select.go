@@ -412,63 +412,58 @@ func (p *Parser) parseFromClause(sel *Select) error {
 	}
 
 	p.next() // consume FROM keyword
+	var err error
+	sel.From, err = p.parseFromItem("FROM")
+	return err
+}
 
+func (p *Parser) parseFromItem(clause string) (FromItem, error) {
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
-		return p.parseFromSubselect(sel)
+		p.next()
+		subSel, err := p.parseSelect()
+		if err != nil {
+			return FromItem{}, err
+		}
+		if p.cur.Typ != tSymbol || p.cur.Val != ")" {
+			return FromItem{}, p.errf("expected ) after subselect in %s", clause)
+		}
+		p.next()
+		alias, err := p.parseRequiredAlias("expected alias after AS for subselect", "expected alias for subselect in "+clause)
+		if err != nil {
+			return FromItem{}, err
+		}
+		return FromItem{Subquery: subSel, Alias: alias}, nil
 	}
-	return p.parseFromTableOrFunction(sel)
-}
-
-func (p *Parser) parseFromSubselect(sel *Select) error {
-	p.next()
-	subSel, err := p.parseSelect()
-	if err != nil {
-		return err
-	}
-	if p.cur.Typ != tSymbol || p.cur.Val != ")" {
-		return p.errf("expected ) after subselect in FROM")
-	}
-	p.next()
-	alias, err := p.parseRequiredAlias("expected alias after AS for subselect", "expected alias for subselect in FROM")
-	if err != nil {
-		return err
-	}
-	sel.From = FromItem{Subquery: subSel, Alias: alias}
-	return nil
-}
-
-func (p *Parser) parseFromTableOrFunction(sel *Select) error {
 	from := p.parseQualifiedIdentLike()
 	if from == "" {
-		return p.errf("expected table or table-valued function")
+		return FromItem{}, p.errf("expected table or table-valued function")
 	}
 
+	var tableFunc *TableFuncCall
 	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
 		fcExpr, err := p.parseFuncCallWithName(from)
 		if err != nil {
-			return err
+			return FromItem{}, err
 		}
 		fc, ok := fcExpr.(*FuncCall)
 		if !ok {
-			return p.errf("internal: expected FuncCall for table function %q", from)
+			return FromItem{}, p.errf("internal: expected FuncCall for table function %q", from)
 		}
 		if fc.Over != nil {
-			return p.errf("OVER clause not allowed for table-valued functions in FROM")
+			return FromItem{}, p.errf("OVER clause not allowed for table-valued functions in %s", clause)
 		}
-		alias, err := p.parseOptionalAlias(from, "expected alias")
-		if err != nil {
-			return err
-		}
-		sel.From = FromItem{TableFunc: &TableFuncCall{Name: from, Args: fc.Args, Alias: alias}, Alias: alias}
-		return nil
+		tableFunc = &TableFuncCall{Name: from, Args: fc.Args}
 	}
 
 	alias, err := p.parseOptionalAlias(from, "expected alias")
 	if err != nil {
-		return err
+		return FromItem{}, err
 	}
-	sel.From = FromItem{Table: from, Alias: alias}
-	return nil
+	if tableFunc != nil {
+		tableFunc.Alias = alias
+		return FromItem{TableFunc: tableFunc, Alias: alias}, nil
+	}
+	return FromItem{Table: from, Alias: alias}, nil
 }
 
 func (p *Parser) parseRequiredAlias(asMsg, missingMsg string) (string, error) {
@@ -506,25 +501,20 @@ func (p *Parser) parseOptionalAlias(defaultAlias, asMsg string) (string, error) 
 }
 
 func (p *Parser) parseJoinClauses(sel *Select) error {
-	for {
-		if p.cur.Typ == tKeyword && p.cur.Val == "JOIN" {
+	for p.cur.Typ == tKeyword {
+		var joinType JoinType
+		switch p.cur.Val {
+		case "JOIN":
 			p.next()
-			right, on, err := p.parseJoinTail()
-			if err != nil {
-				return err
-			}
-			sel.Joins = append(sel.Joins, JoinClause{Type: JoinInner, Right: right, On: on})
-			continue
-		}
-		if p.cur.Typ == tKeyword && (p.cur.Val == "LEFT" || p.cur.Val == "RIGHT" || p.cur.Val == "FULL") {
-			var jt JoinType
+			joinType = JoinInner
+		case "LEFT", "RIGHT", "FULL":
 			switch p.cur.Val {
 			case "LEFT":
-				jt = JoinLeft
+				joinType = JoinLeft
 			case "RIGHT":
-				jt = JoinRight
+				joinType = JoinRight
 			case "FULL":
-				jt = JoinFull
+				joinType = JoinFull
 			}
 			p.next()
 			if p.cur.Typ == tKeyword && p.cur.Val == "OUTER" {
@@ -533,34 +523,55 @@ func (p *Parser) parseJoinClauses(sel *Select) error {
 			if err := p.expectKeyword("JOIN"); err != nil {
 				return err
 			}
-			right, on, err := p.parseJoinTail()
-			if err != nil {
-				return err
-			}
-			sel.Joins = append(sel.Joins, JoinClause{Type: jt, Right: right, On: on})
-			continue
-		}
-		if p.cur.Typ == tKeyword && p.cur.Val == "CROSS" {
+		case "CROSS":
 			p.next()
-			if err := p.expectKeyword("JOIN"); err != nil {
+			joinType = JoinCross
+			if p.consumeApply() {
+				joinType = JoinCrossApply
+			} else if err := p.expectKeyword("JOIN"); err != nil {
 				return err
 			}
-			// CROSS JOIN is an unconditional Cartesian product: no ON clause,
-			// so it can't reuse parseJoinTail (which always requires one).
-			rt := p.parseQualifiedIdentLike()
-			if rt == "" {
-				return p.errf("expected table name after CROSS JOIN")
+		case "OUTER":
+			p.next()
+			if !p.consumeApply() {
+				return p.errf("expected APPLY after OUTER")
 			}
-			alias, err := p.parseOptionalAlias(rt, "expected alias")
+			joinType = JoinOuterApply
+		default:
+			return nil
+		}
+
+		apply := joinType == JoinCrossApply || joinType == JoinOuterApply
+		clause := "JOIN"
+		if apply {
+			clause = "APPLY"
+		}
+		right, err := p.parseFromItem(clause)
+		if err != nil {
+			return err
+		}
+		join := JoinClause{Type: joinType, Right: right}
+		if !apply && joinType != JoinCross {
+			if err := p.expectKeyword("ON"); err != nil {
+				return err
+			}
+			join.On, err = p.parseExpr()
 			if err != nil {
 				return err
 			}
-			sel.Joins = append(sel.Joins, JoinClause{Type: JoinCross, Right: FromItem{Table: rt, Alias: alias}, On: nil})
-			continue
 		}
-		break
+		sel.Joins = append(sel.Joins, join)
 	}
 	return nil
+}
+
+// APPLY remains usable as an unquoted identifier or alias elsewhere.
+func (p *Parser) consumeApply() bool {
+	if p.cur.Typ != tIdent || !strings.EqualFold(p.cur.Val, "APPLY") || p.lx.s[p.cur.Pos] == '"' {
+		return false
+	}
+	p.next()
+	return true
 }
 
 func (p *Parser) parseWhereClause(sel *Select) error {
@@ -882,83 +893,4 @@ func (p *Parser) parseUnionClause(sel *Select) error {
 		}
 	}
 	return nil
-}
-
-func (p *Parser) parseJoinTail() (FromItem, Expr, error) {
-	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
-		return p.parseJoinSubselectTail()
-	}
-	return p.parseJoinTableOrFunctionTail()
-}
-
-func (p *Parser) parseJoinSubselectTail() (FromItem, Expr, error) {
-	p.next()
-	subSel, err := p.parseSelect()
-	if err != nil {
-		return FromItem{}, nil, err
-	}
-	if p.cur.Typ != tSymbol || p.cur.Val != ")" {
-		return FromItem{}, nil, p.errf("expected ) after subselect in JOIN")
-	}
-	p.next()
-	alias, err := p.parseRequiredAlias("expected alias after AS for subselect", "expected alias for subselect in JOIN")
-	if err != nil {
-		return FromItem{}, nil, err
-	}
-	on, err := p.parseJoinOnExpr()
-	if err != nil {
-		return FromItem{}, nil, err
-	}
-	return FromItem{Subquery: subSel, Alias: alias}, on, nil
-}
-
-func (p *Parser) parseJoinTableOrFunctionTail() (FromItem, Expr, error) {
-	rt := p.parseQualifiedIdentLike()
-	if rt == "" {
-		return FromItem{}, nil, p.errf("expected table or table-valued function")
-	}
-
-	if p.cur.Typ == tSymbol && p.cur.Val == "(" {
-		fcExpr, err := p.parseFuncCallWithName(rt)
-		if err != nil {
-			return FromItem{}, nil, err
-		}
-		fc, ok := fcExpr.(*FuncCall)
-		if !ok {
-			return FromItem{}, nil, p.errf("internal: expected FuncCall for table function %q", rt)
-		}
-		if fc.Over != nil {
-			return FromItem{}, nil, p.errf("OVER clause not allowed for table-valued functions in JOIN")
-		}
-		alias, err := p.parseOptionalAlias(rt, "expected alias")
-		if err != nil {
-			return FromItem{}, nil, err
-		}
-		on, err := p.parseJoinOnExpr()
-		if err != nil {
-			return FromItem{}, nil, err
-		}
-		return FromItem{TableFunc: &TableFuncCall{Name: rt, Args: fc.Args, Alias: alias}, Alias: alias}, on, nil
-	}
-
-	alias, err := p.parseOptionalAlias(rt, "expected alias")
-	if err != nil {
-		return FromItem{}, nil, err
-	}
-	on, err := p.parseJoinOnExpr()
-	if err != nil {
-		return FromItem{}, nil, err
-	}
-	return FromItem{Table: rt, Alias: alias}, on, nil
-}
-
-func (p *Parser) parseJoinOnExpr() (Expr, error) {
-	if err := p.expectKeyword("ON"); err != nil {
-		return nil, err
-	}
-	on, err := p.parseExpr()
-	if err != nil {
-		return nil, err
-	}
-	return on, nil
 }

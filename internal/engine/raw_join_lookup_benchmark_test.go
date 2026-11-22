@@ -11,11 +11,14 @@ func BenchmarkRawJoinLookupBuild(b *testing.B) {
 	for _, tc := range []struct {
 		name   string
 		groups int
-		filter bool
+		filter func([]any) (bool, error)
 	}{
-		{"Unique", size, false},
-		{"Repeated", 500, false},
-		{"Selective", size, true},
+		{"Unique", size, nil},
+		{"AlmostUnique", size - 1, nil},
+		{"Repeated", 500, nil},
+		{"Selective", size, func(row []any) (bool, error) { return row[1].(int)%1000 == 0, nil }},
+		{"Half", size, func(row []any) (bool, error) { return row[1].(int)&1 == 0, nil }},
+		{"Dense", size, func(row []any) (bool, error) { return row[1].(int)%10 != 0, nil }},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			rows := make([][]any, size)
@@ -23,10 +26,7 @@ func BenchmarkRawJoinLookupBuild(b *testing.B) {
 				rows[i] = []any{i % tc.groups, i}
 			}
 			table := &storage.Table{Rows: rows, Version: 1}
-			plan := &simpleJoinPlan{right: table, rightKey: 0}
-			if tc.filter {
-				plan.rightFilter = func(row []any) (bool, error) { return row[1].(int)%1000 == 0, nil }
-			}
+			plan := &simpleJoinPlan{right: table, rightKey: 0, rightFilter: tc.filter}
 			b.ReportAllocs()
 			for b.Loop() {
 				// Rebuild a version-invalidated index; fixture construction and

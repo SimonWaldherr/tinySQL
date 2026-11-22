@@ -334,6 +334,9 @@ type aggregateProjectionArg struct {
 }
 
 func processAggregateQueryFastPath(env ExecEnv, s *Select, filtered []Row) ([]Row, []string, bool, error) {
+	if env.applyOuter != nil {
+		return nil, nil, false, nil
+	}
 	if s.Having != nil || anyWindowInSelect(s.Projs) {
 		return nil, nil, false, nil
 	}
@@ -637,7 +640,7 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 
 	// Check if any window functions are used
 	hasWindowFunctions := anyWindowInSelect(s.Projs)
-	isDirectSelect := !hasWindowFunctions
+	isDirectSelect := !hasWindowFunctions && env.applyOuter == nil
 	directProjs := make([]directSelectProjection, 0, len(s.Projs))
 	if isDirectSelect {
 		for i, it := range s.Projs {
@@ -767,7 +770,11 @@ func processNonAggregateQuery(env ExecEnv, s *Select, filtered []Row) ([]Row, []
 			if _, projected := out[col]; projected {
 				continue
 			}
-			if v, ok := r[col]; ok {
+			v, ok := r[col]
+			if !ok && env.applyOuter != nil {
+				v, ok = lookupApplyColumn(env, col)
+			}
+			if ok {
 				out[col] = v
 			}
 		}
