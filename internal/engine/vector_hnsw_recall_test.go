@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand"
 	"slices"
@@ -164,5 +165,28 @@ func TestVecHNSWResultPrefixMatchesFullSort(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func BenchmarkHNSWResultRanking(b *testing.B) {
+	const size = 40
+	rng := rand.New(rand.NewSource(42))
+	beam := make(vecScoredHeap, 0, size)
+	for row := range size {
+		vecScoredHeapPush(&beam, vecScoredRow{rowIdx: row, distance: rng.Float64()})
+	}
+	want := rankHNSWResults(slices.Clone(beam), size)
+	for _, k := range []int{1, 20} {
+		b.Run(fmt.Sprintf("k=%d", k), func(b *testing.B) {
+			var scratch [size]vecScoredRow
+			b.ReportAllocs()
+			for b.Loop() {
+				copy(scratch[:], beam)
+				got := rankHNSWResults(scratch[:], k)
+				if len(got) != k || got[0] != want[0] || got[k-1] != want[k-1] {
+					b.Fatalf("ranked beam: got %v, want %v", got, want[:k])
+				}
+			}
+		})
 	}
 }

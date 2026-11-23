@@ -127,6 +127,67 @@ func TestIVFSearchScratchMatchesAllocatingFrontier(t *testing.T) {
 	}
 }
 
+func TestIVFSearchSegmentedMatchesPerRowResolution(t *testing.T) {
+	for _, metric := range []string{"cosine", "l2", "manhattan", "dot"} {
+		t.Run(metric, func(t *testing.T) {
+			idx, cache := ivfSearchScratchFixture(4, metric)
+			base := cache.segments[0]
+			cache.segments = nil
+			start := 0
+			for _, end := range []int{0, 5, 29, 96, cache.rows} {
+				cache.segments = append(cache.segments, vecColumnSegment{
+					start: start, vectors: base.vectors[start:end],
+					valid: base.valid[start:end], norms: base.norms[start:end],
+				})
+				start = end
+			}
+			withUpdate := cache
+			withUpdate.overrides = map[int]vecColumnOverride{7: {vector: []float64{1, 2}, norm: math.Sqrt(5), valid: true}}
+			withoutNorms := cache
+			withoutNorms.normsReady = false
+			query := []float64{1, 2}
+			queryNorm := vectorL2Norm(query)
+			for _, view := range []vecSearchColumnCacheEntry{cache, withUpdate, withoutNorms} {
+				for _, k := range []int{1, 10, 128} {
+					got, err := idx.search(t.Context(), query, queryNorm, k, view)
+					want, refErr := legacyIVFSearchScratch(t.Context(), idx, query, queryNorm, k, view)
+					if err != nil || refErr != nil || !equalIVFScratchResults(got, want) {
+						t.Fatalf("k=%d, updated=%t: got %v/%v, want %v/%v", k, len(view.overrides) != 0, got, err, want, refErr)
+					}
+				}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			if _, err := idx.search(ctx, query, queryNorm, 10, cache); err != context.Canceled {
+				t.Fatalf("segmented search: got %v, want context cancellation", err)
+			}
+		})
+	}
+}
+
+func TestIVFSparseHeapReservesScorableLists(t *testing.T) {
+	idx, cache := ivfSearchScratchFixture(4, "cosine")
+	// The indexed vectors are followed by a large region of NULL rows.
+	cache.rows = 4096
+	idx.lists[0] = []int{4, 8, 12}
+	idx.lists[1] = nil
+	query := []float64{1, 2}
+	norm := vectorL2Norm(query)
+	const k = math.MaxInt
+	got, err := idx.search(t.Context(), query, norm, k, cache)
+	want, refErr := legacyIVFSearchScratch(t.Context(), idx, query, norm, k, cache)
+	if err != nil || refErr != nil || len(want) == 0 || !equalIVFScratchResults(got, want) {
+		t.Fatalf("got %v/%v, want %v/%v", got, err, want, refErr)
+	}
+	// The first centroid is unscorable and the second list is empty.
+	if bound := len(idx.lists[2]) + len(idx.lists[3]); cap(got) > bound {
+		t.Fatalf("reserved capacity %d, want at most %d", cap(got), bound)
+	}
+	if got, err := idx.search(t.Context(), []float64{0, 0}, 0, k, cache); err != nil || got != nil {
+		t.Fatalf("zero cosine query returned %v/%v", got, err)
+	}
+}
+
 func TestIVFSearchScratchOwnsResultsAndSupportsConcurrentReaders(t *testing.T) {
 	idx, cache := ivfSearchScratchFixture(64, "l2")
 	query := []float64{1, 2}

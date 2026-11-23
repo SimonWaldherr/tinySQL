@@ -7,6 +7,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"testing"
 
@@ -100,4 +101,55 @@ func BenchmarkVecHNSWIncrementalInsert_10k(b *testing.B) {
 
 func BenchmarkVecHNSWIncrementalInsert_50k(b *testing.B) {
 	benchmarkVecHNSWIncrementalInsert(b, 50_000)
+}
+
+func BenchmarkVecHNSWSearchWithUpdates(b *testing.B) {
+	const rows, dims, metric = 2048, 32, "cosine"
+	table, queries := hnswRecallCorpus(rows, dims, 8)
+	cache := buildVecColumnCache(table, 1, true)
+	idx, err := buildVecHNSWIndex(b.Context(), table, metric, dims, cache)
+	if err != nil {
+		b.Fatal(err)
+	}
+	deltas := make([]int, 0, rows/32)
+	for i := 0; i < rows; i += 32 {
+		table.Rows[i][1] = queries[len(deltas)%len(queries)]
+		deltas = append(deltas, i)
+	}
+	cache = refreshVecColumnCache(cache, table, 1, true, deltas)
+	idx.addDeltaRows(deltas)
+	query := queries[0]
+	norm := vectorL2Norm(query)
+	for _, k := range []int{1, 20, 100} {
+		b.Run(fmt.Sprintf("k=%d", k), func(b *testing.B) {
+			if got, err := idx.search(b.Context(), query, norm, k, cache); err != nil || len(got) != k {
+				b.Fatalf("warm search got %d results: %v", len(got), err)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if got, err := idx.search(b.Context(), query, norm, k, cache); err != nil || len(got) != k {
+					b.Fatalf("search got %d results: %v", len(got), err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkVecHNSWOversizedSearch(b *testing.B) {
+	const rows, dims, metric = 2048, 32, "cosine"
+	table, queries := hnswRecallCorpus(rows, dims, 8)
+	cache := buildVecColumnCache(table, 1, true)
+	idx, err := buildVecHNSWIndex(b.Context(), table, metric, dims, cache)
+	if err != nil {
+		b.Fatal(err)
+	}
+	query := queries[0]
+	norm := vectorL2Norm(query)
+	b.ReportAllocs()
+	for b.Loop() {
+		got, err := idx.search(b.Context(), query, norm, rows+1, cache)
+		if err != nil || len(got) != rows {
+			b.Fatalf("search got %d results: %v", len(got), err)
+		}
+	}
 }

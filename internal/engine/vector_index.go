@@ -683,12 +683,30 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 		}
 		centroidHeap = append(centroidHeap, vecScoredRow{rowIdx: i, distance: dist})
 	}
+	if len(centroidHeap) == 0 {
+		return nil, nil
+	}
 	for i := len(centroidHeap)/2 - 1; i >= 0; i-- {
 		vecMinHeapDown(centroidHeap, i)
 	}
 
+	capHint := min(k, cache.rowCount())
+	if capHint > len(centroidScratch) {
+		// A sparse vector column may index far fewer rows than the table
+		// contains. Bound large reservations by the scorable probes, without
+		// changing k or the point at which the search stops probing.
+		remaining := capHint
+		for _, c := range centroidHeap {
+			remaining -= min(remaining, len(idx.lists[c.rowIdx]))
+			if remaining == 0 {
+				break
+			}
+		}
+		capHint -= remaining
+	}
 	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
-	resultHeap := newScoredHeap(k, cache.rowCount())
+	segmented := len(cache.segments) > 1 && cache.directScanSegments(0, cache.rows)
+	resultHeap := newScoredHeap(k, capHint)
 	for probed := 0; len(centroidHeap) > 0; probed++ {
 		// Past the probe budget, keep going only while short of k.
 		if probed >= probes && resultHeap.Len() >= k {
@@ -702,6 +720,12 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 		c := centroidHeap[last]
 		centroidHeap = centroidHeap[:last]
 		list := idx.lists[c.rowIdx]
+		if segmented {
+			if err := scoreSegmentedIVFList(ctx, list, &scorer, resultHeap, k); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		for i, rowIdx := range list {
 			if i&1023 == 0 {
 				if err := checkCtx(ctx); err != nil {
@@ -715,6 +739,44 @@ func (idx *vecIVFIndex) search(ctx context.Context, query []float64, queryNorm f
 		}
 	}
 	return topKFromHeap(resultHeap, k), nil
+}
+
+// IVF lists hold physical row IDs in order. Keep the last segment for the
+// next row and look it up again only at segment boundaries. Only complete
+// caches without UPDATE overrides can use this direct scan.
+func scoreSegmentedIVFList(ctx context.Context, list []int, scorer *vecRowScorer, heap *vecScoredHeap, k int) error {
+	cache := scorer.rows.cache
+	var segment *vecColumnSegment
+	for i, row := range list {
+		if i&1023 == 0 {
+			if err := checkCtx(ctx); err != nil {
+				return err
+			}
+		}
+		if segment == nil || uint(row-segment.start) >= uint(len(segment.vectors)) {
+			segment = cache.segmentFor(row)
+			if segment == nil {
+				continue
+			}
+		}
+		local := row - segment.start
+		if !segment.valid[local] {
+			continue
+		}
+		vector := segment.vectors[local]
+		var norm float64
+		if scorer.rows.needNorm {
+			if cache.normsReady {
+				norm = segment.norms[local]
+			} else {
+				norm = vectorL2Norm(vector)
+			}
+		}
+		if distance, ok := vecRankingDistanceKind(scorer.kind, vector, scorer.query, norm, scorer.queryNorm); ok {
+			pushTopK(heap, row, distance, k)
+		}
+	}
+	return nil
 }
 
 func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, colIdx int, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecHNSWIndex, error) {
@@ -1195,18 +1257,18 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	if idx.entry < 0 {
 		return nil, nil
 	}
+	// Each physical row contributes at most one hit. This request would
+	// always fall back to a flat scan after traversing the graph.
+	if k > cache.rowCount() {
+		return idx.searchFlat(ctx, query, queryNorm, k, cache)
+	}
 	visited := acquireVisited(cache.rowCount())
 	defer releaseVisited(visited)
 	scratch := acquireHNSWScratch()
 	defer releaseHNSWScratch(scratch)
 	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
 	ef := chooseHNSWEfSearch(k)
-	limit := k
-	if len(idx.deltaRows) != 0 {
-		// Keep the full beam for the existing merge with updated vectors.
-		limit = ef
-	}
-	candidates, err := idx.searchCandidates(ctx, &scorer, ef, limit, visited, scratch)
+	candidates, err := idx.searchCandidates(ctx, &scorer, ef, k, visited, scratch)
 	if err != nil {
 		return nil, err
 	}
@@ -1214,31 +1276,37 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 		// candidates is sorted nearest first and owned by scratch.
 		return append([]vecScoredRow(nil), candidates[:k]...), nil
 	}
-	resultHeap := newScoredHeap(k, len(candidates)+len(idx.deltaRows))
-	var seen map[int]struct{}
 	if len(idx.deltaRows) != 0 {
-		seen = make(map[int]struct{}, len(candidates))
-	}
-	for _, sr := range candidates {
-		pushTopK(resultHeap, sr.rowIdx, sr.distance, k)
-		if seen != nil {
-			seen[sr.rowIdx] = struct{}{}
+		// Graph candidates are distinct and already scored against current
+		// vectors. The best k graph rows suffice even after adding updates.
+		// Reset visitation marks to record only those candidates, so updates
+		// missed by the graph can still compete.
+		visited.reset()
+		resultHeap := newScoredHeap(k, len(candidates)+len(idx.deltaRows))
+		for i := len(candidates) - 1; i >= 0; i-- {
+			candidate := candidates[i]
+			// Reversing nearest-first candidates produces a valid max heap.
+			*resultHeap = append(*resultHeap, candidate)
+			visited.visit(candidate.rowIdx)
+		}
+		for _, rowIdx := range idx.deltaRows {
+			if !visited.visit(rowIdx) {
+				continue
+			}
+			if distance, ok := scorer.distance(rowIdx); ok {
+				pushTopK(resultHeap, rowIdx, distance, k)
+			}
+		}
+		if resultHeap.Len() >= k {
+			return topKFromHeap(resultHeap, k), nil
 		}
 	}
-	for _, rowIdx := range idx.deltaRows {
-		if _, duplicate := seen[rowIdx]; duplicate {
-			continue
-		}
-		distance, ok := scorer.distance(rowIdx)
-		if ok {
-			pushTopK(resultHeap, rowIdx, distance, k)
-		}
-	}
-	if resultHeap.Len() < k {
-		distFn := buildVecDistanceFunc(idx.metric, query, queryNorm)
-		return vecSearchTopK(ctx, idx.table.Rows, idx.dims, k, cache, distFn, vecDistanceFuncNeedsNorm(idx.metric))
-	}
-	return topKFromHeap(resultHeap, k), nil
+	return idx.searchFlat(ctx, query, queryNorm, k, cache)
+}
+
+func (idx *vecHNSWIndex) searchFlat(ctx context.Context, query []float64, queryNorm float64, k int, cache vecSearchColumnCacheEntry) ([]vecScoredRow, error) {
+	distance := buildVecDistanceFunc(idx.metric, query, queryNorm)
+	return vecSearchTopK(ctx, idx.table.Rows, idx.dims, k, cache, distance, metricNeedsNorms(idx.metric))
 }
 
 // searchCandidates descends greedily from the entry point to layer 1 and
@@ -1351,6 +1419,17 @@ func (idx *vecHNSWIndex) searchLayer(s *vecRowScorer, entry int, entryDist float
 
 func rankHNSWResults(rows vecScoredHeap, limit int) []vecScoredRow {
 	limit = min(limit, len(rows))
+	if limit == 1 {
+		// A max heap's minimum is among its leaves. Find it directly
+		// without changing the heap or sorting the rest of the beam.
+		best := len(rows) / 2
+		for i := best + 1; i < len(rows); i++ {
+			if vecScoredRowLess(rows[i], rows[best]) {
+				best = i
+			}
+		}
+		return rows[best : best+1]
+	}
 	if limit > 0 && limit <= len(rows)/2 {
 		// Heapify once and extract only the best rows. Pop leaves each
 		// extracted row in the tail, in reverse order.

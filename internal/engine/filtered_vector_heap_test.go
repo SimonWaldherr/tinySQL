@@ -27,6 +27,21 @@ func filteredVectorHeapFixture(rows int) vecSearchColumnCacheEntry {
 	return buildVecColumnCache(table, 0, true)
 }
 
+func splitFilteredVectorHeap(cache vecSearchColumnCacheEntry, parts int) vecSearchColumnCacheEntry {
+	base := cache.segments[0]
+	cache.segments = make([]vecColumnSegment, parts)
+	for i := range cache.segments {
+		start, end := i*cache.rows/parts, (i+1)*cache.rows/parts
+		cache.segments[i] = vecColumnSegment{
+			start:   start,
+			vectors: base.vectors[start:end],
+			norms:   base.norms[start:end],
+			valid:   base.valid[start:end],
+		}
+	}
+	return cache
+}
+
 func referenceFilteredVectorScores(allowed []int, dims, k int, cache vecSearchColumnCacheEntry, distance vecDistanceFunc, needNorm bool) []vecScoredRow {
 	if k <= 0 {
 		return nil
@@ -56,19 +71,25 @@ func referenceFilteredVectorScores(allowed []int, dims, k int, cache vecSearchCo
 
 func TestFilteredVectorHeapBoundsMatchScores(t *testing.T) {
 	cache := filteredVectorHeapFixture(48)
-	segmented := cache
-	segmented.segments = append(slices.Clone(cache.segments), vecColumnSegment{start: cache.rows})
-	updated := cache
+	segmented := splitFilteredVectorHeap(cache, 4)
+	withoutNorms := segmented
+	withoutNorms.normsReady = false
+	gapped := segmented
+	gapped.segments = append(gapped.segments[:1:1], gapped.segments[2:]...)
+	updated := segmented
 	updated.overrides = map[int]vecColumnOverride{1: {vector: []float64{9, 0, 0}, norm: 9, valid: true}, 2: {valid: false}}
 	query := []float64{1, 0, 0}
-	for _, candidateCache := range []vecSearchColumnCacheEntry{cache, segmented, updated} {
+	for _, candidateCache := range []vecSearchColumnCacheEntry{cache, segmented, withoutNorms, gapped, updated} {
 		for _, metric := range []string{"cosine", "l2", "manhattan", "dot"} {
 			distance := buildVecDistanceFunc(metric, query, vectorL2Norm(query))
-			for _, allowed := range [][]int{nil, {1}, {-1, 0, 1, 1, 2, 7, 11, 13, 28, 48, 99}} {
+			for _, allowed := range [][]int{nil, {1}, {-1, 0, 1, 1, 2, 7, 11, 13, 28, 48, 99}, {27, 1, 38, 12, 25, 47, 38}} {
 				for _, k := range []int{0, 1, 3, 1000, math.MaxInt} {
 					got, err := ragVecTopKAllowed(t.Context(), allowed, len(query), k, candidateCache, distance, metric == "cosine")
 					want := referenceFilteredVectorScores(allowed, len(query), k, candidateCache, distance, metric == "cosine")
-					if err != nil || !reflect.DeepEqual(got, want) {
+					same := slices.EqualFunc(got, want, func(a, b vecScoredRow) bool {
+						return a.rowIdx == b.rowIdx && math.Float64bits(a.distance) == math.Float64bits(b.distance)
+					})
+					if err != nil || !same {
 						t.Fatalf("metric=%s k=%d allowed=%v: got %v / %v, want %v", metric, k, allowed, got, err, want)
 					}
 				}
@@ -85,7 +106,7 @@ func TestFilteredVectorHeapBoundsMatchScores(t *testing.T) {
 func TestFilteredVectorHeapParallelLargeK(t *testing.T) {
 	previous := runtime.GOMAXPROCS(2)
 	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
-	cache := filteredVectorHeapFixture(8192)
+	cache := splitFilteredVectorHeap(filteredVectorHeapFixture(8192), 8)
 	allowed := make([]int, 4096)
 	for i := range allowed {
 		allowed[i] = i * 2
@@ -106,6 +127,29 @@ func TestFilteredVectorHeapParallelLargeK(t *testing.T) {
 	cancel()
 	if _, err := ragVecTopKAllowed(ctx, allowed, len(query), math.MaxInt, cache, distance, false); !errors.Is(err, context.Canceled) {
 		t.Fatal("parallel cancellation", err)
+	}
+}
+
+func BenchmarkFilteredVectorSegmentSearch(b *testing.B) {
+	const rows, k = 65536, 20
+	base := filteredVectorHeapFixture(rows)
+	query := []float64{1, 0, 0}
+	distance := buildVecDistanceFunc("cosine", query, vectorL2Norm(query))
+	allowed := make([]int, rows/4)
+	for i := range allowed {
+		allowed[i] = i * 4
+	}
+	for _, parts := range []int{1, 8} {
+		b.Run(fmt.Sprintf("segments=%d", parts), func(b *testing.B) {
+			cache := splitFilteredVectorHeap(base, parts)
+			b.ReportAllocs()
+			for b.Loop() {
+				got, err := ragVecTopKAllowed(b.Context(), allowed, len(query), k, cache, distance, true)
+				if err != nil || len(got) != k {
+					b.Fatalf("got %d results: %v", len(got), err)
+				}
+			}
+		})
 	}
 }
 

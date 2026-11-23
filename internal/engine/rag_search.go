@@ -531,7 +531,13 @@ func materializeRAGFusedCandidates(table *storage.Table, ordered ragNativeCandid
 	// across every fused row below, so ToLower-ing it per (row, column) pair
 	// redid the same string conversion len(ordered) times over. Mirrors
 	// materializeVecCandidates' identical hoist.
-	lowerCols := make([]string, len(table.Cols))
+	var lowerScratch [16]string
+	lowerCols := lowerScratch[:]
+	if len(table.Cols) > len(lowerCols) {
+		lowerCols = make([]string, len(table.Cols))
+	} else {
+		lowerCols = lowerCols[:len(table.Cols)]
+	}
 	for i, column := range table.Cols {
 		cols = append(cols, column.Name)
 		lowerCols[i] = strings.ToLower(column.Name)

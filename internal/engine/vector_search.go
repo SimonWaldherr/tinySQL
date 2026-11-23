@@ -1245,7 +1245,13 @@ func materializeVecCandidates(table *storage.Table, scoredRowsOrdered []vecScore
 	// Lower-cased once per column up front: table.Cols is loop-invariant
 	// across every scored row below, so ToLower-ing it per (row, column) pair
 	// redid the same string conversion len(scoredRowsOrdered) times over.
-	lowerCols := make([]string, len(table.Cols))
+	var lowerScratch [16]string
+	lowerCols := lowerScratch[:]
+	if len(table.Cols) > len(lowerCols) {
+		lowerCols = make([]string, len(table.Cols))
+	} else {
+		lowerCols = lowerCols[:len(table.Cols)]
+	}
 	for i, c := range table.Cols {
 		resultCols = append(resultCols, c.Name)
 		lowerCols[i] = strings.ToLower(c.Name)

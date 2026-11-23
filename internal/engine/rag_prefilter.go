@@ -1138,6 +1138,13 @@ func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, quer
 		return heapRows, nil
 	}
 
+	// Filtered row IDs are usually sorted, so one segment lookup covers
+	// many candidates. Retain the general resolver when updates or gaps
+	// can change which row data the cache returns.
+	var segment *vecColumnSegment
+	if len(cache.segments) > 1 && cache.directScanSegments(0, rowCount) {
+		segment = &cache.segments[0]
+	}
 	for i := start; i < end; i++ {
 		if i&1023 == 0 {
 			if err := checkCtx(ctx); err != nil {
@@ -1148,9 +1155,35 @@ func ragVecTopKAllowedRange(ctx context.Context, allowed []int, start, end, quer
 		if rowID < 0 || rowID >= rowCount {
 			continue
 		}
-		vec, norm, valid := cache.resolveRow(rowID, needNorm)
-		if !valid || len(vec) != queryLen {
-			continue
+		var vec []float64
+		var norm float64
+		if segment == nil {
+			var valid bool
+			vec, norm, valid = cache.resolveRow(rowID, needNorm)
+			if !valid || len(vec) != queryLen {
+				continue
+			}
+		} else {
+			local := rowID - segment.start
+			if uint(local) >= uint(len(segment.vectors)) {
+				next := cache.segmentFor(rowID)
+				if next == nil {
+					continue
+				}
+				segment = next
+				local = rowID - segment.start
+			}
+			vec = segment.vectors[local]
+			if !segment.valid[local] || len(vec) != queryLen {
+				continue
+			}
+			if needNorm {
+				if cache.normsReady {
+					norm = segment.norms[local]
+				} else {
+					norm = vectorL2Norm(vec)
+				}
+			}
 		}
 		distance, ok := distFn(vec, norm)
 		if ok {

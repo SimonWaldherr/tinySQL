@@ -300,6 +300,101 @@ func TestVecHNSWExtendFallsBackToFullRebuildAfterUpdateOrDelete(t *testing.T) {
 	}
 }
 
+// referenceHNSWDeltaSearch ranks the entire beam and deduplicates updates
+// against it with a map, as the original delta search did.
+func referenceHNSWDeltaSearch(ctx context.Context, idx *vecHNSWIndex, query []float64, queryNorm float64, k int, cache vecSearchColumnCacheEntry) ([]vecScoredRow, error) {
+	visited := acquireVisited(cache.rowCount())
+	defer releaseVisited(visited)
+	scratch := acquireHNSWScratch()
+	defer releaseHNSWScratch(scratch)
+	scorer := newVecRowScorer(idx.metric, query, queryNorm, newVecRowResolver(&cache, metricNeedsNorms(idx.metric)))
+	ef := chooseHNSWEfSearch(k)
+	candidates, err := idx.searchCandidates(ctx, &scorer, ef, ef, visited, scratch)
+	if err != nil {
+		return nil, err
+	}
+	best := newScoredHeap(k, len(candidates)+len(idx.deltaRows))
+	seen := make(map[int]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		pushTopK(best, candidate.rowIdx, candidate.distance, k)
+		seen[candidate.rowIdx] = struct{}{}
+	}
+	for _, row := range idx.deltaRows {
+		if _, found := seen[row]; found {
+			continue
+		}
+		if distance, ok := scorer.distance(row); ok {
+			pushTopK(best, row, distance, k)
+		}
+	}
+	if best.Len() < k {
+		return vecSearchTopK(ctx, idx.table.Rows, idx.dims, k, cache, buildVecDistanceFunc(idx.metric, query, queryNorm), metricNeedsNorms(idx.metric))
+	}
+	return topKFromHeap(best, k), nil
+}
+
+func TestVecHNSWDeltaMergeMatchesFullBeam(t *testing.T) {
+	const rows, connected, dims = 72, 49, 2
+	table := storage.NewTable("hnsw_delta_merge", []storage.Column{{Name: "embedding", Type: storage.VectorType}}, false)
+	graph := make([][][]int, rows)
+	for i := range rows {
+		table.Rows = append(table.Rows, []any{[]float64{float64(3 + i%5), float64(4 + i%8)}})
+		graph[i] = make([][]int, 1)
+	}
+	// Only the first 49 rows are reachable, including more than the minimum
+	// beam width. Updated rows can also be present only in the exact delta.
+	for row := 1; row <= 24; row++ {
+		graph[0][0] = append(graph[0][0], row)
+		if row+24 < connected {
+			graph[row][0] = []int{row + 24}
+		}
+	}
+	for _, metric := range []string{"cosine", "l2", "manhattan", "dot"} {
+		t.Run(metric, func(t *testing.T) {
+			idx := &vecHNSWIndex{table: table, metric: metric, dims: dims, entry: 0, neighbors: graph}
+			needNorms := metricNeedsNorms(metric)
+			cache := buildVecColumnCache(table, 0, needNorms)
+			cache.overrides = make(map[int]vecColumnOverride)
+			for i, row := range []int{1, 4, 40, 48, 60, 61, 62, 63, 64} {
+				vector := []float64{1, 2}
+				switch i {
+				case 6:
+					vector[0] = math.NaN()
+				case 7:
+					vector[0] = math.Inf(1)
+				case 8:
+					vector = []float64{1}
+				}
+				cache.overrides[row] = vecColumnOverride{vector: vector, norm: vectorL2Norm(vector), valid: true}
+				idx.addDeltaRows([]int{row})
+			}
+			// Test candidates tied across graph and delta, and cases that
+			// cannot fill k without falling back to the flat scan.
+			for _, query := range [][]float64{{1, 2}, {2, 1}, {0, 0}} {
+				queryNorm := vectorL2Norm(query)
+				for _, k := range []int{1, 8, 20, 40, 50, rows + 10} {
+					got, err := idx.search(t.Context(), query, queryNorm, k, cache)
+					want, refErr := referenceHNSWDeltaSearch(t.Context(), idx, query, queryNorm, k, cache)
+					if err != nil || refErr != nil || len(got) != len(want) {
+						t.Fatalf("query=%v k=%d: got %v / %v, want %v / %v", query, k, got, err, want, refErr)
+					}
+					for i, row := range got {
+						if row.rowIdx != want[i].rowIdx || math.Float64bits(row.distance) != math.Float64bits(want[i].distance) {
+							t.Fatalf("query=%v k=%d rank=%d: got %+v, want %+v", query, k, i, row, want[i])
+						}
+					}
+				}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			query := []float64{1, 2}
+			if _, err := idx.search(ctx, query, vectorL2Norm(query), rows+1, cache); err != context.Canceled {
+				t.Fatalf("oversized search: got %v, want context cancellation", err)
+			}
+		})
+	}
+}
+
 // TestVecHNSWExtendContextCancellationLeavesConsistentGraph confirms that if
 // an incremental extend is cancelled partway through, the graph is left
 // covering exactly the rows it finished inserting (never a partially linked
