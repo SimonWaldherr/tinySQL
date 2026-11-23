@@ -448,8 +448,7 @@ func vecSearchTopKWithIndex(
 			rows, err = idx.search(ctx, args.queryVec, queryNorm, args.k, cache)
 		}
 	default:
-		distFn := buildVecDistanceFunc(args.metric, args.queryVec, queryNorm)
-		rows, err = vecSearchTopK(ctx, table.Rows, queryLen, args.k, cache, distFn, vecDistanceFuncNeedsNorm(args.metric))
+		rows, err = vecSearchFlat(ctx, table.Rows, args.metric, args.queryVec, queryNorm, args.k, cache)
 	}
 	if err != nil {
 		return nil, err

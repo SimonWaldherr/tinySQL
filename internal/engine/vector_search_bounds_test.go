@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -63,6 +64,12 @@ func TestVecSearchParallelLargeKIsBounded(t *testing.T) {
 	for i := 1; i < len(result); i++ {
 		if vecScoredRowLess(result[i], result[i-1]) {
 			t.Fatalf("result not ordered at %d", i)
+		}
+	}
+	for _, k := range []int{5, math.MaxInt} {
+		got, err := vecSearchFlat(t.Context(), table.Rows, "l2", query, 0, k, cache)
+		if err != nil || !slices.Equal(got, result[:min(k, rows)]) {
+			t.Fatalf("parallel L2 top-%d differs from the generic ranking: got %d rows, error=%v", k, len(got), err)
 		}
 	}
 }

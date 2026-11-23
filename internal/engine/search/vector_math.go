@@ -34,6 +34,12 @@ func VectorL2Squared(a, b []float64) float64 {
 	return vectorL2SquaredKernel(a[:n], b[:n])
 }
 
+// VectorL2SquaredEqualLength uses the native kernel after the caller has
+// established that a and b have the same length.
+func VectorL2SquaredEqualLength(a, b []float64) float64 {
+	return vectorL2SquaredKernel(a, b)
+}
+
 func VectorL2SquaredUnrolled(a, b []float64) float64 {
 	var s0, s1, s2, s3 float64
 	i := 0

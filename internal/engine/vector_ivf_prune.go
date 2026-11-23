@@ -9,7 +9,6 @@ import (
 const (
 	ivfL2PruneMinDims      = 256
 	ivfL2PruneMinCentroids = 32
-	ivfL2PrunePrefix       = 64
 	ivfL2PruneMaxMisses    = 4
 )
 
@@ -38,7 +37,7 @@ func nearestCentroidL2Pruned(vec []float64, centroids [][]float64, hint int) int
 			continue
 		}
 		if misses < ivfL2PruneMaxMisses {
-			prefix := search.VectorL2Squared(centroid[:ivfL2PrunePrefix], vec[:ivfL2PrunePrefix])
+			prefix := search.VectorL2Squared(centroid[:l2PrunePrefix], vec[:l2PrunePrefix])
 			if prefix > bestDist || prefix == bestDist && c > best {
 				misses = 0
 				continue

@@ -972,16 +972,48 @@ func vecSearchWorkerCount(rows, dims int) int {
 	return workers
 }
 
+type vecFlatScan struct {
+	cache    vecSearchColumnCacheEntry
+	distance vecDistanceFunc
+	needNorm bool
+	l2Query  []float64 // non-nil only for a validated contiguous segment
+}
+
+func vecSearchFlat(ctx context.Context, rows [][]any, metric string, query []float64, queryNorm float64, k int, cache vecSearchColumnCacheEntry) ([]vecScoredRow, error) {
+	if metric == "l2" && k > 0 && len(query) != 0 && len(rows) == cache.rows {
+		if _, ok := cache.contiguousSegment(); ok {
+			scan := vecFlatScan{cache: cache, l2Query: query}
+			return scan.topK(ctx, rows, len(query), k)
+		}
+	}
+	return vecSearchTopK(ctx, rows, len(query), k, cache, buildVecDistanceFunc(metric, query, queryNorm), vecDistanceFuncNeedsNorm(metric))
+}
+
 func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) ([]vecScoredRow, error) {
+	scan := vecFlatScan{cache: cache, distance: distFn, needNorm: needNorm}
+	return scan.topK(ctx, rows, queryLen, k)
+}
+
+func (scan *vecFlatScan) scanRange(ctx context.Context, rows [][]any, start, end, queryLen, k int) (vecScoredHeap, error) {
+	if scan.l2Query != nil {
+		return scanVecL2Range(ctx, &scan.cache.segments[0], scan.l2Query, start, end, k)
+	}
+	return vecSearchTopKRange(ctx, rows, start, end, queryLen, k, scan.cache, scan.distance, scan.needNorm)
+}
+
+func (scan vecFlatScan) topK(ctx context.Context, rows [][]any, queryLen, k int) ([]vecScoredRow, error) {
 	workers := vecSearchWorkerCount(len(rows), queryLen)
 	if workers == 1 {
-		h, err := vecSearchTopKRange(ctx, rows, 0, len(rows), queryLen, k, cache, distFn, needNorm)
+		h, err := scan.scanRange(ctx, rows, 0, len(rows), queryLen, k)
 		if err != nil {
 			return nil, err
 		}
 		return topKFromHeap(&h, k), nil
 	}
+	return scan.topKParallel(ctx, rows, queryLen, k, workers)
+}
 
+func (scan vecFlatScan) topKParallel(ctx context.Context, rows [][]any, queryLen, k, workers int) ([]vecScoredRow, error) {
 	results := make([]vecSearchWorkerResult, workers)
 	var wg sync.WaitGroup
 	chunk := (len(rows) + workers - 1) / workers
@@ -1008,7 +1040,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 					results[worker].err = fmt.Errorf("VEC_SEARCH: worker panic: %v", r)
 				}
 			}()
-			h, err := vecSearchTopKRange(ctx, rows, start, end, queryLen, k, cache, distFn, needNorm)
+			h, err := scan.scanRange(ctx, rows, start, end, queryLen, k)
 			results[worker] = vecSearchWorkerResult{heapRows: h, err: err}
 		}
 		// Use the caller as one worker instead of parking it for the whole scan.

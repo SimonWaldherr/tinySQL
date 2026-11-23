@@ -39,8 +39,12 @@ func fillVecTopKBatch(ctx context.Context, start, end, dims, k int, cache *vecSe
 			break
 		}
 	}
-	for parent := len(*rows)/2 - 1; parent >= 0; parent-- {
-		vecScoredHeapDown(*rows, parent)
-	}
+	heapifyVecScoredRows(*rows)
 	return next, nil
+}
+
+func heapifyVecScoredRows(rows vecScoredHeap) {
+	for parent := len(rows)/2 - 1; parent >= 0; parent-- {
+		vecScoredHeapDown(rows, parent)
+	}
 }

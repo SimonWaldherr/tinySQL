@@ -162,6 +162,9 @@ func resolveTableFunc(env ExecEnv, s *Select) ([]Row, error) {
 	if err := tf.ValidateArgs(s.From.TableFunc.Args); err != nil {
 		return nil, fmt.Errorf("%s: %v", fnName, err)
 	}
+	if canProjectVecSearch(env, s, tf) {
+		return resolveProjectedVecSearch(env, s, tf)
+	}
 	// Execute table function (no correlated row for top-level FROM)
 	rs, err := tf.Execute(env.ctx, s.From.TableFunc.Args, env, nil)
 	if err != nil {
