@@ -239,6 +239,9 @@ type vecColumnSegment struct {
 	vectors [][]float64
 	norms   []float64
 	valid   []bool
+	// garbage is how many floats of data no row of vectors points to any more
+	// (rows a followed removal dropped); see followVecColumnCache.
+	garbage int
 }
 
 type vecSearchColumnCacheEntry struct {
@@ -526,20 +529,75 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 		// Capture the stale entry while holding the cache lock.  It remains
 		// immutable after we release the lock, so an append extension can share
 		// its segments safely without doing a speculative full rebuild first.
-		cached, canExtend := vecSearchColumnCache[key]
-		canExtend = canExtend && canExtendVecColumnCache(cached, table)
-		updatedRows, canRefresh := table.UpdatedRowsSince(cached.structVersion)
+		cached, exists := vecSearchColumnCache[key]
+		usable := exists && cached.table == table && cached.rows <= len(table.Rows)
+		var updatedRows []int
+		canRefresh := false
+		if usable {
+			// Only an UPDATE of this vector column changes the cache. A row
+			// reported for other columns (a bookkeeping timestamp) is not
+			// returned, so it costs nothing here.
+			updatedRows, canRefresh = table.UpdatedRowsSinceCols(cached.structVersion, storage.ColumnBit(colIdx))
+		}
+		canExtend := canRefresh && len(updatedRows) == 0 && cached.version <= table.Version
+		// A window that removed rows (the log reports them in order) can be
+		// followed too: the surviving rows keep their packed data.
+		// Composing the log is asked below, after the lock is released: it can
+		// take a while for a long window and must not hold up other tables.
+		mayFollow := exists && cached.table == table && !canRefresh
 		call := &vecColumnBuildCall{done: make(chan struct{})}
 		vecSearchColumnBuilds[key] = call
 		vecSearchColumnCacheMu.Unlock()
 
+		// A panic in a build below must not leave the call registered: every
+		// later search of this column would wait for it forever.
+		published := false
+		defer func() {
+			if !published {
+				vecSearchColumnCacheMu.Lock()
+				delete(vecSearchColumnBuilds, key)
+				close(call.done)
+				vecSearchColumnCacheMu.Unlock()
+			}
+		}()
+		var removal storage.TableChanges
+		canFollow := false
+		if mayFollow {
+			var vouched bool
+			removal, vouched = table.ChangesSince(cached.structVersion, cached.rows, storage.ColumnBit(colIdx))
+			switch {
+			case !vouched:
+			case len(removal.Dead) > 0:
+				canFollow = true
+			default:
+				// The window removed rows, but only ones the entry never covered
+				// (appended since and deleted again, a failed load cleaned up, say):
+				// every covered row is where it was, so this is the append-and-update
+				// case after all.
+				usable, canRefresh = true, true
+				updatedRows = removal.Updated
+				canExtend = len(updatedRows) == 0 && cached.version <= table.Version
+			}
+		}
+
 		var entry vecSearchColumnCacheEntry
 		if canExtend {
-			// A stale entry can be safely extended only when structural changes
-			// did not occur and the table grew by appending rows.
+			// A stale entry can be safely extended when no structural change
+			// touched this column (the table grew by appending rows, or other
+			// columns were updated): its stamps move forward and only the
+			// appended tail is read.
 			entry = extendVecColumnCache(cached, table, colIdx, includeNorms)
-		} else if canRefresh && cached.table == table && cached.rows <= len(table.Rows) {
+			if cached.rows == len(table.Rows) && cached.shape != nil {
+				// Same rows, same vectors: the lazily computed shape still holds.
+				entry.shape = cached.shape
+			}
+		} else if canRefresh && usable {
 			entry = refreshVecColumnCache(cached, table, colIdx, includeNorms, updatedRows)
+		} else if canFollow {
+			var followed bool
+			if entry, followed = followVecColumnCache(cached, table, colIdx, includeNorms, removal); !followed {
+				entry = buildVecColumnCache(table, colIdx, includeNorms || cached.normsReady)
+			}
 		} else {
 			entry = buildVecColumnCache(table, colIdx, includeNorms)
 		}
@@ -551,6 +609,7 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 		publishVecSearchColumnCacheSnapshotLocked()
 		delete(vecSearchColumnBuilds, key)
 		close(call.done)
+		published = true
 		vecSearchColumnCacheMu.Unlock()
 		return entry
 	}
@@ -600,14 +659,20 @@ func refreshVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Tabl
 }
 
 func vecColumnOverridesNeedCompaction(entry vecSearchColumnCacheEntry) bool {
-	limit := entry.rows / 8
+	return len(entry.overrides) > vecColumnOverrideLimit(entry.rows)
+}
+
+// vecColumnOverrideLimit is how many overridden rows a cache of rows rows keeps
+// before a rebuild is the better deal.
+func vecColumnOverrideLimit(rows int) int {
+	limit := rows / 8
 	if limit < 32 {
 		limit = 32
 	}
 	if limit > 1024 {
 		limit = 1024
 	}
-	return len(entry.overrides) > limit
+	return limit
 }
 
 // buildVecColumnCache extracts one table column into a cache entry backed by
@@ -638,7 +703,113 @@ func buildVecColumnCache(table *storage.Table, colIdx int, includeNorms bool) ve
 	}
 }
 
+// buildVecColumnSegment packs one column of rows into a segment. A cold build of
+// a large corpus (a million 768-dimensional embeddings is 6 GB to pack and, for
+// cosine, to take the norm of) is spread over the available cores; the result is
+// byte-for-byte the serial build's, see buildVecColumnSegmentParallel.
 func buildVecColumnSegment(rows [][]any, colIdx int, includeNorms bool, start int) vecColumnSegment {
+	if workers := vecBuildWorkerCount(len(rows)); workers > 1 {
+		return buildVecColumnSegmentParallel(rows, colIdx, includeNorms, start, workers)
+	}
+	return buildVecColumnSegmentSerial(rows, colIdx, includeNorms, start)
+}
+
+const (
+	// vecBuildParallelMinRows is where spreading the build over several cores
+	// starts to pay for starting them; below it (an INSERT's tail segment, a small
+	// table) the serial build is used.
+	vecBuildParallelMinRows = 2048
+	// vecBuildChunkRows is the unit of work handed to a worker, small enough to
+	// balance ragged data and large enough to keep scheduling negligible.
+	vecBuildChunkRows = 1024
+)
+
+func vecBuildWorkerCount(rows int) int {
+	if rows < vecBuildParallelMinRows {
+		return 1
+	}
+	return min(runtime.GOMAXPROCS(0), rows/vecBuildChunkRows)
+}
+
+// buildVecColumnSegmentParallel is the same two-pass build as the serial one with
+// both passes spread over workers goroutines on disjoint row ranges: pass one
+// classifies the rows of each chunk and counts its floats, a prefix sum over the
+// chunk totals gives every chunk its offset in the packed array, pass two copies
+// and takes norms. Chunks are contiguous and processed in row order inside, so
+// the packed layout (and every norm) is exactly the serial build's.
+func buildVecColumnSegmentParallel(rows [][]any, colIdx int, includeNorms bool, start, workers int) vecColumnSegment {
+	n := len(rows)
+	valid := make([]bool, n)
+	vectors := make([][]float64, n)
+	chunks := (n + vecBuildChunkRows - 1) / vecBuildChunkRows
+	totals := make([]int, chunks+1) // totals[c+1] is chunk c's float count, then its prefix sum
+
+	runChunks := func(work func(c, from, to int)) {
+		var next atomic.Int64
+		var wg sync.WaitGroup
+		for range min(workers, chunks) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					c := int(next.Add(1)) - 1
+					if c >= chunks {
+						return
+					}
+					work(c, c*vecBuildChunkRows, min((c+1)*vecBuildChunkRows, n))
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	runChunks(func(c, from, to int) {
+		total := 0
+		for i := from; i < to; i++ {
+			r := rows[i]
+			if colIdx >= len(r) || r[colIdx] == nil {
+				continue
+			}
+			vec, ok := vecRowValue(r[colIdx])
+			if !ok {
+				continue
+			}
+			valid[i] = true
+			vectors[i] = vec
+			total += len(vec)
+		}
+		totals[c+1] = total
+	})
+	for c := 1; c <= chunks; c++ {
+		totals[c] += totals[c-1]
+	}
+
+	data := make([]float64, totals[chunks])
+	var norms []float64
+	if includeNorms {
+		norms = make([]float64, n)
+	}
+	runChunks(func(c, from, to int) {
+		cursor := totals[c]
+		for i := from; i < to; i++ {
+			if !valid[i] {
+				continue
+			}
+			vec := vectors[i]
+			dst := data[cursor : cursor+len(vec) : cursor+len(vec)]
+			copy(dst, vec)
+			vectors[i] = dst
+			if includeNorms {
+				norms[i] = vectorL2Norm(dst)
+			}
+			cursor += len(vec)
+		}
+	})
+	return vecColumnSegment{start: start, data: data, vectors: vectors, norms: norms, valid: valid}
+}
+
+// buildVecColumnSegmentSerial is the reference build, used for small inputs.
+func buildVecColumnSegmentSerial(rows [][]any, colIdx int, includeNorms bool, start int) vecColumnSegment {
 	n := len(rows)
 	valid := make([]bool, n)
 	// Use the final slice-header array as first-pass scratch, then replace each
@@ -680,13 +851,6 @@ func buildVecColumnSegment(rows [][]any, colIdx int, includeNorms bool, start in
 		cursor += len(vec)
 	}
 	return vecColumnSegment{start: start, data: data, vectors: vectors, norms: norms, valid: valid}
-}
-
-func canExtendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table) bool {
-	return cached.table == table &&
-		cached.structVersion == table.StructVersion() &&
-		cached.rows <= len(table.Rows) &&
-		cached.version <= table.Version
 }
 
 // extendVecColumnCache returns a new immutable cache view that shares old
@@ -764,7 +928,9 @@ func mergeTwoVecColumnSegments(left, right vecColumnSegment, normsReady bool) ve
 	rows := len(left.vectors) + len(right.vectors)
 	valid := make([]bool, rows)
 	vectors := make([][]float64, rows)
-	total := len(left.data) + len(right.data)
+	// Only the live floats are copied: a segment a removal was followed on holds
+	// the packed data of rows that are gone (see followVecColumnCache).
+	total := len(left.data) - left.garbage + len(right.data) - right.garbage
 	data := make([]float64, total)
 	var norms []float64
 	if normsReady {

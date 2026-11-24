@@ -66,6 +66,9 @@ func TestFTSPostingMetadataMaintenanceAndUpgrade(t *testing.T) {
 			old.Format = 1
 		} else {
 			old.PostingCounts["alpha"] = nil
+			// Damage reaches the executor through a decoded or cloned index, which
+			// is not trusted until its full check has passed.
+			old.SetVerified(false)
 		}
 		deleteFTSDocCacheEntry(ftsDocCacheKey{tenant: tenant, table: table.Name, cols: "0"})
 		check()

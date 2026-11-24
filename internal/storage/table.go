@@ -89,6 +89,16 @@ type Table struct {
 	// because physical row positions can no longer be translated safely.
 	rowUpdateLog  rowUpdateHistory
 	rowUpdateBase int
+	// rowUpdateFolds summarises the oldest deltas of a long log whose per-row
+	// detail was dropped to bound memory: each fold names the highest structVersion
+	// it covers and the union of the columns changed up to there. The versions
+	// between rowUpdateBase and the first retained delta are exactly the folds'
+	// ranges. A reader whose stamp lies inside a fold can still be told that no
+	// column it depends on changed (UpdatedRowsSinceCols) but never which rows.
+	// A removal is not summarised: it stays in the list as a fold of its own that
+	// carries its positions (see rowUpdateFold), so the DELETEs of a long window
+	// are still composed by ChangesSince however many UPDATEs followed them.
+	rowUpdateFolds []rowUpdateFold
 	// derived is a slot for executor-owned state that is a pure function of
 	// this table's contents and can always be rebuilt from them: today, the
 	// constraint-value index that turns PRIMARY KEY and UNIQUE enforcement
@@ -127,9 +137,50 @@ type Table struct {
 	twinOrigin *rowTwinOrigin
 }
 
+// rowUpdateDelta is one event of the table's ordered change log: either an
+// UPDATE of one row (removed == nil) or a DELETE that removed several rows at
+// once (removed != nil). Both advance structVersion by exactly one.
 type rowUpdateDelta struct {
 	structVersion int
-	row           int
+	// row is the position of the updated row in the table as it was at that
+	// moment. It is unused (-1) for a removal.
+	row int
+	// cols is the set of columns the UPDATE changed (see ColumnMask). Zero means
+	// "unknown", which every consumer must treat as "every column".
+	cols uint64
+	// removed is non-nil for a DELETE that reported the rows it removed.
+	removed *rowRemoval
+}
+
+// rowRemoval lists the positions a DELETE removed, in the coordinates of the
+// table immediately before that statement, strictly ascending. It is immutable
+// once logged, so clones of the log share it.
+type rowRemoval struct {
+	positions []int32
+}
+
+// Bounds on the removal events of the change log. A log holding more removed
+// positions than this sheds the OLDEST removals (see shedRemovedPositions): a
+// consumer stamped before them rebuilds, one that is newer keeps following. The
+// other bound (the number of events) is maxRowUpdateDeltas, shared with UPDATE
+// events.
+const (
+	maxRowRemovedPositions = 1 << 20
+	// maxChangeComposeMoves bounds the work ChangesSince may spend merging removal
+	// events (element moves); a log that would cost more reports ok=false, which
+	// makes the consumer rebuild, exactly as an overflowing log does.
+	maxChangeComposeMoves = 1 << 28
+)
+
+// rowUpdateFold is either a summary of consecutive dropped deltas (removed ==
+// nil): every structVersion up to upTo (and after the previous fold, or
+// rowUpdateBase) was an UPDATE, and cols is the union of the columns they
+// changed (all bits when one was unknown); or one retained removal (removed !=
+// nil), which covers exactly the structVersion upTo and keeps its positions.
+type rowUpdateFold struct {
+	upTo    int
+	cols    uint64
+	removed *rowRemoval
 }
 
 // rowUpdateChunk is the number of deltas per sealed block of a rowUpdateHistory.
@@ -141,6 +192,10 @@ const rowUpdateChunk = 64
 type rowUpdateHistory struct {
 	sealed [][]rowUpdateDelta // full blocks of rowUpdateChunk deltas, immutable
 	open   []rowUpdateDelta   // the block being filled, owned by this history
+	// removedTotal is the number of positions held by the removal events of the
+	// log and of the folds that carry removals (kept by add; foldRowUpdateLog and
+	// shedRemovedPositions subtract what they forget).
+	removedTotal int
 }
 
 func (h *rowUpdateHistory) len() int { return len(h.sealed)*rowUpdateChunk + len(h.open) }
@@ -153,6 +208,9 @@ func (h *rowUpdateHistory) at(i int) rowUpdateDelta {
 }
 
 func (h *rowUpdateHistory) add(delta rowUpdateDelta) {
+	if delta.removed != nil {
+		h.removedTotal += len(delta.removed.positions)
+	}
 	if len(h.open) == rowUpdateChunk {
 		h.sealed = append(h.sealed, h.open[:rowUpdateChunk:rowUpdateChunk])
 		h.open = nil
@@ -175,12 +233,19 @@ func (h *rowUpdateHistory) add(delta rowUpdateDelta) {
 
 func (h *rowUpdateHistory) reset() { *h = rowUpdateHistory{} }
 
+// dropBlocks forgets the oldest n sealed blocks. The remaining blocks are
+// untouched, so clones that still share the dropped ones keep them.
+func (h *rowUpdateHistory) dropBlocks(n int) {
+	h.sealed = h.sealed[n:len(h.sealed):len(h.sealed)]
+}
+
 // clone shares immutable prefixes. Appends only write beyond those prefixes;
 // clipped capacities ensure a borrower cannot overwrite a lender's next slot.
 func (h *rowUpdateHistory) clone() rowUpdateHistory {
 	return rowUpdateHistory{
-		sealed: h.sealed[:len(h.sealed):len(h.sealed)],
-		open:   h.open[:len(h.open):len(h.open)],
+		sealed:       h.sealed[:len(h.sealed):len(h.sealed)],
+		open:         h.open[:len(h.open):len(h.open)],
+		removedTotal: h.removedTotal,
 	}
 }
 
@@ -234,7 +299,45 @@ type FTSIndex struct {
 	// unbounded trail of obsolete document terms/tokens.
 	StaleTerms  int
 	StaleTokens int
+
+	// verified and termNames are engine-owned caches, never persisted (gob and
+	// JSON skip unexported fields). A decoded index starts unverified; Clone carries
+	// both over, because a deep copy of a validated structure is valid. They are
+	// read and written under the owning table's DerivedLock, like the rest of the
+	// index.
+	verified  bool
+	termNames []string
 }
+
+// Verified reports whether the engine has validated the whole structure
+// (posting/count/block alignment, arena ranges, term ids) since the last time
+// it could have been damaged: false for an index that was decoded, cloned or
+// touched by a mutation that did not finish.
+func (i *FTSIndex) Verified() bool { return i.verified }
+
+// SetVerified records the result of a full validation, or false when the
+// structure may no longer be consistent.
+func (i *FTSIndex) SetVerified(v bool) { i.verified = v }
+
+// TermNames returns the dense inverse of TermIDs: TermNames()[id] is the term
+// with that id. It is built on first use and kept by SetTermNames afterwards; a
+// cached slice whose length no longer matches TermIDs is rebuilt.
+func (i *FTSIndex) TermNames() []string {
+	if len(i.termNames) != len(i.TermIDs) {
+		names := make([]string, len(i.TermIDs))
+		for term, id := range i.TermIDs {
+			if id >= 0 && int(id) < len(names) {
+				names[id] = term
+			}
+		}
+		i.termNames = names
+	}
+	return i.termNames
+}
+
+// SetTermNames stores the dense inverse of TermIDs after terms were appended;
+// names must have exactly one entry per term id.
+func (i *FTSIndex) SetTermNames(names []string) { i.termNames = names }
 
 // VectorIndex is the backend-neutral persisted representation of an ANN
 // index.  The current format stores HNSW topology; the Kind field makes the
@@ -257,6 +360,10 @@ type VectorIndex struct {
 	MaxLevel      int
 	Levels        []int
 	Neighbors     [][][]int
+	// Removed is how many graph nodes followed removals dropped since the graph
+	// was last built from scratch (0 for a fresh build and for graphs stored by
+	// older versions); it bounds how far the graph may drift from a fresh build.
+	Removed int
 }
 
 // DerivedCloner is implemented by derived state (see the field above) that
@@ -309,6 +416,14 @@ func (t *Table) Derived() any { return t.derived }
 // SetDerived stores executor state on this table; nil discards it. The caller
 // must hold DerivedLock.
 func (t *Table) SetDerived(v any) { t.derived = v }
+
+// HasDerivedState reports whether the derived-state slot holds anything, without
+// taking DerivedLock. Only a caller that holds the database's content lock for
+// WRITE may use it: every writer of the slot (the constraint indexes a search or
+// an INSERT builds) holds at least the read side, so none can run, and the
+// answer is exact. A statement that finds the slot empty then skips the lock,
+// which a Sync holds for the whole of its search-image copy.
+func (t *Table) HasDerivedState() bool { return t.derived != nil }
 
 // MarkFTSIndexesChanged records a persist-relevant FTS metadata change. The
 // caller must hold DerivedLock, matching direct access to FTSIndexes.
@@ -389,6 +504,17 @@ func (t *Table) dropDerived() {
 	t.derivedMu.Lock()
 	t.derived = nil
 	t.derivedMu.Unlock()
+}
+
+// dropDerivedExclusive is dropDerived for a caller that holds the database's
+// content lock for write (a statement restoring its rollback state): it skips the
+// derived-state lock when the slot is empty, which a Sync holds for the whole of
+// its search-image copy. See HasDerivedState.
+func (t *Table) dropDerivedExclusive() {
+	if t == nil || t.derived == nil {
+		return
+	}
+	t.dropDerived()
 }
 
 // dirtyRowsState distinguishes "no in-place updates recorded yet" from "the
@@ -608,6 +734,19 @@ func (t *Table) MarkDirtyFrom(idx int) {
 	t.dirtyFrom = idx
 }
 
+// MarkDirtyKeepingRows records that the table must be persisted and logged as a
+// whole (a full-table WAL record, no row delta) although no row's content,
+// position or count changed: an index or other table-level definition was
+// created or dropped. It is MarkDirtyFrom(-1) without the structural
+// invalidation, because structVersion is the signal that existing rows changed
+// and the derived full-text and vector structures key on it; advancing it for a
+// change that left every row alone would make them rebuild for nothing.
+func (t *Table) MarkDirtyKeepingRows() {
+	t.dirtyRows = nil
+	t.dirtyRowsState = dirtyRowsUnknown
+	t.dirtyFrom = -1
+}
+
 // MarkRowUpdated records that row idx was replaced in place, so the WAL can log
 // that row instead of the entire table. UPDATE is the only shape this fits: it
 // changes row contents without changing how many rows there are or where they
@@ -623,8 +762,20 @@ func (t *Table) MarkDirtyFrom(idx int) {
 // with a WAL still accumulates between checkpoints. Every rollback snapshot
 // carries this list, so an unbounded one makes repeated UPDATEs quadratic.
 func (t *Table) MarkRowUpdated(idx int) {
+	t.MarkRowUpdatedCols(idx, 0)
+}
+
+// MarkRowUpdatedCols is MarkRowUpdated for a caller that knows exactly which
+// columns of row idx the UPDATE changed. cols is a ColumnMask; zero means the
+// set is unknown and is treated as every column, so passing the mask of an
+// empty change list is always safe. A derived structure over a column that is
+// not in cols may keep serving its data (see UpdatedRowsSinceCols), which is
+// only correct when cols names EVERY column whose cell differs afterwards:
+// callers whose statement can alter other cells (trigger bodies, cascades,
+// generated columns) must pass zero or invalidate instead.
+func (t *Table) MarkRowUpdatedCols(idx int, cols uint64) {
 	t.dirtyFrom = -1
-	t.noteRowUpdated(idx)
+	t.noteRowUpdatedCols(idx, cols)
 	if t.dirtyRowsState == dirtyRowsUnknown || idx < 0 {
 		return
 	}
@@ -666,20 +817,255 @@ func (t *Table) noteStructuralChange() {
 
 func (t *Table) noteStructuralInvalidation() {
 	t.structVersion++
+	t.resetRowLog()
+}
+
+// resetRowLog forgets the whole change log: a consumer stamped with any version
+// before the current one can no longer be told what happened and rebuilds.
+func (t *Table) resetRowLog() {
 	t.rowUpdateLog.reset()
+	t.rowUpdateFolds = nil
 	t.rowUpdateBase = t.structVersion
 }
 
-func (t *Table) noteRowUpdated(row int) {
+// maxRowUpdateDeltas bounds the retained per-row UPDATE history. It is sized so
+// one touch batch of a few thousand rows (and several of them in a row) still
+// fits: a derived structure that skips columns it does not index
+// (UpdatedRowsSinceCols) needs the whole chain back to its own stamp to prove
+// that nothing relevant happened. 65536 deltas are 1.5 MB per table at most.
+// When the log is full its older half is folded into a column summary
+// (rowUpdateFold) instead of being forgotten, so even a bookkeeping UPDATE of
+// every row of a million-row table, or many of them between two searches, still
+// proves that no indexed column changed. At most maxRowUpdateFolds summaries are
+// kept (a few million updates in all); a stamp older than that rebuilds. A
+// removal is never summarised: it is kept as a fold of its own (at most
+// maxRowUpdateFoldEntries folds in all, and the position bound above), so a
+// consumer that missed a DELETE and then a long run of bookkeeping UPDATEs still
+// follows the DELETE.
+const maxRowUpdateDeltas = 65536
+
+const (
+	rowUpdateFoldBlocks     = maxRowUpdateDeltas / rowUpdateChunk / 2
+	maxRowUpdateFolds       = 64
+	maxRowUpdateFoldEntries = 4096
+)
+
+// maxLegacyUpdateSpan is how many structural versions UpdatedRowsSince may span.
+// The log once held 4096 deltas at most, so a caller older than that always got
+// ok=false; its consumers (subscriptions) keep exactly that contract now that
+// the log is longer.
+const maxLegacyUpdateSpan = 4096
+
+func (t *Table) noteRowUpdated(row int) { t.noteRowUpdatedCols(row, 0) }
+
+func (t *Table) noteRowUpdatedCols(row int, cols uint64) {
+	t.logRowEvent(rowUpdateDelta{row: row, cols: cols})
+}
+
+// logRowEvent advances structVersion by one and appends delta to the change log
+// under that version.
+func (t *Table) logRowEvent(delta rowUpdateDelta) {
 	t.structVersion++
+	delta.structVersion = t.structVersion
 	// Keep the history bounded even for a long-lived in-memory database. A
 	// cache older than the retained tail simply performs one safe rebuild.
-	const maxRowUpdateDeltas = 4096
 	if t.rowUpdateLog.len() >= maxRowUpdateDeltas {
-		t.rowUpdateLog.reset()
-		t.rowUpdateBase = t.structVersion - 1
+		t.foldRowUpdateLog()
 	}
-	t.rowUpdateLog.add(rowUpdateDelta{structVersion: t.structVersion, row: row})
+	t.rowUpdateLog.add(delta)
+}
+
+// MarkRowsRemoved records that a DELETE removed exactly the rows at positions,
+// listed strictly ascending in the coordinates of the table as it was before the
+// statement (the survivors then closed up, keeping their order). It is the
+// reporting alternative to MarkDirtyFrom(-1): the table is marked for a full
+// WAL record all the same, but the change log keeps the statement as one event,
+// so a consumer that indexed the table earlier can ask ChangesSince which of its
+// rows are gone and renumber the rest instead of rebuilding.
+//
+// Call it after the rows have been removed from t.Rows. The caller must name
+// EVERY removed row; a path that cannot (DELETE without WHERE, swap-and-pop, a
+// cascade, a trigger-observed delete, anything that reorders) calls
+// MarkDirtyFrom(-1) instead, which drops the log. A call with no positions
+// records nothing, because nothing was removed. A list that does not describe a
+// plausible removal (unsorted, negative, beyond the former length) is treated as
+// an unreportable change.
+func (t *Table) MarkRowsRemoved(positions []int) {
+	t.MarkDirtyKeepingRows()
+	if len(positions) == 0 {
+		return
+	}
+	last := -1
+	for _, p := range positions {
+		if p <= last || p > 1<<31-2 {
+			t.noteStructuralInvalidation()
+			return
+		}
+		last = p
+	}
+	if last >= len(t.Rows)+len(positions) || len(positions) > maxRowRemovedPositions || !t.shedRemovedPositions(len(positions)) {
+		t.noteStructuralInvalidation()
+		return
+	}
+	removal := &rowRemoval{positions: make([]int32, len(positions))}
+	for i, p := range positions {
+		removal.positions[i] = int32(p)
+	}
+	t.logRowEvent(rowUpdateDelta{row: -1, removed: removal})
+}
+
+// foldRowUpdateLog replaces the oldest half of the log by folds. Called with a
+// full log, before the next delta is added. A run of consecutive UPDATEs becomes
+// one column summary; a removal cannot be summarised and becomes a fold of its
+// own that keeps its positions (the removal itself is shared, not copied). So a
+// stamp older than a removal is still served after any number of UPDATEs, as
+// long as none of the summaries between touches a column the reader depends on.
+// The oldest folds are dropped (rowUpdateBase moves up, older stamps rebuild)
+// when there are more than maxRowUpdateFolds summaries, more than
+// maxRowUpdateFoldEntries folds, or the positions bound is exceeded.
+func (t *Table) foldRowUpdateLog() {
+	log := &t.rowUpdateLog
+	n := min(rowUpdateFoldBlocks, len(log.sealed))
+	if n == 0 {
+		return
+	}
+	dropped := n * rowUpdateChunk
+	first := log.at(0)
+	var made []rowUpdateFold
+	var run rowUpdateFold
+	inRun := false
+	for i := 0; i < dropped; i++ {
+		delta := log.at(i)
+		if delta.removed != nil {
+			if inRun {
+				made = append(made, run)
+				inRun = false
+			}
+			made = append(made, rowUpdateFold{upTo: delta.structVersion, removed: delta.removed})
+			continue
+		}
+		if !inRun {
+			run, inRun = rowUpdateFold{}, true
+		}
+		if delta.cols == 0 {
+			run.cols = ^uint64(0)
+		} else {
+			run.cols |= delta.cols
+		}
+		run.upTo = delta.structVersion
+	}
+	if inRun {
+		made = append(made, run)
+	}
+	old := t.rowUpdateFolds
+	switch last := len(old) - 1; {
+	case last < 0:
+		// The oldest stamp that can be served is the version just before the
+		// first retained delta (rowUpdateBase itself for a log that grew from a
+		// reset; later for a table loaded with a non-zero structVersion).
+		t.rowUpdateBase = first.structVersion - 1
+	case old[last].upTo != first.structVersion-1:
+		// Not contiguous with the previous fold: forget it and everything
+		// before it rather than bridge a gap.
+		log.removedTotal -= foldRemovedPositions(old)
+		old = nil
+		t.rowUpdateBase = first.structVersion - 1
+	}
+	folds := make([]rowUpdateFold, 0, len(old)+len(made))
+	folds = append(append(folds, old...), made...)
+	summaries := 0
+	for _, fold := range folds {
+		if fold.removed == nil {
+			summaries++
+		}
+	}
+	drop := 0
+	for drop < len(folds) && (len(folds)-drop > maxRowUpdateFoldEntries || summaries > maxRowUpdateFolds) {
+		if folds[drop].removed == nil {
+			summaries--
+		} else {
+			log.removedTotal -= len(folds[drop].removed.positions)
+		}
+		t.rowUpdateBase = folds[drop].upTo
+		drop++
+	}
+	t.rowUpdateFolds = folds[drop:len(folds):len(folds)]
+	log.dropBlocks(n)
+}
+
+// foldRemovedPositions counts the removed positions the removal folds hold.
+func foldRemovedPositions(folds []rowUpdateFold) (n int) {
+	for _, fold := range folds {
+		if fold.removed != nil {
+			n += len(fold.removed.positions)
+		}
+	}
+	return n
+}
+
+// shedRemovedPositions makes room for a removal of need positions under
+// maxRowRemovedPositions by forgetting the oldest history: the folds first, then
+// the sealed blocks of the log, oldest first, each time moving rowUpdateBase up
+// to the last forgotten version. A consumer stamped before that rebuilds; every
+// other one keeps following. It reports false when forgetting everything that can
+// be forgotten does not make room (the caller then invalidates the log).
+func (t *Table) shedRemovedPositions(need int) bool {
+	log := &t.rowUpdateLog
+	for log.removedTotal+need > maxRowRemovedPositions && len(t.rowUpdateFolds) > 0 {
+		fold := t.rowUpdateFolds[0]
+		if fold.removed != nil {
+			log.removedTotal -= len(fold.removed.positions)
+		}
+		t.rowUpdateBase = fold.upTo
+		t.rowUpdateFolds = t.rowUpdateFolds[1:len(t.rowUpdateFolds):len(t.rowUpdateFolds)]
+	}
+	for log.removedTotal+need > maxRowRemovedPositions && len(log.sealed) > 0 {
+		block := log.sealed[0]
+		for _, delta := range block {
+			if delta.removed != nil {
+				log.removedTotal -= len(delta.removed.positions)
+			}
+		}
+		t.rowUpdateBase = block[len(block)-1].structVersion
+		t.rowUpdateFolds = nil // empty already: folds precede the log
+		log.dropBlocks(1)
+	}
+	return log.removedTotal+need <= maxRowRemovedPositions
+}
+
+// rowUpdateRowsFrom is the oldest structVersion for which the log still names
+// the changed rows; older stamps (down to rowUpdateBase) are covered by folds
+// only.
+func (t *Table) rowUpdateRowsFrom() int {
+	if n := len(t.rowUpdateFolds); n > 0 {
+		return t.rowUpdateFolds[n-1].upTo
+	}
+	return t.rowUpdateBase
+}
+
+// ColumnBit returns the ColumnMask bit of column idx. Columns 0..62 own one bit
+// each; every column from 63 on shares bit 63, so a wide table stays safe (two
+// such columns look like one, which only ever widens a set). A negative index
+// is not a column and yields every bit.
+func ColumnBit(idx int) uint64 {
+	switch {
+	case idx < 0:
+		return ^uint64(0)
+	case idx >= 63:
+		return 1 << 63
+	default:
+		return 1 << uint(idx)
+	}
+}
+
+// ColumnMask returns the union of ColumnBit over idxs. An empty list yields 0,
+// which MarkRowUpdatedCols reads as "unknown column set".
+func ColumnMask(idxs ...int) uint64 {
+	var mask uint64
+	for _, idx := range idxs {
+		mask |= ColumnBit(idx)
+	}
+	return mask
 }
 
 // StructVersion returns the current structural-change counter. See
@@ -691,27 +1077,69 @@ func (t *Table) StructVersion() int { return t.structVersion }
 // UpdatedRowsSince returns the rows changed exclusively by UPDATEs since a
 // prior structural version. ok is false when a DELETE, reorder, schema change,
 // or an evicted delta history occurred, in which case index users must rebuild.
+// It reports every changed row whatever column changed, and refuses a span of
+// more than maxLegacyUpdateSpan versions.
 func (t *Table) UpdatedRowsSince(version int) (rows []int, ok bool) {
 	if version == t.structVersion {
 		return nil, true
 	}
-	log := &t.rowUpdateLog
-	total := log.len()
-	if version < t.rowUpdateBase || total == 0 {
+	if t.structVersion-version > maxLegacyUpdateSpan {
 		return nil, false
 	}
+	return t.updatedRowsSince(version, 0)
+}
+
+// UpdatedRowsSinceCols is UpdatedRowsSince for a structure that only depends on
+// the columns in interest (a ColumnMask; zero means every column): rows whose
+// recorded change set does not intersect interest are left out. A delta without
+// a column set always counts. ok has the same meaning as for UpdatedRowsSince
+// and the version chain is validated over ALL deltas, relevant or not, so a
+// gap, an evicted history, a DELETE or a schema change still yields ok=false.
+// ok with no rows means the structure is still exact and only needs its
+// version stamps moved forward.
+func (t *Table) UpdatedRowsSinceCols(version int, interest uint64) (rows []int, ok bool) {
+	if version == t.structVersion {
+		return nil, true
+	}
+	return t.updatedRowsSince(version, interest)
+}
+
+func (t *Table) updatedRowsSince(version int, interest uint64) (rows []int, ok bool) {
+	if version < t.rowUpdateBase {
+		return nil, false
+	}
+	// Deltas dropped into a fold can only vouch that nothing relevant changed,
+	// and a removal shifts positions, which this reader cannot follow.
+	if len(t.rowUpdateFolds) > 0 {
+		for _, fold := range t.rowUpdateFolds {
+			if fold.upTo > version && (fold.removed != nil || interest == 0 || fold.cols&interest != 0) {
+				return nil, false
+			}
+		}
+		version = max(version, t.rowUpdateRowsFrom())
+	}
+	log := &t.rowUpdateLog
+	total := log.len()
 	want := version + 1
 	start := log.search(want)
-	seen := make(map[int]struct{}, total-start)
+	var seen map[int]struct{}
 	for i := start; i < total; i++ {
 		delta := log.at(i)
 		if delta.structVersion < want {
 			continue
 		}
-		if delta.structVersion != want {
+		if delta.structVersion != want || delta.removed != nil {
+			// A removal shifts positions, which this reader (row twins, the
+			// flat vector cache, HNSW, subscriptions) cannot follow.
 			return nil, false
 		}
 		want++
+		if interest != 0 && delta.cols != 0 && delta.cols&interest == 0 {
+			continue
+		}
+		if seen == nil {
+			seen = make(map[int]struct{})
+		}
 		if _, duplicate := seen[delta.row]; !duplicate {
 			seen[delta.row] = struct{}{}
 			rows = append(rows, delta.row)

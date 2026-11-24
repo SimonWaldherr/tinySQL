@@ -32,10 +32,16 @@ type cfg struct {
 	mode    storage.StorageMode
 	modeSet bool
 
-	maxMemoryBytes     int64
-	readOnly           bool
-	syncOnMutate       bool
-	compressFiles      bool
+	maxMemoryBytes int64
+	readOnly       bool
+	syncOnMutate   bool
+	compressFiles  bool
+	// skipSearchIndexPersistence keeps FTS/ANN index images out of table files
+	// (storage.StorageConfig.SkipSearchIndexPersistence).
+	skipSearchIndexPersistence bool
+	// rowBlockFiles writes table files in the row-block layout
+	// (storage.StorageConfig.RowBlockFiles).
+	rowBlockFiles      bool
 	checkpointEvery    uint64
 	checkpointInterval time.Duration
 	checkpointMaxBytes int64

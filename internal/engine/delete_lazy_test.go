@@ -41,8 +41,14 @@ func TestDeleteRawScanRetainsRowsAndIndex(t *testing.T) {
 				if got := result.Rows[0]["deleted"]; got != 6-len(tc.want) {
 					t.Fatalf("deleted = %v", got)
 				}
-				if table.Version != version+1 {
-					t.Fatalf("version = %d, want %d", table.Version, version+1)
+				// Only a statement that removed a row advances the version (like
+				// UPDATE): a DELETE that matched nothing changed nothing.
+				wantVersion := version
+				if len(tc.want) < 6 {
+					wantVersion++
+				}
+				if table.Version != wantVersion {
+					t.Fatalf("version = %d, want %d", table.Version, wantVersion)
 				}
 				for category := 0; category < 2; category++ {
 					rs := execSQL(t, db, fmt.Sprintf(`SELECT id FROM lazy_delete WHERE category = 'c%d' ORDER BY id`, category))

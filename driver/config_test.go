@@ -215,3 +215,42 @@ func splitPublicTestDSN(dsn string) (string, string) {
 	}
 	return dsn, ""
 }
+
+func TestOpenConfigDSNCarriesSkipSearchIndexPersistence(t *testing.T) {
+	cfg := RAGOpenConfig("./rag-artifact")
+	cfg.SkipSearchIndexPersistence = true
+	dsn, err := cfg.DSN()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rawQuery := splitPublicTestDSN(dsn)
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := query.Get("skip_search_index_persistence"); got != "1" {
+		t.Fatalf("skip_search_index_persistence = %q in %s", got, dsn)
+	}
+	cfg.SkipSearchIndexPersistence = false
+	dsn, _ = cfg.DSN()
+	if strings.Contains(dsn, "skip_search_index_persistence") {
+		t.Fatalf("default DSN must not mention the option: %s", dsn)
+	}
+}
+
+func TestOpenConfigDSNCarriesRowBlockFiles(t *testing.T) {
+	cfg := RAGOpenConfig("./rag-artifact")
+	cfg.RowBlockFiles = true
+	dsn, err := cfg.DSN()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rawQuery := splitPublicTestDSN(dsn)
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := query.Get("row_block_files"); got != "1" {
+		t.Fatalf("row_block_files = %q in %s", got, dsn)
+	}
+}

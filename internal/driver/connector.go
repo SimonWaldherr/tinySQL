@@ -141,6 +141,8 @@ func (c *connector) openServer() (*server, error) {
 		sc.ReadOnly = c.cfg.readOnly
 		sc.SyncOnMutate = c.cfg.syncOnMutate
 		sc.CompressFiles = c.cfg.compressFiles
+		sc.SkipSearchIndexPersistence = c.cfg.skipSearchIndexPersistence
+		sc.RowBlockFiles = c.cfg.rowBlockFiles
 		sc.CheckpointEvery = c.cfg.checkpointEvery
 		sc.CheckpointInterval = c.cfg.checkpointInterval
 		sc.CheckpointMaxBytes = c.cfg.checkpointMaxBytes

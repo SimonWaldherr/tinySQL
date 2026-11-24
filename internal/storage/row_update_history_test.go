@@ -79,9 +79,11 @@ func TestUpdatedRowsSinceHistoryBoundaries(t *testing.T) {
 			for i := range count {
 				table.noteRowUpdated(i % 7)
 			}
+			// The legacy reader spans at most maxLegacyUpdateSpan versions even
+			// though the log itself is longer.
 			oldest := 0
-			if count > 4096 {
-				oldest = 4096
+			if count > maxLegacyUpdateSpan {
+				oldest = count - maxLegacyUpdateSpan
 			}
 			for _, version := range []int{-1, 0, 1, 62, 63, 64, 65, 4095, 4096, count - 1, count, count + 1} {
 				wantOK := version >= oldest && version <= count
@@ -173,7 +175,9 @@ func TestRowTwinCatchUpAcrossHistoryBlocks(t *testing.T) {
 			branch.noteRowUpdated(newRow)
 			buffer := slices.Clone(before)
 			got, ok := branch.catchUpRows(buffer, version)
-			wantOK := count != 4095 // its next delta is evicted on rollover
+			// The log keeps 65536 deltas, so none of these counts evicts the
+			// twin's chain.
+			wantOK := true
 			if ok != wantOK || (ok && !reflect.DeepEqual(got, branch.Rows)) {
 				t.Fatalf("catch-up: ok=%v, want %v; got %v, want %v", ok, wantOK, got, branch.Rows)
 			}

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -27,7 +28,10 @@ type HybridBackend struct {
 	mode StorageMode // ModeHybrid or ModeIndex
 
 	// Track which tables have been modified in memory so Sync can flush them.
-	dirty     map[string]map[string]bool // tenant → lower(name) → dirty
+	dirty map[string]map[string]bool // tenant → lower(name) → dirty
+	// dirtySeq counts MarkDirty calls per table. A snapshot save clears the
+	// dirty flag only if the count is what it was when the snapshot was taken.
+	dirtySeq  map[string]map[string]uint64
 	dirtyLock sync.Mutex
 
 	loadCount atomic.Int64
@@ -75,19 +79,30 @@ func NewHybridBackend(dir string, maxMemoryBytes int64, compress bool, mode Stor
 	// lease. Save it first, going straight to disk (not through
 	// HybridBackend.SaveTable, which would call pool.Put and deadlock: this
 	// callback runs with bp.mu already held).
-	pool.SetEvictionSaver(func(tenant, name string, t *Table) {
+	//
+	// A snapshot write of the same table (DB.Sync) can be in flight for
+	// minutes. The pool holds its own lock for the whole eviction, so waiting
+	// for that write would stall every pool lookup, which is every query in
+	// these modes; the table is kept cached instead (the veto) and evicted by a
+	// later Put once the write is done.
+	pool.SetEvictionSaver(func(tenant, name string, t *Table) bool {
 		if disk.IsDirty(tenant, name, t.Version) {
-			if err := disk.SaveTable(tenant, t); err != nil {
+			if _, err := disk.saveTableOpt(tenant, t, false); err != nil {
+				if errors.Is(err, errTableFileBusy) {
+					return false
+				}
 				log.Printf("warning: flush-before-evict failed for %s/%s: %v", tenant, name, err)
 			}
 		}
+		return true
 	})
 
 	return &HybridBackend{
-		disk:  disk,
-		pool:  pool,
-		mode:  mode,
-		dirty: make(map[string]map[string]bool),
+		disk:     disk,
+		pool:     pool,
+		mode:     mode,
+		dirty:    make(map[string]map[string]bool),
+		dirtySeq: make(map[string]map[string]uint64),
 	}, nil
 }
 
@@ -140,8 +155,14 @@ func (h *HybridBackend) noteAdmissionReject(tenant, name string, size int64, cau
 
 // SaveTable writes to disk and updates the cache.
 func (h *HybridBackend) SaveTable(tenant string, t *Table) error {
-	if err := h.disk.SaveTable(tenant, t); err != nil {
+	installed, err := h.disk.saveTable(tenant, t)
+	if err != nil {
 		return err
+	}
+	if !installed {
+		// Dropped while it was being written: nothing was saved, and the
+		// dropped table must not be cached either.
+		return nil
 	}
 
 	lc := strings.ToLower(t.Name)
@@ -164,11 +185,74 @@ func (h *HybridBackend) SaveTable(tenant string, t *Table) error {
 	return nil
 }
 
+// beginTableSnapshot is DiskBackend.beginTableSnapshot plus the table's
+// MarkDirty sequence, so saveTableSnapshot can clear the dirty flag only when
+// nothing marked the table dirty after the snapshot was taken.
+func (h *HybridBackend) beginTableSnapshot(tenant, name string) snapshotToken {
+	token := h.disk.beginTableSnapshot(tenant, name)
+	tn, lc := strings.ToLower(tenant), strings.ToLower(name)
+	h.dirtyLock.Lock()
+	token.dirtySeq = h.dirtySeq[tn][lc]
+	h.dirtyLock.Unlock()
+	return token
+}
+
+// saveTableSnapshot writes the snapshot through the DiskBackend and then does
+// what SaveTable does after its write: mirror the LIVE table into the buffer
+// pool (a snapshot is a private copy and must never become the cached table)
+// and clear the table's dirty flag, but only for the state that was written.
+// The pool entry's size is estimated from the snapshot, not the live table,
+// whose rows may be changing concurrently.
+func (h *HybridBackend) saveTableSnapshot(s *tableSnapshot) error {
+	if err := h.disk.saveTableSnapshot(s); err != nil {
+		return err
+	}
+	if hook := hybridSnapshotInstalledHook.Load(); hook != nil {
+		(*hook)()
+	}
+	lc := strings.ToLower(s.table.Name)
+	tn := strings.ToLower(s.tenant)
+
+	dropped := func() bool { return h.disk.deleteGeneration(s.tenant, s.table.Name) != s.token.delGen }
+	if !dropped() {
+		size := EstimateTableSize(s.table)
+		if err := h.pool.mirrorWithSize(tn, lc, s.live, size); err != nil {
+			h.noteAdmissionReject(tn, lc, size, err)
+		}
+		// A DROP that ran after the install must not leave the dropped table
+		// cached. DeleteTable drops from disk first and the pool second, so either
+		// its pool removal comes after the Put above, or this check sees its
+		// generation bump: one of the two removes the entry. Only this snapshot's
+		// own table object is removed, never a newer table created under the same
+		// name.
+		if dropped() {
+			h.pool.removeIfSame(tn, lc, s.live)
+		}
+	}
+
+	h.dirtyLock.Lock()
+	if h.dirtySeq[tn][lc] == s.token.dirtySeq {
+		if dm := h.dirty[tn]; dm != nil {
+			delete(dm, lc)
+		}
+	}
+	h.dirtyLock.Unlock()
+	return nil
+}
+
+// hybridSnapshotInstalledHook, when set by a test, runs between a snapshot's
+// install on disk and the mirroring of the live table into the pool.
+var hybridSnapshotInstalledHook atomic.Pointer[func()]
+
 // DeleteTable removes from both disk and cache.
 func (h *HybridBackend) DeleteTable(tenant, name string) error {
 	lc := strings.ToLower(name)
 	tn := strings.ToLower(tenant)
 
+	// Disk first (this bumps the table's drop generation, see
+	// saveTableSnapshot), pool second, whatever the disk answered: the table
+	// is gone from the catalog either way.
+	err := h.disk.DeleteTable(tenant, name)
 	h.pool.Remove(tn, lc)
 
 	h.dirtyLock.Lock()
@@ -177,7 +261,13 @@ func (h *HybridBackend) DeleteTable(tenant, name string) error {
 	}
 	h.dirtyLock.Unlock()
 
-	return h.disk.DeleteTable(tenant, name)
+	return err
+}
+
+// forgetTable is DiskBackend.forgetTable plus the pool entry.
+func (h *HybridBackend) forgetTable(tenant, name string) {
+	h.disk.forgetTable(tenant, name)
+	h.pool.Remove(strings.ToLower(tenant), strings.ToLower(name))
 }
 
 // ListTableNames returns names from the disk manifest (authoritative source).
@@ -200,6 +290,10 @@ func (h *HybridBackend) MarkDirty(tenant, name string) {
 		h.dirty[tn] = make(map[string]bool)
 	}
 	h.dirty[tn][lc] = true
+	if h.dirtySeq[tn] == nil {
+		h.dirtySeq[tn] = make(map[string]uint64)
+	}
+	h.dirtySeq[tn][lc]++
 	h.dirtyLock.Unlock()
 }
 
@@ -260,6 +354,21 @@ func (h *HybridBackend) SetEncryptor(enc *Encryptor) {
 	h.disk.SetEncryptor(enc)
 }
 
+// SetSkipSearchIndexPersistence forwards StorageConfig.SkipSearchIndexPersistence
+// to the underlying DiskBackend, which owns the table files.
+func (h *HybridBackend) SetSkipSearchIndexPersistence(skip bool) {
+	h.disk.SetSkipSearchIndexPersistence(skip)
+}
+
+// SetRowBlockFiles forwards StorageConfig.RowBlockFiles to the DiskBackend.
+func (h *HybridBackend) SetRowBlockFiles(on bool) { h.disk.SetRowBlockFiles(on) }
+
+// SkipsSearchIndexPersistence reports whether table files omit the derived FTS
+// and ANN index images (searchIndexPersistenceSkipper).
+func (h *HybridBackend) SkipsSearchIndexPersistence() bool {
+	return h.disk.SkipsSearchIndexPersistence()
+}
+
 // SetReadOnly forwards the serving-only contract to the durable backend.
 func (h *HybridBackend) SetReadOnly(readOnly bool) {
 	h.disk.SetReadOnly(readOnly)
@@ -284,6 +393,7 @@ func (h *HybridBackend) Stats() BackendStats {
 		DiskUsedBytes:        ds.DiskUsedBytes,
 		CacheHitRate:         hitRate,
 		SyncCount:            ds.SyncCount,
+		TableWrites:          ds.TableWrites,
 		LoadCount:            h.loadCount.Load(),
 		EvictionCount:        ps.EvictionCount,
 		AdmissionRejects:     ps.AdmissionRejects,

@@ -28,6 +28,15 @@ func tableToDiskRange(tn string, t *Table, from, to int) diskTable {
 }
 
 func tableToDiskRangeIndexed(tn string, t *Table, from, to int, includeIndexes bool) diskTable {
+	return tableToDiskImage(tn, t, from, to, includeIndexes, includeIndexes)
+}
+
+// tableToDiskImage is tableToDiskRangeIndexed with the derived search indexes
+// (FTS, ANN) selected separately from the secondary indexes: a table-file
+// backend configured with SkipSearchIndexPersistence keeps the secondary
+// indexes, which are authoritative, and leaves out the images, which are pure
+// functions of the rows and cost a deep copy under the table's derived lock.
+func tableToDiskImage(tn string, t *Table, from, to int, includeIndexes, includeSearchIndexes bool) diskTable {
 	if from < 0 {
 		from = 0
 	}
@@ -39,6 +48,8 @@ func tableToDiskRangeIndexed(tn string, t *Table, from, to int, includeIndexes b
 	var vectorIndexes map[string]*VectorIndex
 	if includeIndexes {
 		indexes = materializeSecondaryIndexesForEncode(t.Indexes)
+	}
+	if includeSearchIndexes {
 		ftsIndexes = t.snapshotFTSIndexes()
 		vectorIndexes = t.snapshotVectorIndexes()
 	}

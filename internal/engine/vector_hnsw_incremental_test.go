@@ -272,8 +272,9 @@ func TestVecHNSWExtendFallsBackToFullRebuildAfterUpdateOrDelete(t *testing.T) {
 		t.Fatalf("expected the extended graph to cover 70 rows, got %d", len(idxAfterMoreAppends.levels))
 	}
 
-	// DELETE must, symmetrically, also force a full rebuild rather than an
-	// incremental extend.
+	// A DELETE is not an append, but the change log reports the removed row: the
+	// graph drops its node and renumbers the others in place (see
+	// followVecHNSWIndex) instead of being rebuilt.
 	structBeforeDelete := table.StructVersion()
 	execSQL(t, db, `DELETE FROM mix_docs WHERE id = 5`)
 	if table.StructVersion() == structBeforeDelete {
@@ -283,11 +284,25 @@ func TestVecHNSWExtendFallsBackToFullRebuildAfterUpdateOrDelete(t *testing.T) {
 	vecHNSWCacheMu.RLock()
 	idxAfterDelete := vecHNSWCache[key]
 	vecHNSWCacheMu.RUnlock()
-	if idxAfterDelete == idxAfterMoreAppends {
-		t.Fatal("expected the DELETE to force a full rebuild into a NEW *vecHNSWIndex object, not extend the old one in place")
+	if idxAfterDelete != idxAfterMoreAppends {
+		t.Fatal("expected the DELETE of one row to be followed by the same *vecHNSWIndex object")
 	}
 	if len(idxAfterDelete.levels) != 69 {
-		t.Fatalf("expected the rebuilt graph to cover 69 rows after the delete, got %d", len(idxAfterDelete.levels))
+		t.Fatalf("expected the followed graph to cover 69 rows after the delete, got %d", len(idxAfterDelete.levels))
+	}
+
+	// A removal too large for the graph to keep its quality is rebuilt into a new
+	// object.
+	execSQL(t, db, `DELETE FROM mix_docs WHERE id >= 20 AND id < 40`)
+	warm()
+	vecHNSWCacheMu.RLock()
+	idxAfterBigDelete := vecHNSWCache[key]
+	vecHNSWCacheMu.RUnlock()
+	if idxAfterBigDelete == idxAfterDelete {
+		t.Fatal("expected a removal of 20 of 69 rows to force a full rebuild into a NEW *vecHNSWIndex object")
+	}
+	if len(idxAfterBigDelete.levels) != 49 {
+		t.Fatalf("expected the rebuilt graph to cover 49 rows, got %d", len(idxAfterBigDelete.levels))
 	}
 
 	// Sanity: the deleted row's id must no longer be reachable via search of

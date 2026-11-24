@@ -46,6 +46,19 @@ type OpenConfig struct {
 	SyncOnMutate bool
 	// CompressFiles compresses supported table/checkpoint files.
 	CompressFiles bool
+	// SkipSearchIndexPersistence keeps the derived FTS and vector index images
+	// out of table files (DSN option `skip_search_index_persistence`); they are
+	// rebuilt on first use after a reopen and no longer make Sync rewrite a
+	// table. Honoured by the table-file modes (disk, json, hybrid, index).
+	SkipSearchIndexPersistence bool
+	// RowBlockFiles writes table files as independent CRC-checked row blocks
+	// instead of one GOB message (DSN option `row_block_files`): no 8 GiB limit
+	// on the rows, parallel encode/decode, bounded memory while saving the rows
+	// (the header, which holds the FTS/vector images unless
+	// SkipSearchIndexPersistence is set, is still one message). Honoured by disk,
+	// hybrid and index; opening with json mode or with an encryption key is an
+	// error. Files written this way cannot be read by older binaries.
+	RowBlockFiles bool
 	// CheckpointEvery and CheckpointInterval control WAL checkpoint cadence.
 	CheckpointEvery    uint64
 	CheckpointInterval time.Duration
@@ -187,6 +200,12 @@ func (c OpenConfig) DSN() (string, error) {
 	}
 	if c.CompressFiles {
 		q.Set("compress_files", "1")
+	}
+	if c.SkipSearchIndexPersistence {
+		q.Set("skip_search_index_persistence", "1")
+	}
+	if c.RowBlockFiles {
+		q.Set("row_block_files", "1")
 	}
 	if c.CheckpointEvery > 0 {
 		q.Set("checkpoint_every", strconv.FormatUint(c.CheckpointEvery, 10))

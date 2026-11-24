@@ -92,6 +92,19 @@ type DB struct {
 	// closes the race with a single, easy-to-audit choke point.
 	contentMu sync.RWMutex
 
+	// syncMu serializes DB.Sync (and so Close's final flush). See Sync.
+	syncMu sync.Mutex
+	// lastSnapshotHold is how long the most recent Sync held contentMu's read
+	// side to take its table snapshots, in nanoseconds. Diagnostic only.
+	lastSnapshotHold atomic.Int64
+	// catalogFileMu serializes writers of the catalog sidecar file (a catalog
+	// change and DB.Sync both write it) and orders their images.
+	catalogFileMu sync.Mutex
+	// lastImageCopy is how long the most recent Sync spent deep-copying the
+	// FTS/ANN images (outside the content lock, but holding each table's
+	// derived-state lock), in nanoseconds. Diagnostic only.
+	lastImageCopy atomic.Int64
+
 	// streamSnapshotMu protects streamSnapshots. A direct ResultStream pins its
 	// source table here after planning; a later writer can then copy that one
 	// table before mutating it instead of making the slow consumer retain

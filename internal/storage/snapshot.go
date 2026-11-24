@@ -108,6 +108,7 @@ func cloneTableMeta(t *Table) *Table {
 	nt.structVersion = t.structVersion
 	nt.rowUpdateBase = t.rowUpdateBase
 	nt.rowUpdateLog = t.rowUpdateLog.clone()
+	nt.rowUpdateFolds = t.rowUpdateFolds[:len(t.rowUpdateFolds):len(t.rowUpdateFolds)]
 	return nt
 }
 
@@ -192,6 +193,7 @@ func cloneTableCore(t *Table, rows [][]any, copySearchIndexes, borrow bool) *Tab
 	nt.structVersion = t.structVersion
 	nt.rowUpdateBase = t.rowUpdateBase
 	nt.rowUpdateLog = t.rowUpdateLog.clone()
+	nt.rowUpdateFolds = t.rowUpdateFolds[:len(t.rowUpdateFolds):len(t.rowUpdateFolds)]
 	if borrow {
 		nt.Indexes = borrowSecondaryIndexes(t.Indexes)
 	} else {
@@ -239,30 +241,42 @@ func cloneFTSIndexes(src map[string]*FTSIndex) map[string]*FTSIndex {
 		if index == nil {
 			continue
 		}
-		clone := *index
-		clone.Docs = append([]FTSDocument(nil), index.Docs...)
-		clone.DocTermIDs = append([]int32(nil), index.DocTermIDs...)
-		clone.DocTermCounts = append([]int32(nil), index.DocTermCounts...)
-		clone.DocTokenIDs = append([]int32(nil), index.DocTokenIDs...)
-		clone.PostingBlocks = make(map[string][]FTSPostingBlock, len(index.PostingBlocks))
-		for term, blocks := range index.PostingBlocks {
-			clone.PostingBlocks[term] = append([]FTSPostingBlock(nil), blocks...)
-		}
-		clone.PostingCounts = make(map[string][]int32, len(index.PostingCounts))
-		for term, counts := range index.PostingCounts {
-			clone.PostingCounts[term] = append([]int32(nil), counts...)
-		}
-		clone.Postings = make(map[string][]int32, len(index.Postings))
-		for term, rows := range index.Postings {
-			clone.Postings[term] = append([]int32(nil), rows...)
-		}
-		clone.TermIDs = make(map[string]int32, len(index.TermIDs))
-		for term, id := range index.TermIDs {
-			clone.TermIDs[term] = id
-		}
-		out[key] = &clone
+		out[key] = index.Clone()
 	}
 	return out
+}
+
+// Clone returns a deep copy of the index. A copy of an index the engine has
+// validated is itself valid, so the verified flag and the term-name table are
+// carried over (a transaction that rewrites other columns of a big table would
+// otherwise pay a full validation and a vocabulary-sized rebuild on its first
+// search after COMMIT). The caller must hold the owning table's DerivedLock, as
+// every mutation of the flag and of the structure does, or the index must not
+// be shared yet (a decoded one is never verified).
+func (index *FTSIndex) Clone() *FTSIndex {
+	clone := *index
+	clone.termNames = append([]string(nil), index.termNames...)
+	clone.Docs = append([]FTSDocument(nil), index.Docs...)
+	clone.DocTermIDs = append([]int32(nil), index.DocTermIDs...)
+	clone.DocTermCounts = append([]int32(nil), index.DocTermCounts...)
+	clone.DocTokenIDs = append([]int32(nil), index.DocTokenIDs...)
+	clone.PostingBlocks = make(map[string][]FTSPostingBlock, len(index.PostingBlocks))
+	for term, blocks := range index.PostingBlocks {
+		clone.PostingBlocks[term] = append([]FTSPostingBlock(nil), blocks...)
+	}
+	clone.PostingCounts = make(map[string][]int32, len(index.PostingCounts))
+	for term, counts := range index.PostingCounts {
+		clone.PostingCounts[term] = append([]int32(nil), counts...)
+	}
+	clone.Postings = make(map[string][]int32, len(index.Postings))
+	for term, rows := range index.Postings {
+		clone.Postings[term] = append([]int32(nil), rows...)
+	}
+	clone.TermIDs = make(map[string]int32, len(index.TermIDs))
+	for term, id := range index.TermIDs {
+		clone.TermIDs[term] = id
+	}
+	return &clone
 }
 
 // cloneVectorIndexes returns a deep copy suitable for a transaction snapshot

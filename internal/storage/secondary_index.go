@@ -380,6 +380,49 @@ func (t *Table) ReindexSecondaryIndexRows(oldToNew map[int]int) {
 	}
 }
 
+// RenumberSecondaryIndexRowsAfterRemoval is ReindexSecondaryIndexRows for a
+// DELETE that knows exactly which rows it removed: removed lists their positions,
+// strictly ascending, in the numbering from before the statement, and the caller
+// has already compacted t.Rows. Instead of an old-to-new map over every row and a
+// rebuilt skip list per index, each index is renumbered in place (one walk, no
+// allocation, see SkipList.renumberAfterRemoval), so the cost no longer includes
+// a map entry and a skip-list node per row of the table.
+//
+// A list shared with another index (a transaction's copy of the table) is copied
+// first, like for every other write (hydrateForWrite), and any twin or returned
+// list parked for the index is forgotten: they equal the list as it was before.
+//
+// It reports false, having changed nothing, when removed is not a strictly
+// ascending list of non-negative positions below the row count from before the
+// statement (len(t.Rows) + len(removed)); the caller then falls back to
+// RebuildSecondaryIndexes.
+func (t *Table) RenumberSecondaryIndexRowsAfterRemoval(removed []int) bool {
+	for i, pos := range removed {
+		if pos < 0 || i > 0 && pos <= removed[i-1] {
+			return false
+		}
+	}
+	if len(removed) == 0 {
+		return true
+	}
+	// A position that was never a row (a stale list, or one counted after the
+	// statement) would shift the survivors wrongly.
+	if removed[len(removed)-1] >= len(t.Rows)+len(removed) {
+		return false
+	}
+	for _, index := range t.Indexes {
+		if index == nil {
+			continue
+		}
+		index.hydrateForWrite().renumberAfterRemoval(removed)
+		index.mu.Lock()
+		index.twin = nil
+		index.returned.Store(nil)
+		index.mu.Unlock()
+	}
+	return true
+}
+
 // DeleteSecondaryIndexRow removes one stable row position and shifts every
 // later RowID down by one. Point DELETE uses this to avoid allocating an
 // old-to-new map proportional to the whole table.

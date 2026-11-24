@@ -68,6 +68,20 @@ type DiskBackend struct {
 	// versions tracks the version at last save so we can detect dirty tables.
 	versions map[string]map[string]int // tenant → lower(name) → version
 
+	// gen counts, per table (tenant NUL lower(name)), the installs and deletes
+	// that replaced or removed its file. A snapshot writer compares it before
+	// installing: see saveTableSnapshot.
+	gen map[string]uint64
+
+	// delGen counts, per table (same key as gen), the DeleteTable and
+	// forgetTable calls: how often the table was dropped. HybridBackend uses it
+	// to notice a DROP that ran after a snapshot of the table was installed.
+	delGen map[string]uint64
+
+	// tableLocks serializes the writers of one table's file (lockTableFile).
+	// Always acquired before b.mu, never while holding it.
+	tableLocks sync.Map
+
 	// Manifest timestamp bookkeeping.
 	manifestCreatedAt time.Time
 	manifestDirty     bool
@@ -77,8 +91,18 @@ type DiskBackend struct {
 	// protects direct embedding callers and background cleanup paths.
 	readOnly atomic.Bool
 
+	// skipSearchIndexes keeps the FTS/ANN index images out of table files and
+	// drops the ones found in files that carry them. See
+	// StorageConfig.SkipSearchIndexPersistence.
+	skipSearchIndexes atomic.Bool
+
+	// rowBlocks writes table files in the row-block layout. See
+	// StorageConfig.RowBlockFiles.
+	rowBlocks atomic.Bool
+
 	// stats
 	syncCount     atomic.Int64
+	tableWrites   atomic.Int64
 	loadCount     atomic.Int64
 	evictionCount atomic.Int64
 }
@@ -111,6 +135,8 @@ func newDiskBackend(dir string, compress bool, format diskFileFormat, mode Stora
 		mode:     mode,
 		meta:     make(map[string]map[string]*TableMeta),
 		versions: make(map[string]map[string]int),
+		gen:      make(map[string]uint64),
+		delGen:   make(map[string]uint64),
 	}
 	if err := b.loadManifest(); err != nil {
 		// If manifest doesn't exist, that's fine – new database.
@@ -146,6 +172,33 @@ func (b *DiskBackend) SetReadOnly(readOnly bool) {
 // IsReadOnly reports whether persistence has been disabled for this backend.
 func (b *DiskBackend) IsReadOnly() bool {
 	return b != nil && b.readOnly.Load()
+}
+
+// SetSkipSearchIndexPersistence stops table files from carrying the derived
+// FTS and ANN index images (see StorageConfig.SkipSearchIndexPersistence).
+// OpenDB sets it before the backend is exposed; toggling it on a live backend
+// only affects files written afterwards.
+func (b *DiskBackend) SetSkipSearchIndexPersistence(skip bool) {
+	if b != nil {
+		b.skipSearchIndexes.Store(skip)
+	}
+}
+
+// SetRowBlockFiles makes the backend write table files in the row-block layout
+// (see StorageConfig.RowBlockFiles); files of either layout are read whatever
+// the setting. It has no effect on JSON backends or with encryption.
+func (b *DiskBackend) SetRowBlockFiles(on bool) {
+	if b != nil {
+		b.rowBlocks.Store(on)
+	}
+}
+
+// SkipsSearchIndexPersistence reports whether table files omit the derived
+// FTS and ANN index images. DB.Sync uses it (through
+// searchIndexPersistenceSkipper) to stop the search-index generation counters
+// from making a table look dirty.
+func (b *DiskBackend) SkipsSearchIndexPersistence() bool {
+	return b != nil && b.skipSearchIndexes.Load()
 }
 
 // ──── StorageBackend interface ────────────────────────────────────────────
@@ -186,52 +239,113 @@ func (b *DiskBackend) LoadTable(tenant, name string) (*Table, error) {
 }
 
 // SaveTable writes a table to its GOB file on disk and updates the manifest.
+//
+// The caller guarantees that t is not modified while the call runs (DB.SyncTable
+// runs under the engine's content write lock; DB.Sync's fallback holds its read
+// side). SaveTable itself holds b.mu only for the bookkeeping at the end, not
+// while it encodes, so a slow save does not stall ListTableNames, TableExists or
+// IsDirty, which every DML statement's foreign-key check goes through.
 func (b *DiskBackend) SaveTable(tenant string, t *Table) error {
+	_, err := b.saveTable(tenant, t)
+	return err
+}
+
+// saveTable is SaveTable that also reports whether the table was installed. A
+// DeleteTable (a DROP) that ran while the table was being encoded wins: the
+// encoded file is discarded and nothing is reported as written, because
+// installing it would bring the dropped table back on disk and in the manifest.
+// The caller must then not mirror the table anywhere either (HybridBackend
+// skips its pool Put).
+func (b *DiskBackend) saveTable(tenant string, t *Table) (installed bool, err error) {
+	return b.saveTableOpt(tenant, t, true)
+}
+
+// errTableFileBusy is returned by saveTableOpt(wait=false) when another writer
+// holds the table's file. Nothing was written.
+var errTableFileBusy = errors.New("storage: table file is being written by another save")
+
+// saveTableOpt is saveTable; with wait unset it returns errTableFileBusy,
+// having written nothing, if another writer (a snapshot write that may take
+// minutes) holds the table's file, instead of waiting for it.
+func (b *DiskBackend) saveTableOpt(tenant string, t *Table, wait bool) (installed bool, err error) {
 	if b.IsReadOnly() {
-		return ErrReadOnlyStorage
+		return false, ErrReadOnlyStorage
 	}
 	tn := normalizeTenantKey(tenant)
 	relPath, absPath, err := b.buildTablePaths(tn, t.Name)
 	if err != nil {
-		return fmt.Errorf("disk backend: save %s/%s: %w", tenant, t.Name, err)
+		return false, fmt.Errorf("disk backend: save %s/%s: %w", tenant, t.Name, err)
+	}
+	lc := strings.ToLower(t.Name)
+	key := tn + "\x00" + lc
+
+	var unlock func()
+	if wait {
+		unlock = b.lockTableFile(tn, lc)
+	} else {
+		var ok bool
+		if unlock, ok = b.tryLockTableFile(tn, lc); !ok {
+			return false, errTableFileBusy
+		}
+	}
+	defer unlock()
+
+	// With the file lock held only a DeleteTable can change the generation
+	// before this call installs (every other file writer takes the same lock).
+	b.mu.RLock()
+	gen := b.gen[key]
+	b.mu.RUnlock()
+
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		return false, fmt.Errorf("disk backend: mkdir: %w", err)
+	}
+	cfg := b.fileConfig()
+	dt := tableToDiskImage(tn, t, 0, len(t.Rows), true, !b.skipSearchIndexes.Load())
+	tmp := absPath + ".tmp"
+	if err := cfg.writeTemp(tmp, dt); err != nil {
+		return false, fmt.Errorf("disk backend: save %s/%s: %w", tenant, t.Name, err)
 	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	lc := strings.ToLower(t.Name)
-
-	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
-		return fmt.Errorf("disk backend: mkdir: %w", err)
+	if b.gen[key] != gen {
+		_ = os.Remove(tmp)
+		return false, nil
 	}
-	size, err := b.writeTableFile(absPath, tn, t)
+	size, err := installTableFile(tmp, absPath)
 	if err != nil {
-		return fmt.Errorf("disk backend: save %s/%s: %w", tenant, t.Name, err)
+		return false, fmt.Errorf("disk backend: save %s/%s: %w", tenant, t.Name, err)
 	}
+	b.tableWrites.Add(1)
+	return true, b.recordTableSavedLocked(tn, lc, relPath, t.Name, t.Cols, len(t.Rows), t.Version, size)
+}
 
-	// Update metadata
+// recordTableSavedLocked updates the metadata, the dirty-tracking version and
+// the write generation after a table file was installed. The caller holds b.mu.
+func (b *DiskBackend) recordTableSavedLocked(tn, lc, relPath, name string, cols []Column, rowCount, version int, size int64) error {
 	if b.meta[tn] == nil {
 		b.meta[tn] = make(map[string]*TableMeta)
 	}
 	prevMeta, hadMeta := b.meta[tn][lc]
 	structuralChange := !hadMeta ||
 		prevMeta.FilePath != relPath ||
-		prevMeta.Name != t.Name ||
-		!reflect.DeepEqual(prevMeta.Cols, t.Cols)
+		prevMeta.Name != name ||
+		!reflect.DeepEqual(prevMeta.Cols, cols)
 
 	b.meta[tn][lc] = &TableMeta{
 		Tenant:   tn,
-		Name:     t.Name,
-		Cols:     t.Cols,
-		RowCount: len(t.Rows),
-		Version:  t.Version,
+		Name:     name,
+		Cols:     cols,
+		RowCount: rowCount,
+		Version:  version,
 		DiskSize: size,
 		FilePath: relPath,
 	}
 
 	// Track version
 	b.ensureVersionMap(tn)
-	b.versions[tn][lc] = t.Version
+	b.versions[tn][lc] = version
+	b.bumpGenLocked(tn, lc)
 
 	// Persist manifest immediately only for structural changes (new table,
 	// path/schema/name change). Non-structural row/version updates are
@@ -242,6 +356,140 @@ func (b *DiskBackend) SaveTable(tenant string, t *Table) error {
 		return b.saveManifestLocked()
 	}
 	return nil
+}
+
+// lockTableFile serializes writers of one table's file: the temporary file
+// name is derived from the table, so two concurrent saves would share it.
+// Writers hold this lock while they encode, which b.mu must not be held for.
+func (b *DiskBackend) lockTableFile(tn, lc string) (unlock func()) {
+	m, _ := b.tableLocks.LoadOrStore(tn+"\x00"+lc, new(sync.Mutex))
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// tryLockTableFile is lockTableFile that gives up instead of waiting.
+func (b *DiskBackend) tryLockTableFile(tn, lc string) (unlock func(), ok bool) {
+	m, _ := b.tableLocks.LoadOrStore(tn+"\x00"+lc, new(sync.Mutex))
+	mu := m.(*sync.Mutex)
+	if !mu.TryLock() {
+		return nil, false
+	}
+	return mu.Unlock, true
+}
+
+// genKey is the key of a table in b.gen and b.tableLocks.
+func (b *DiskBackend) genKey(tenant, name string) string {
+	return normalizeTenantKey(tenant) + "\x00" + strings.ToLower(name)
+}
+
+// bumpGenLocked records that something replaced or removed a table's file. The
+// caller holds b.mu.
+func (b *DiskBackend) bumpGenLocked(tn, lc string) {
+	if b.gen == nil {
+		b.gen = make(map[string]uint64)
+	}
+	b.gen[tn+"\x00"+lc]++
+}
+
+// beginTableSnapshot returns the write generation a snapshot of the named
+// table is based on. A snapshot may be installed only while the generation is
+// unchanged: any other save of the table, and any DeleteTable, supersedes it.
+func (b *DiskBackend) beginTableSnapshot(tenant, name string) snapshotToken {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	key := b.genKey(tenant, name)
+	return snapshotToken{gen: b.gen[key], delGen: b.delGen[key]}
+}
+
+// deleteGeneration reports how often the named table was dropped (DeleteTable
+// or forgetTable) since the backend was opened.
+func (b *DiskBackend) deleteGeneration(tenant, name string) uint64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.delGen[b.genKey(tenant, name)]
+}
+
+// forgetTable records a DROP of a table the backend never persisted (a table
+// created inside a transaction and dropped before any Sync wrote it). Nothing
+// is on disk to remove, but a snapshot of the table that a Sync is writing right
+// now must not install it afterwards, and DeleteTable is not called for tables
+// the manifest does not know. It takes b.mu, which an installing snapshot holds
+// across its check and rename, so the DROP is ordered against the install: the
+// snapshot either installed first (and the caller's DeleteTable follows, because
+// the table is then on disk) or sees the bumped generation and discards itself.
+func (b *DiskBackend) forgetTable(tenant, name string) {
+	tn := normalizeTenantKey(tenant)
+	lc := strings.ToLower(name)
+	b.mu.Lock()
+	b.bumpGenLocked(tn, lc)
+	b.bumpDelGenLocked(tn, lc)
+	b.mu.Unlock()
+}
+
+func (b *DiskBackend) bumpDelGenLocked(tn, lc string) {
+	if b.delGen == nil {
+		b.delGen = make(map[string]uint64)
+	}
+	b.delGen[tn+"\x00"+lc]++
+}
+
+// saveTableSnapshot writes a detached snapshot (see takeTableSnapshot) to the
+// table's file without any engine lock held and without holding b.mu while it
+// encodes. The file is replaced atomically (temporary file, fsync, rename,
+// directory fsync) exactly as SaveTable does, and the table's dirty-tracking
+// version becomes the snapshot's version, so a table that changed after the
+// snapshot was taken stays dirty.
+//
+// It returns errSnapshotSuperseded, having changed nothing, when the table was
+// saved by someone else or deleted since the snapshot was based
+// (beginTableSnapshot): installing it could roll the file back to older rows.
+func (b *DiskBackend) saveTableSnapshot(s *tableSnapshot) error {
+	if b.IsReadOnly() {
+		return ErrReadOnlyStorage
+	}
+	snap := s.table
+	tn := normalizeTenantKey(s.tenant)
+	relPath, absPath, err := b.buildTablePaths(tn, snap.Name)
+	if err != nil {
+		return fmt.Errorf("disk backend: save %s/%s: %w", s.tenant, snap.Name, err)
+	}
+	lc := strings.ToLower(snap.Name)
+	key := tn + "\x00" + lc
+
+	unlock := b.lockTableFile(tn, lc)
+	defer unlock()
+
+	// Do not spend minutes encoding a snapshot that is already obsolete.
+	b.mu.RLock()
+	stale := b.gen[key] != s.token.gen
+	b.mu.RUnlock()
+	if stale {
+		return errSnapshotSuperseded
+	}
+
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		return fmt.Errorf("disk backend: mkdir: %w", err)
+	}
+	cfg := b.fileConfig()
+	dt := snapshotToDisk(tn, s, cfg.format == diskFormatGob)
+	tmp := absPath + ".tmp"
+	if err := cfg.writeTemp(tmp, dt); err != nil {
+		return fmt.Errorf("disk backend: save %s/%s: %w", s.tenant, snap.Name, err)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.gen[key] != s.token.gen {
+		_ = os.Remove(tmp)
+		return errSnapshotSuperseded
+	}
+	size, err := installTableFile(tmp, absPath)
+	if err != nil {
+		return fmt.Errorf("disk backend: save %s/%s: %w", s.tenant, snap.Name, err)
+	}
+	b.tableWrites.Add(1)
+	return b.recordTableSavedLocked(tn, lc, relPath, snap.Name, snap.Cols, len(snap.Rows), snap.Version, size)
 }
 
 // DeleteTable removes a table file from disk and updates the manifest.
@@ -255,6 +503,10 @@ func (b *DiskBackend) DeleteTable(tenant, name string) error {
 	defer b.mu.Unlock()
 
 	lc := strings.ToLower(name)
+	// A snapshot of this table that is being written right now must not
+	// resurrect it when it finishes.
+	b.bumpGenLocked(tn, lc)
+	b.bumpDelGenLocked(tn, lc)
 	if tm := b.meta[tn]; tm != nil {
 		if meta, ok := tm[lc]; ok {
 			absPath, err := b.resolveTablePath(meta.FilePath)
@@ -337,6 +589,7 @@ func (b *DiskBackend) Stats() BackendStats {
 		TablesOnDisk:  diskTables,
 		DiskUsedBytes: diskBytes,
 		SyncCount:     b.syncCount.Load(),
+		TableWrites:   b.tableWrites.Load(),
 		LoadCount:     b.loadCount.Load(),
 		EvictionCount: b.evictionCount.Load(),
 	}
@@ -496,161 +749,6 @@ func (b *DiskBackend) fileExt() string {
 	}
 }
 
-// ──── File I/O ──────────────────────────────────────────────────────────
-
-// tableEncoder is the common interface between gob.Encoder and json.Encoder
-// that writeTableFile needs.
-type tableEncoder interface {
-	Encode(v any) error
-}
-
-func (b *DiskBackend) newEncoder(w io.Writer) tableEncoder {
-	if b.format == diskFormatJSON {
-		return json.NewEncoder(w)
-	}
-	return gob.NewEncoder(w)
-}
-
-func (b *DiskBackend) writeTableFile(path, tenant string, t *Table) (int64, error) {
-	dt := tableToDisk(tenant, t)
-
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return 0, err
-	}
-
-	// Encryption needs the complete ciphertext (GCM authenticates the
-	// whole message at once, it isn't a true streaming cipher the way
-	// gzip/GOB are), so when an encryptor is configured, encode+gzip into
-	// an in-memory buffer first, encrypt that buffer's bytes as one blob,
-	// and write the result in a single Write call — instead of the
-	// unencrypted path's direct stream to the file below. Table files are
-	// bounded in size for this engine's use case, so buffering one file's
-	// contents in memory is an acceptable trade for correct AEAD usage.
-	if b.encryptor != nil {
-		var buf bytes.Buffer
-		if err := b.encodeTableInto(&buf, dt); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmp)
-			return 0, err
-		}
-		ciphertext, err := b.encryptor.Encrypt(buf.Bytes())
-		if err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmp)
-			return 0, fmt.Errorf("encrypt table file: %w", err)
-		}
-		if _, err := f.Write(ciphertext); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmp)
-			return 0, err
-		}
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmp)
-			return 0, err
-		}
-		if err := f.Close(); err != nil {
-			_ = os.Remove(tmp)
-			return 0, err
-		}
-		return b.finishTableFileWrite(tmp, path)
-	}
-
-	bw := borrowDiskWriter(f)
-	defer releaseDiskWriter(bw)
-	var w io.Writer = bw
-	var gz *gzip.Writer
-	if b.gzip {
-		gz = borrowDiskGzipWriter(bw)
-		defer releaseDiskGzipWriter(gz)
-		w = gz
-	}
-
-	enc := b.newEncoder(w)
-	var encErr error
-	if b.format == diskFormatJSON {
-		// JSONMarshal-equivalent normalization (big.Rat/uuid.UUID -> string)
-		// applied to Rows before encoding. Custom default-value marshalers
-		// retain their representation and the old isolation from row data.
-		encErr = enc.Encode(normalizeJSONTable(dt))
-	} else {
-		encErr = enc.Encode(dt)
-	}
-
-	// Close gzip layer first (flushes compressed data to bw)
-	if gz != nil {
-		if err := gz.Close(); err != nil && encErr == nil {
-			encErr = err
-		}
-	}
-	// Flush the bufio layer
-	if err := bw.Flush(); err != nil && encErr == nil {
-		encErr = err
-	}
-	// Sync and close the file
-	if err := f.Sync(); err != nil && encErr == nil {
-		encErr = err
-	}
-	if err := f.Close(); err != nil && encErr == nil {
-		encErr = err
-	}
-	if encErr != nil {
-		_ = os.Remove(tmp)
-		return 0, encErr
-	}
-
-	return b.finishTableFileWrite(tmp, path)
-}
-
-// encodeTableInto GOB- or JSON-encodes dt (gzip-compressed if b.gzip) into
-// w, applying the same JSON normalization writeTableFile's unencrypted
-// path does. Shared by the encrypted write path above, which needs the
-// fully encoded bytes in memory before encryption rather than streamed
-// straight to a file.
-func (b *DiskBackend) encodeTableInto(w io.Writer, dt diskTable) error {
-	var gz *gzip.Writer
-	target := w
-	if b.gzip {
-		gz = borrowDiskGzipWriter(w)
-		defer releaseDiskGzipWriter(gz)
-		target = gz
-	}
-	enc := b.newEncoder(target)
-	var err error
-	if b.format == diskFormatJSON {
-		err = enc.Encode(normalizeJSONTable(dt))
-	} else {
-		err = enc.Encode(dt)
-	}
-	if gz != nil {
-		if closeErr := gz.Close(); err == nil {
-			err = closeErr
-		}
-	}
-	return err
-}
-
-// finishTableFileWrite atomically installs tmp as path (rename + directory
-// fsync for crash safety) and returns the final file's size. Shared by both
-// the encrypted and unencrypted write paths above once their bytes are
-// already durably on disk under the temp name.
-func (b *DiskBackend) finishTableFileWrite(tmp, path string) (int64, error) {
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return 0, err
-	}
-	if err := syncDir(filepath.Dir(path)); err != nil {
-		return 0, err
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	return info.Size(), nil
-}
-
 func init() {
 	// Ensure diskTable is registered for individual file encoding.
 	safeGobRegister(diskTable{})
@@ -688,6 +786,29 @@ func (b *DiskBackend) readTableFile(path string) (*Table, error) {
 		reader := borrowDiskReader(f)
 		defer releaseDiskReader(reader)
 		r = reader
+	}
+
+	// A row-block file (see disk_rowblocks.go) is recognised by its magic,
+	// whatever the configuration or the file name say; its compression, if any,
+	// is per block. No classic gob stream starts with that byte sequence.
+	if b.format != diskFormatJSON {
+		var head []byte
+		switch src := r.(type) {
+		case *bytes.Reader: // decrypted plaintext
+			head = make([]byte, len(rowBlockMagic))
+			if n, _ := src.ReadAt(head, 0); n < len(head) {
+				head = head[:n]
+			}
+		case interface{ Peek(int) ([]byte, error) }:
+			head, _ = src.Peek(len(rowBlockMagic))
+		}
+		if hasRowBlockMagic(head) {
+			dt, err := decodeRowBlockFile(r)
+			if err != nil {
+				return nil, err
+			}
+			return b.tableFromDisk(dt), nil
+		}
 	}
 
 	if strings.HasSuffix(strings.ToLower(path), ".gz") {
@@ -757,9 +878,22 @@ func (b *DiskBackend) readTableFile(path string) (*Table, error) {
 			return nil, err
 		}
 	}
+	return b.tableFromDisk(dt), nil
+}
+
+// tableFromDisk turns a decoded file image into a table, applying the
+// configuration's view of the search-index images.
+func (b *DiskBackend) tableFromDisk(dt diskTable) *Table {
+	if b.skipSearchIndexes.Load() {
+		// Images left by a version (or configuration) that persisted them are
+		// not wanted: the engine rebuilds an index lazily from the rows, and
+		// keeping a stale image would pin memory the flag exists to save.
+		dt.FTSIndexes = nil
+		dt.VectorIndexes = nil
+	}
 	// diskToTable normalizes vector cells regardless of source format: GOB
 	// preserves []float64 exactly, JSON decodes numeric arrays as []any.
-	return diskToTableOwned(dt), nil
+	return diskToTableOwned(dt)
 }
 
 // ──── Manifest (JSON) ───────────────────────────────────────────────────

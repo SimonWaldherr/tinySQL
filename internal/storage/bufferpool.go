@@ -149,8 +149,12 @@ type BufferPool struct {
 	// — possibly the only remaining reference — disappears. It must not
 	// call back into this BufferPool's own Put/Get/Remove/Snapshot: evictLRU
 	// always runs with bp.mu already held, and sync.RWMutex is not
-	// reentrant.
-	evictionSaver func(tenant, name string, table *Table)
+	// reentrant. It returns false to veto the eviction of that table for now
+	// (the backend could not save it without waiting for something slow, such
+	// as a snapshot write of the same table that is in flight): the table
+	// stays cached, and the pool, which holds bp.mu for the whole call, never
+	// stalls its readers behind that wait.
+	evictionSaver func(tenant, name string, table *Table) bool
 }
 
 // CachedTable wraps a table with caching metadata.
@@ -253,7 +257,25 @@ func NewLRUQueue() *LRUQueue {
 
 // Put adds or updates a table in the buffer pool.
 func (bp *BufferPool) Put(tenant, name string, table *Table) error {
-	tableSize := EstimateTableSize(table)
+	return bp.putWithSize(tenant, name, table, EstimateTableSize(table))
+}
+
+// putWithSize is Put with the size supplied by the caller, for a caller that
+// must not read the table's rows to estimate it (a snapshot save mirrors the
+// live table, which writers may be changing, and estimates from its snapshot).
+func (bp *BufferPool) putWithSize(tenant, name string, table *Table, tableSize int64) error {
+	return bp.putSized(tenant, name, table, tableSize, false)
+}
+
+// mirrorWithSize is putWithSize for a snapshot save that mirrors the live table it
+// copied: when the pool holds a DIFFERENT table object under the name by now (the
+// live one was evicted and reloaded from the file just written, or replaced), that
+// object is newer and is left alone; replacing it would drop its unsaved changes.
+func (bp *BufferPool) mirrorWithSize(tenant, name string, table *Table, tableSize int64) error {
+	return bp.putSized(tenant, name, table, tableSize, true)
+}
+
+func (bp *BufferPool) putSized(tenant, name string, table *Table, tableSize int64, keepNewer bool) error {
 	key := tenant + ":" + name
 
 	// Check if table is pinned or should be ignored
@@ -266,6 +288,12 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
+
+	if keepNewer {
+		if cached, exists := bp.cache[tenant][name]; exists && cached.Table != table {
+			return nil
+		}
+	}
 
 	// Check memory limit. EvictionThreshold (a fraction like 0.9, not 1.0)
 	// triggers eviction before the pool is completely full, leaving
@@ -355,7 +383,7 @@ func (bp *BufferPool) Put(tenant, name string, table *Table) error {
 // SetEvictionSaver installs the callback evictLRU invokes on each table it
 // is about to drop from the cache. See the evictionSaver field for the
 // no-reentrancy constraint.
-func (bp *BufferPool) SetEvictionSaver(f func(tenant, name string, table *Table)) {
+func (bp *BufferPool) SetEvictionSaver(f func(tenant, name string, table *Table) bool) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 	bp.evictionSaver = f
@@ -425,13 +453,26 @@ func (bp *BufferPool) Get(tenant, name string) (*Table, bool) {
 
 // Remove removes a table from the buffer pool.
 func (bp *BufferPool) Remove(tenant, name string) {
+	bp.remove(tenant, name, nil)
+}
+
+// removeIfSame removes the entry only while it still holds table: a caller
+// undoing its own Put must not evict a newer table another caller cached under
+// the same name since.
+func (bp *BufferPool) removeIfSame(tenant, name string, table *Table) {
+	bp.remove(tenant, name, table)
+}
+
+// remove deletes the entry, or, with only set, deletes it only if it caches that
+// very table.
+func (bp *BufferPool) remove(tenant, name string, only *Table) {
 	key := tenant + ":" + name
 
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
 	if tenantCache, exists := bp.cache[tenant]; exists {
-		if cached, exists := tenantCache[name]; exists {
+		if cached, exists := tenantCache[name]; exists && (only == nil || cached.Table == only) {
 			bp.currentMemory.Add(-cached.Size)
 			delete(tenantCache, name)
 
@@ -456,6 +497,16 @@ func (bp *BufferPool) Remove(tenant, name string) {
 func (bp *BufferPool) evictLRU(needed int64) {
 	freed := int64(0)
 	evicted := 0
+	type vetoedEntry struct {
+		key    string
+		cached *CachedTable
+	}
+	var vetoed []vetoedEntry
+	defer func() {
+		for _, v := range vetoed {
+			bp.lru.Add(v.key, v.cached)
+		}
+	}()
 
 	for freed < needed && evicted < bp.policy.EvictionBatchSize {
 		key, cached := bp.lru.RemoveLRU()
@@ -483,8 +534,11 @@ func (bp *BufferPool) evictLRU(needed int64) {
 			// Give the backend a chance to persist this table before its
 			// pool-held pointer — possibly the only remaining reference to
 			// an in-place mutation — is dropped for good.
-			if bp.evictionSaver != nil {
-				bp.evictionSaver(tenant, name, cached.Table)
+			if bp.evictionSaver != nil && !bp.evictionSaver(tenant, name, cached.Table) {
+				// Vetoed: keep it cached, and back in the LRU once the loop
+				// is done (re-adding it now would let the loop pop it again).
+				vetoed = append(vetoed, vetoedEntry{key: key, cached: cached})
+				continue
 			}
 			delete(tenantCache, name)
 			if len(tenantCache) == 0 {

@@ -56,13 +56,14 @@ func loadPersistentVecHNSWIndex(table *storage.Table, colIdx int, metric string,
 		maxLevel:      clone.MaxLevel,
 		levels:        clone.Levels,
 		neighbors:     clone.Neighbors,
+		removed:       clone.Removed,
 	}
 }
 
 func usablePersistentVecHNSW(index *storage.VectorIndex, table *storage.Table, colIdx int, metric string, dims int, cache vecSearchColumnCacheEntry) bool {
 	if index == nil || index.Format != vecPersistentFormat || index.Kind != vecIndexHNSW ||
 		index.Column != colIdx || index.Metric != metric || index.Dims != dims ||
-		index.Version > table.Version || index.StructVersion != table.StructVersion() || index.BuiltRows < 0 ||
+		index.Version > table.Version || index.StructVersion != table.StructVersion() || index.BuiltRows < 0 || index.Removed < 0 ||
 		index.BuiltRows > len(table.Rows) || len(index.Levels) != index.BuiltRows ||
 		len(index.Neighbors) != index.BuiltRows {
 		return false
@@ -162,6 +163,28 @@ func persistExtendedVecHNSWIndex(table *storage.Table, colIdx int, metric string
 	}
 }
 
+// restampPersistedVecHNSW moves the stored graph's structVersion stamp from
+// "from" to "to". The caller has established that the table's structVersion
+// advanced from "from" to "to" without any change to the indexed vector column
+// (updates of other columns only), so a graph that was current at "from" is
+// current at "to". A stored graph with any other stamp is left alone. The
+// stored object is replaced by a shallow copy: its topology slices are never
+// mutated in place, and a concurrent flush may still be reading the old object.
+func restampPersistedVecHNSW(table *storage.Table, colIdx int, metric string, from, to int) {
+	if table == nil || from == to {
+		return
+	}
+	key := vecPersistentHNSWKey(colIdx, metric)
+	table.DerivedLock()
+	if stored := table.VectorIndexes[key]; stored != nil && stored.StructVersion == from {
+		restamped := *stored
+		restamped.StructVersion = to
+		table.VectorIndexes[key] = &restamped
+		table.MarkVectorIndexesChanged()
+	}
+	table.DerivedUnlock()
+}
+
 func vecPersistentAppendLimit(rows int) int {
 	return min(1024, max(32, rows/16))
 }
@@ -185,6 +208,7 @@ func persistVecHNSWIndex(table *storage.Table, colIdx int, metric string, idx *v
 		Dims:          idx.dims,
 		Entry:         idx.entry,
 		MaxLevel:      idx.maxLevel,
+		Removed:       idx.removed,
 	}
 	persisted.Levels, persisted.Neighbors = storage.CloneVectorTopology(idx.levels, idx.neighbors)
 	idx.mu.RUnlock()

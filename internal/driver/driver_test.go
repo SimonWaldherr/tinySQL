@@ -1585,3 +1585,32 @@ func TestDriverRowsAffectedForUpdateDelete(t *testing.T) {
 
 // tiny helper to quiet unused imports during incremental edits
 var _ = fmt.Sprintf
+
+func TestParseDSNSkipSearchIndexPersistence(t *testing.T) {
+	c, err := parseDSN("file:/tmp/tiny?mode=hybrid&skip_search_index_persistence=1")
+	if err != nil {
+		t.Fatalf("parse DSN: %v", err)
+	}
+	if !c.skipSearchIndexPersistence {
+		t.Fatalf("skip_search_index_persistence not parsed: %#v", c)
+	}
+	if c, err = parseDSN("file:/tmp/tiny?mode=hybrid"); err != nil || c.skipSearchIndexPersistence {
+		t.Fatalf("default must be off: %v %#v", err, c)
+	}
+	if _, err := parseDSN("file:/tmp/tiny?mode=hybrid&skip_search_index_persistence=maybe"); err == nil {
+		t.Fatal("a malformed boolean must be rejected")
+	}
+}
+
+func TestParseDSNRowBlockFiles(t *testing.T) {
+	c, err := parseDSN("file:/tmp/tiny?mode=hybrid&row_block_files=true")
+	if err != nil || !c.rowBlockFiles {
+		t.Fatalf("row_block_files not parsed: %v %#v", err, c)
+	}
+	if c, err = parseDSN("file:/tmp/tiny?mode=hybrid"); err != nil || c.rowBlockFiles {
+		t.Fatalf("default must be off: %v %#v", err, c)
+	}
+	if _, err := parseDSN("file:/tmp/tiny?mode=hybrid&row_block_files=2"); err == nil {
+		t.Fatal("a malformed boolean must be rejected")
+	}
+}

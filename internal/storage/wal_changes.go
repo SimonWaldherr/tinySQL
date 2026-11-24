@@ -111,8 +111,9 @@ func (db *DB) ApplyWALChanges(changes []WALChange) error {
 			td := db.getTenant(ch.Tenant)
 			delete(td.tables, strings.ToLower(ch.Name))
 			db.mu.Unlock()
-			if db.backend != nil && db.backend.TableExists(ch.Tenant, ch.Name) {
-				if err := db.backend.DeleteTable(ch.Tenant, ch.Name); err != nil {
+			if db.backend != nil {
+				onDisk := db.backend.TableExists(ch.Tenant, ch.Name)
+				if err := db.dropFromBackend(ch.Tenant, ch.Name, onDisk); err != nil {
 					return fmt.Errorf("backend delete %s/%s: %w", ch.Tenant, ch.Name, err)
 				}
 			}

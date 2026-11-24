@@ -133,6 +133,12 @@ func executeGeneralUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 				values[i] = cv
 				if !rawEqual(t.Rows[ri][set.col], cv) {
 					changedCols = append(changedCols, set.col)
+				} else {
+					// Equal values may still differ in representation (0.0 and -0.0, an
+					// int and a float): keep the stored cell so that a column outside
+					// changedCols is bit-identical afterwards, which the column mask
+					// recorded for this row promises to derived indexes.
+					values[i] = t.Rows[ri][set.col]
 				}
 			}
 			// Assignments are sorted by column, so changedCols is already in
@@ -163,7 +169,10 @@ func executeGeneralUpdate(env ExecEnv, s *Update) (*ResultSet, error) {
 			// Report the row so the WAL can log it alone instead of the whole
 			// table. Triggers below may write here too; anything that adds or
 			// removes rows invalidates the list through MarkDirtyFrom.
-			t.MarkRowUpdated(ri)
+			// changedCols is exactly the set of cells this replacement altered (every
+			// other cell was copied from the old row); an empty set (a trigger-only
+			// no-op) becomes mask 0, "unknown", never "nothing changed".
+			t.MarkRowUpdatedCols(ri, storage.ColumnMask(changedCols...))
 			if len(indexNames) > 0 {
 				if err := t.UpdateSecondaryIndexRow(ri, before, nextRow, indexNames); err != nil {
 					return nil, err
@@ -453,6 +462,10 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		for i, set := range plan.sets {
 			if !rawEqual(raw[set.col], values[i]) {
 				changedCols = append(changedCols, set.col)
+			} else {
+				// Keep the stored cell when only its representation differs (see the
+				// general path): a column outside changedCols must stay bit-identical.
+				values[i] = raw[set.col]
 			}
 		}
 		if len(changedCols) == 0 {
@@ -475,7 +488,8 @@ func executeSimpleUpdateFastPath(env ExecEnv, s *Update) (*ResultSet, bool, erro
 		patchConstraintIndexRow(plan.table, ri, plan.table.Rows[ri], nextRow)
 		before := raw
 		plan.table.Rows[ri] = nextRow
-		plan.table.MarkRowUpdated(ri)
+		// changedCols is non-empty here and names every cell nextRow changed.
+		plan.table.MarkRowUpdatedCols(ri, storage.ColumnMask(changedCols...))
 		if len(indexNames) > 0 {
 			if err := plan.table.UpdateSecondaryIndexRow(ri, before, nextRow, indexNames); err != nil {
 				return nil, true, err

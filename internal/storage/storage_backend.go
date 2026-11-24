@@ -268,6 +268,50 @@ type StorageConfig struct {
 	// unencrypted behavior. Not yet supported for ModeWAL/ModeAdvancedWAL —
 	// see README's Limitations section.
 	EncryptionKey []byte
+
+	// SkipSearchIndexPersistence keeps the derived full-text (FTS) and vector
+	// (ANN/HNSW) index images out of table files. They are rebuilt from the
+	// rows on first use after a reopen (or after the table leaves the
+	// ModeHybrid/ModeIndex buffer pool), exactly like a table that was never
+	// searched, and a search that merely builds such an index no longer makes
+	// the table "dirty": DB.Sync writes only tables whose rows, schema or
+	// secondary indexes changed. On a large retrieval corpus the FTS and ANN
+	// images dominate the file and their deep copy dominates Sync's CPU and
+	// memory, so a corpus that is cheap to re-index trades a slower first
+	// search after a restart for a much cheaper Sync.
+	//
+	// Default false: table files carry the images, as before. Honoured by the
+	// table-file backends (ModeDisk, ModeJSON, ModeHybrid, ModeIndex). Ignored
+	// by ModePagedIndex and ModeSQLite (their sidecar columns keep being
+	// written) and by the checkpoint/log based modes (ModeMemory, ModeWAL,
+	// ModeAdvancedWAL, whose whole-database checkpoints always embed them).
+	// Files written without the images remain readable by every version; files
+	// written by older versions load fine with the flag set, the images found
+	// in them are dropped.
+	SkipSearchIndexPersistence bool
+
+	// RowBlockFiles writes table files in the row-block layout instead of one
+	// GOB message per table: a header (schema, indexes, statistics) followed by
+	// independent, CRC-checked blocks of rows of about 32 MB each, encoded on
+	// several cores and decoded in parallel on load. It removes the 8 GiB limit
+	// encoding/gob puts on a single message (a table file of that size could
+	// neither be written nor read) and the whole-table buffer the single message
+	// needs while it is encoded, for the ROWS: peak memory while saving them is a
+	// few blocks, not a multiple of the table. The header is still one message and
+	// holds the FTS/ANN images unless SkipSearchIndexPersistence is set, so for a
+	// table whose images are large combine the two options; a table file that
+	// already crossed 8 GiB in the classic layout cannot be loaded to convert it,
+	// so enable the option before the table gets there. With CompressFiles each
+	// block is gzipped separately.
+	//
+	// Default false. Honoured by ModeDisk, ModeHybrid and ModeIndex. OpenDB
+	// returns an error for ModeJSON and for EncryptionKey with these modes (an
+	// encrypted file is one AEAD blob and would keep the single-message limit);
+	// the modes without table files ignore it. Every version that includes this
+	// option reads files of both layouts whatever the setting, so it can be
+	// switched back off, but a file written with it cannot be read by older
+	// binaries.
+	RowBlockFiles bool
 }
 
 // DefaultStorageConfig returns a StorageConfig with sensible defaults for
@@ -367,6 +411,15 @@ type dirtyTracker interface {
 	IsDirty(tenant, name string, currentVersion int) bool
 }
 
+// searchIndexPersistenceSkipper is implemented by backends whose table files
+// never carry the derived FTS/ANN index images (StorageConfig.
+// SkipSearchIndexPersistence). DB.Sync then ignores the search-index
+// generation counters: they only say that an in-memory index differs from the
+// image on disk, and there is no image.
+type searchIndexPersistenceSkipper interface {
+	SkipsSearchIndexPersistence() bool
+}
+
 // BackendStats provides observability into storage backend behaviour.
 type BackendStats struct {
 	Mode             StorageMode
@@ -400,6 +453,11 @@ type BackendStats struct {
 	TransientPages  int
 	TransientFrames int
 	MaxCachePages   int
+	// TableWrites counts table files written by the table-file backends
+	// (ModeDisk, ModeJSON, ModeHybrid, ModeIndex), whole files at a time: a
+	// Sync that finds nothing dirty leaves it unchanged. (Last, so that existing
+	// unkeyed BackendStats literals keep compiling.)
+	TableWrites int64
 }
 
 // ───────────────────────────────────────────────────────────────────────────

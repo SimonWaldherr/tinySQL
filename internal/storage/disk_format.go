@@ -443,19 +443,36 @@ func (db *DB) saveBackendCatalog() error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := os.Create(path)
+	// The image is taken inside the file lock, so of two concurrent writers the
+	// one that writes last also has the newer image. The file is replaced
+	// atomically: a crash or a failed write leaves the previous catalog, never a
+	// truncated or empty one (an empty catalog file loads as "no catalog").
+	db.catalogFileMu.Lock()
+	defer db.catalogFileMu.Unlock()
+	image := catalogToDisk(db.Catalog())
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	bw := bufio.NewWriter(f)
-	encErr := gob.NewEncoder(bw).Encode(catalogToDisk(db.Catalog()))
-	flushErr := bw.Flush()
-	closeErr := f.Close()
-	if encErr != nil {
-		return encErr
+	err = gob.NewEncoder(bw).Encode(image)
+	if flushErr := bw.Flush(); err == nil {
+		err = flushErr
 	}
-	if flushErr != nil {
-		return flushErr
+	if syncErr := f.Sync(); err == nil {
+		err = syncErr
 	}
-	return closeErr
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }

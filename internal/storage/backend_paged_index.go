@@ -116,12 +116,13 @@ func NewPagedIndexBackend(dir string, maxMemoryBytes int64, readOnly bool) (*Pag
 	// lease. Save it first, going straight to the pager (not through
 	// PagedIndexBackend.SaveTable, which would call pool.Put and deadlock:
 	// this callback runs with the pool's own lock already held).
-	pool.SetEvictionSaver(func(tenant, name string, t *Table) {
+	pool.SetEvictionSaver(func(tenant, name string, t *Table) bool {
 		if b.IsDirty(tenant, name, t.Version) {
 			if err := b.saveToPager(tenant, t); err != nil {
 				log.Printf("warning: flush-before-evict failed for paged index %s/%s: %v", tenant, name, err)
 			}
 		}
+		return true
 	})
 	b.readOnly.Store(readOnly)
 	return b, nil

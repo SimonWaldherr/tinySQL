@@ -108,13 +108,13 @@ func (t *Table) catchUpRows(buf [][]any, since int) ([][]any, bool) {
 	if since != t.structVersion {
 		log := &t.rowUpdateLog
 		total := log.len()
-		if since < t.rowUpdateBase || total == 0 {
+		if since < t.rowUpdateRowsFrom() || total == 0 {
 			return nil, false
 		}
 		want := since + 1
 		for i := log.search(want); i < total; i++ {
 			delta := log.at(i)
-			if delta.structVersion != want || delta.row < 0 || delta.row >= len(t.Rows) {
+			if delta.structVersion != want || delta.removed != nil || delta.row < 0 || delta.row >= len(t.Rows) {
 				return nil, false
 			}
 			want++

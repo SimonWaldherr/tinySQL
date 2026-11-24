@@ -78,6 +78,18 @@ func applyDSNOption(c *cfg, key, value string) error {
 			return err
 		}
 		c.compressFiles = v
+	case "skip_search_index_persistence":
+		v, err := parseDSNBool(value, key)
+		if err != nil {
+			return err
+		}
+		c.skipSearchIndexPersistence = v
+	case "row_block_files":
+		v, err := parseDSNBool(value, key)
+		if err != nil {
+			return err
+		}
+		c.rowBlockFiles = v
 	case "checkpoint_every":
 		v, err := parseNonNegativeUint(value, key)
 		if err != nil {

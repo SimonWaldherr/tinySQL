@@ -63,6 +63,10 @@ func TestFTSParallelBuildMatchesSequential(t *testing.T) {
 		table := ftsParallelBuildCorpus(rows)
 		for _, cols := range [][]int{{0}, {0, 1}, {1, 0, 1}} {
 			want := ftsSequentialBuild(table, cols)
+			// The verified flag and the term-name table are maintenance caches of
+			// the live object, not part of the built structure.
+			want.SetVerified(false)
+			want.SetTermNames(nil)
 			for _, workers := range []int{2, 3, 7, 16} {
 				got := ftsFreshIndexFor(table)
 				ftsBuildFreshParallel(table, cols, got, workers)

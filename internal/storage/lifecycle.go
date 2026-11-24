@@ -88,6 +88,19 @@ func (db *DB) HealthCheck() DBHealth {
 // WAL checkpoints respectively). For ModeDisk, ModeJSON, ModeHybrid, and
 // ModeIndex, tables whose version has changed since the last save are
 // written to disk.
+//
+// For ModeDisk, ModeJSON, ModeHybrid and ModeIndex, Sync does not stop the
+// world. It copies each dirty table (row headers, schema, statistics; the
+// secondary indexes are lent) under the content lock's read side, in one
+// critical section of a few milliseconds even for a million rows, and then
+// encodes and writes the copies, atomically replacing each table file, with no
+// engine lock held: statements, including DML on the table being written, run
+// meanwhile, and what they change stays dirty for the next Sync. A nil return
+// means the state each table had when Sync took its snapshot is on disk. Syncs
+// are serialized with each other, and Sync must not be called while the caller
+// holds the content lock (LockContentForRead/LockContentForWrite) itself.
+// Other backends are handed the live table and need the caller to keep writers
+// out for the duration, as before.
 func (db *DB) Sync() error {
 	if db.IsReadOnly() {
 		db.markSynced()
@@ -98,66 +111,21 @@ func (db *DB) Sync() error {
 		return nil
 	}
 
+	// One Sync at a time: two concurrent ones would snapshot and write the
+	// same tables twice, and the second to finish could install the older
+	// image. It is the outermost lock of the Sync path.
+	db.syncMu.Lock()
+	defer db.syncMu.Unlock()
+
 	// For disk/hybrid/paged-index backends, save all resident tables that
-	// are dirty. "Resident" is two sets: db.tenants (every non-evictable
-	// mode, plus any table Put into this process) and — for the evictable
-	// modes ModeIndex/ModeHybrid/ModePagedIndex — whatever the backend's own
-	// bounded pool currently holds. DB.Get returns a query-scoped lease for
-	// the latter without ever registering it in db.tenants (see
-	// backendTablesEvictable), so skipping pooledTableSource here would
-	// silently drop any mutation made on such a lease: Sync/Close would
-	// keep returning nil while the table was never actually re-saved.
+	// are dirty (see collectDirtyTables for what "resident" means). A backend
+	// that can write snapshots (DiskBackend, HybridBackend) has each dirty
+	// table copied under a brief content read lock and written with no engine
+	// lock held (see sync_snapshot.go); the others get the live table and need
+	// the caller to keep writers out meanwhile, as they always did.
 	if db.storageMode == ModeDisk || db.storageMode == ModeJSON || db.storageMode == ModeHybrid || db.storageMode == ModeIndex || db.storageMode == ModePagedIndex || db.storageMode == ModeSQLite {
-		dc, hasDirtyTracker := db.backend.(dirtyTracker)
-
-		type entry struct {
-			tenant           string
-			table            *Table
-			ftsGeneration    int
-			vectorGeneration int
-		}
-		var toSave []entry
-		seen := make(map[string]bool) // tenant\x00lower(table name)
-
-		db.mu.RLock()
-		for tn, tdb := range db.tenants {
-			for _, t := range tdb.tables {
-				seen[tn+"\x00"+strings.ToLower(t.Name)] = true
-				ftsGeneration, ftsDirty := t.FTSIndexesPersistenceState()
-				vectorGeneration, vectorDirty := t.VectorIndexesPersistenceState()
-				if hasDirtyTracker && !dc.IsDirty(tn, t.Name, t.Version) && !ftsDirty && !vectorDirty {
-					continue
-				}
-				toSave = append(toSave, entry{tenant: tn, table: t, ftsGeneration: ftsGeneration, vectorGeneration: vectorGeneration})
-			}
-		}
-		db.mu.RUnlock()
-
-		// db.tenants entries take precedence: a table already covered above
-		// (e.g. HybridBackend/PagedIndexBackend's SaveTable mirrors a Put
-		// into their own pool too) must not be saved twice.
-		if ps, ok := db.backend.(pooledTableSource); ok {
-			for _, ref := range ps.PooledTables() {
-				key := strings.ToLower(ref.Tenant) + "\x00" + strings.ToLower(ref.Table.Name)
-				if seen[key] {
-					continue
-				}
-				seen[key] = true
-				ftsGeneration, ftsDirty := ref.Table.FTSIndexesPersistenceState()
-				vectorGeneration, vectorDirty := ref.Table.VectorIndexesPersistenceState()
-				if hasDirtyTracker && !dc.IsDirty(ref.Tenant, ref.Table.Name, ref.Table.Version) && !ftsDirty && !vectorDirty {
-					continue
-				}
-				toSave = append(toSave, entry{tenant: ref.Tenant, table: ref.Table, ftsGeneration: ftsGeneration, vectorGeneration: vectorGeneration})
-			}
-		}
-
-		for _, e := range toSave {
-			if err := db.backend.SaveTable(e.tenant, e.table); err != nil {
-				return db.markError(err)
-			}
-			e.table.MarkFTSIndexesPersisted(e.ftsGeneration)
-			e.table.MarkVectorIndexesPersisted(e.vectorGeneration)
+		if err := db.flushDirtyTables(); err != nil {
+			return db.markError(err)
 		}
 	}
 
@@ -169,6 +137,48 @@ func (db *DB) Sync() error {
 	}
 	db.markSynced()
 	return nil
+}
+
+// skipsSearchIndexPersistence reports whether the attached backend keeps the
+// derived FTS/ANN index images out of its files.
+func (db *DB) skipsSearchIndexPersistence() bool {
+	s, ok := db.backend.(searchIndexPersistenceSkipper)
+	return ok && s.SkipsSearchIndexPersistence()
+}
+
+// searchIndexPersistenceState returns the FTS and ANN generations and whether
+// each needs persisting. With skip set the answer is "never": the backend
+// writes no image, so a generation counter that moved (a search built an
+// index) is not a reason to rewrite the table. The generations are still
+// returned so the caller can mark them persisted, which keeps the counters
+// meaningful should the table later be handed to a backend that writes images.
+func (t *Table) searchIndexPersistenceState(skip bool) (ftsGeneration int, ftsDirty bool, vectorGeneration int, vectorDirty bool) {
+	ftsGeneration, ftsDirty = t.FTSIndexesPersistenceState()
+	vectorGeneration, vectorDirty = t.VectorIndexesPersistenceState()
+	if skip {
+		return ftsGeneration, false, vectorGeneration, false
+	}
+	return ftsGeneration, ftsDirty, vectorGeneration, vectorDirty
+}
+
+// searchIndexPersistenceStateNoWait is searchIndexPersistenceState for a caller
+// that holds the engine's content lock and so must never wait for the table's
+// derived-state lock: an FTS or ANN index build holds that lock for its whole
+// duration (tens of seconds on a large table), and a Sync that waited for it
+// inside its snapshot critical section would park every statement behind the
+// first writer that queued up. With skip set nothing is read at all. When the
+// lock is busy the answer is "not dirty": an index build is in progress, the
+// image is about to change anyway, and the next Sync sees the finished build.
+func (t *Table) searchIndexPersistenceStateNoWait(skip bool) (ftsGeneration int, ftsDirty bool, vectorGeneration int, vectorDirty bool) {
+	if skip || !t.derivedMu.TryLock() {
+		return 0, false, 0, false
+	}
+	ftsGeneration = t.ftsGeneration
+	ftsDirty = ftsGeneration != t.ftsPersistedGeneration
+	vectorGeneration = t.vectorGeneration
+	vectorDirty = vectorGeneration != t.vectorPersistedGeneration
+	t.derivedMu.Unlock()
+	return ftsGeneration, ftsDirty, vectorGeneration, vectorDirty
 }
 
 // Close persists all data and releases resources. For ModeMemory with a

@@ -862,10 +862,27 @@ search also scores a bounded update-delta exactly and merges it into Top-K, so
 a vector moved far away from its old graph neighborhood remains discoverable.
 When that delta grows beyond the compaction threshold, tinySQL rebuilds the
 topology once and clears it.
-Deletes and schema changes still rebuild safely, because physical row positions
-may change; this is intentional rather than serving a graph with shifted IDs.
+A DELETE that names the rows it removes (see the roadmap's Phase 4 status) is
+followed too: the column cache keeps the packed vectors of the surviving rows,
+and the HNSW graph drops the dead nodes and renumbers the others, so a re-import
+that deletes a source and inserts its new chunks does not rebuild either
+structure. The graph is rebuilt after a removal of more than 5 percent of its
+nodes, or once more than 10 percent were removed since its last build (the
+count is stored with the persisted graph); the
+column cache is rebuilt once more than 10 percent of its packed vector data
+belongs to deleted rows. Schema changes, deletes that cannot report their rows
+and everything the change log cannot vouch for still rebuild safely rather than
+serving a graph with shifted IDs.
 
-Writes invalidate vector and FTS caches/indexes through the table version. For
+Writes invalidate vector and FTS caches/indexes through the table version, except
+that a DELETE or UPDATE that changes no row (nothing matched, or every assigned
+value equals the stored one) leaves the version alone and invalidates nothing.
+The followers described above work on the table object they were built for: a
+committed explicit transaction that wrote the table, and a DELETE or UPDATE issued
+while a direct SELECT stream is open on it, replace that object, and the next
+search then rebuilds the flat column cache and the HNSW graph (results stay
+correct). A writer that wants the cheap path issues autocommit statements. See
+the roadmap's Phase 4 status for the limits. For
 serving-oriented deployments, prefer:
 
 1. bulk load or rebuild a snapshot;

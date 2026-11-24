@@ -81,8 +81,10 @@ so it never filters a global ANN frontier after candidate selection.
 The HNSW baseline is implemented. `VEC_WARM(..., 'hnsw')` persists a versioned
 graph alongside the table; the next process validates and hydrates that graph
 instead of rebuilding it. Pure appends extend the vector-column cache and HNSW
-topology only for new rows. An update, delete, schema change, incompatible
-format, or incomplete/corrupt topology takes the safe full-rebuild path.
+topology only for new rows. A DELETE is followed in place within the bounds
+described under Phase 4; a schema change, an incompatible format, an
+incomplete/corrupt topology or a removal beyond those bounds takes the safe
+full-rebuild path.
 
 Remaining deliverables:
 
@@ -129,6 +131,169 @@ Deliverables:
 
 Acceptance criterion: query results are transactionally correct throughout a
 mutation/compaction cycle and steady update cost is independent of corpus size.
+
+Status (see [Retrieval maintenance](retrieval-maintenance.md) for the cost model,
+the bounds in one table and the adoption guide): the persistent full-text index now
+follows DELETEs without a rebuild.
+The table keeps an ordered change log of UPDATE and DELETE events
+(`Table.ChangesSince`); a DELETE that names the rows it removed is one event, and
+the next search compacts the document directory, drops the dead documents from
+their posting lists, renumbers the other entries and rebuilds the block bounds of
+the lists that lost entries (three sweeps over the postings behind the first
+removed row, no re-tokenizing of the corpus; the cost grows with the index and
+is worst when the removed row is near the start of the table). Deletes that
+cannot report their rows (no WHERE clause, swap-and-pop point deletes by
+PRIMARY KEY/UNIQUE value, triggers, cascades), schema changes, rolled-back
+deletes, indexes with more than a quarter of obsolete arena entries and indexes
+in which a quarter of the terms are empty lists still rebuild. So does a log that
+overflows: it holds at most 65536 events (every UPDATEd row is one event, a
+DELETE statement one). When it fills, its older half is folded: a run of UPDATEs
+becomes one column summary (it can only vouch that no column the reader depends
+on changed, never which rows), a DELETE is kept whole as a fold of its own, with
+its positions. A structure that missed a DELETE and then any number of
+bookkeeping UPDATEs is therefore still followed, as long as none of the folded
+UPDATEs touched a column it indexes; one that missed an UPDATE of its own column
+inside a fold pays one full rebuild at the next search. At most 64 summaries and
+4096 folds are kept, and at most 2^20 removed positions in log and folds
+together; past a bound the OLDEST folds (then the oldest log blocks) are
+forgotten, and only the stamps older than what was forgotten rebuild. This is
+renumbering, not tombstones, so there is no delta segment to merge.
+
+The flat vector column cache and the HNSW graph follow the same change log (see
+"Vector structures after a DELETE" below), so a hybrid search after a DELETE no
+longer waits for a cold rebuild of either. The RAG context index, the
+ACL-filtered ANN graphs, the IVF index, row twins and subscriptions still
+rebuild after a removal.
+
+#### Vector structures after a DELETE
+
+*Flat column cache.* The new cache entry shares the packed vector arrays of the
+old one and only rebuilds the small per-row arrays (24 bytes of slice header, 8
+of norm and 1 of validity per row, copied in runs between the dead rows), so
+positions stay equal to table positions and no consumer changes. UPDATE
+overrides are renumbered, the UPDATEs of the vector column reported with the
+removal are applied as overrides, and the appended tail becomes a new segment.
+The old entry is never written to, so a search that holds it is unaffected. The
+floats of the dead rows stay in the shared arrays and are counted as garbage per
+segment; once more than 10 percent of the packed floats are garbage, the next
+removal rebuilds the cache (which also resets the count). At most 24 segments
+are kept: beyond that the two smallest neighbours are merged. The memory
+trade-off is up to 10 percent of the vector data (600 MB of a 6 GB column of a
+million 768-dimensional rows) kept allocated for rows that no longer exist, in
+return for not copying the column (2.4 us per row and 6 GB of transient memory
+at 768 dimensions) on every DELETE.
+
+*HNSW graph.* Under the graph's write lock the nodes of the dead rows are
+dropped and every node, edge, delta row and the entry point is renumbered through
+the dead list (a rank table with one prefix count per 256 ids; the edge pass runs
+on all cores); rows appended since are inserted by the existing incremental path.
+Edges that led to dead nodes are dropped, neighbours are not repaired: on
+clustered embeddings recall@10 stayed within one point of a fresh build up to 20
+percent removed (0.988 against 0.998), on isotropic Gaussian vectors, the
+worst case, within 4 points (0.905 against 0.945), and every node stayed
+reachable from the entry point. On source-shaped data (a source is 32 chunks of
+one topic, one source deleted and one inserted per cycle, 17 of 190 sources
+replaced) recall@10 was 0.9925 to 0.9988 against 0.9988 to 1.0 for a fresh build
+and recall@50 0.983 to 0.989 against 0.987 to 0.994. All of this was measured at
+32 dimensions and 6,000 rows; 768 dimensions and a million rows are not
+measured. A graph that loses its entry point picks the
+first scorable node of the highest level. The graph is marked not current while
+it is edited, so a failure or panic in the middle leads to a rebuild, never to a
+half-renumbered graph being served. The followed graph is persisted again, so a
+reopen hydrates a topology with the right numbering; a graph with UPDATE delta
+rows is not persisted (as before) and its stored predecessor, which has the old
+stamp, is never used. The graph is rebuilt once more than 5 percent of its nodes
+are removed by one statement or more than 10 percent since it was last built
+(the count is stored with the persisted topology, so a reopen continues it), or
+when the UPDATEs of the vector
+column exceed the delta bound. The measured recall leaves headroom above both
+bounds, at those sizes only; they are constants (`vecHNSWFollowSinglePercent`,
+`vecHNSWFollowTotalPercent`).
+
+Measured on a laptop (i7-10850H, GOMAXPROCS 4, 768 dimensions, one source of six
+chunks removed, then the first `HYBRID_SEARCH`; medians of three runs of five
+iterations, noisy because the machine was shared):
+
+| | before | after |
+| --- | ---: | ---: |
+| flat, 50,000 rows, DELETE + first search | 63 ms, 312 MB/op | 21 ms, 4.8 MB/op |
+| flat, 100,000 rows | 168 ms, 623 MB/op | 39 ms, 8.8 MB/op |
+| flat, 100 sources in one DELETE, 50,000 rows | 117 ms | 76 ms |
+| column cache refresh alone, 50,000 / 100,000 rows | 60 ms / 316 ms | 0.4 ms / 1.0 ms |
+| HNSW, 10,000 rows, DELETE + first search | 3.9 s | 4.7 ms |
+| HNSW, 20,000 rows | 7.1 s | 7.2 ms |
+| HNSW graph refresh alone, 10,000 / 20,000 rows | 2.3 s / 5.6 s | 2.3 ms / 2.5 ms |
+
+The following figures are projections, not measurements of a real table: they
+come from synthetic benchmarks of the passes alone (one 16-dimensional segment
+without tail, overrides or garbage for the cache; a graph with uniformly random
+links, allocated back to back, for the graph, so a graph grown by inserts will
+be slower to walk). At a million rows the passes alone cost 5.6 ms for the flat
+cache (33 MB allocated, independent of the dimension), 89 ms for the HNSW graph
+(6 dead rows; 101 ms for 600, 157 ms for 30,000) plus 61 ms and 321 MB transient
+for the deep copy that persists it, against a graph rebuild of 380 to 600
+seconds (an estimate supplied to this work, not measured here). The full-text
+follow at a million rows and an end-to-end first HYBRID_SEARCH on a million
+768-dimensional rows in hnsw mode were not measured. What the first search still pays: the flat scan itself
+(O(rows x dimensions)), the full-text follow (the shift of the posting lists
+behind the first removed row, which dominates a removal of many sources), and,
+once per 10 percent of removed graph nodes, one full HNSW rebuild.
+
+The HNSW "after" figures are medians of five iterations and leave out that
+rebuild. Its cost per re-import is constant in the table size (the interval
+grows with the table as the rebuild does): about 0.32 ms per row over 10
+percent of the rows is roughly 19 to 36 ms per re-import of six chunks, four to
+seven times the median at 10,000 rows. The first search that triggers it waits
+for the whole rebuild (minutes at a million rows), and every other search of
+the same graph waits for it. A 400-iteration run at 20,000 rows averaged 15 ms
+per search for this reason.
+
+The figures above were measured before the DELETE statement itself was changed,
+on a benchmark table with no key and no index. The merged code also renumbers the
+secondary indexes in place and takes candidate rows from an index (see
+`insert-update-performance.md`, "What a multi-row DELETE costs"); the statement
+still scans or seeks, copies the row pointer list (24 bytes per row) and marks the
+table for a full WAL record. A DELETE by equality on a primary or unique key is a
+swap-and-pop, which resets the change log and gets none of this (every structure
+of that table rebuilds at its next search); deleting by a non-key column such as
+the source goes through the reporting path. Still rebuilding after a removal,
+deliberately: the RAG context index, the row-filter caches, the ACL-filtered
+graphs, the IVF index, row twins and subscriptions. After a followed removal and
+an append the flat cache has several segments, so the single-segment fast paths
+of the row resolver and of the ACL-filtered scan take the per-row path (a binary
+search over at most 24 segments); that effect is unmeasured and also exists for
+append-only workloads. A window whose removals hit only rows appended after the
+structure was built (insert a source, delete it again, search) has no dead row
+among the indexed ones: the flat cache and the graph are extended over the
+appended rows, as for a window without removals.
+
+Limits of the following, all of which leave results correct and only cost a
+rebuild at the next search: the flat cache and the graph are keyed by the table
+object, so anything that replaces the live object starts them cold. A committed
+explicit transaction that wrote the table installs its private copy of the table
+(autocommit statements do not), and a DELETE or UPDATE issued while a direct
+SELECT stream is open on the table installs a copy without search structures. The
+full-text index survives the first (the transaction's copy carries a deep copy of
+it, which costs O(index) per writing transaction) but not the second. A failed
+statement drops the flat cache, the graphs and the full-text cache of its table;
+a rollback that undoes a logged DELETE resets the change log. Writers that need
+the followers to help issue their DELETEs and UPDATEs as autocommit statements on
+a connection that holds no open stream on the table. The flat cache entries of a
+replaced table object stay in memory until the entry cap (256, 64 for graphs)
+evicts them at random; each pins its packed vectors.
+After a followed removal the graph that picks a new entry point takes the first
+scorable node of the highest level, not a former neighbour of the old entry.
+
+The flat cache is checked against cold builds by a differential fuzz test
+(`vector_cache_follow_test.go`): random statement sequences with NULL, ragged
+and zero vectors, rolled-back statements, transactions and several table
+shapes. The graph has no differential test against a cold build, because its
+answers are approximate by design: `vector_hnsw_follow_test.go` checks the
+invariants, an exact renumbering oracle keyed by the id column (including the
+multi-worker pass), recall and reachability on four corpora, failure
+injection, cancellation, concurrent searches and reopen, and
+`retrieval_maintenance_diff_test.go` keeps the strict comparison with a cold
+build for every window the graph rebuilt.
 
 ### Phase 5 — retrieval quality controls
 

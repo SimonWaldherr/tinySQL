@@ -1722,13 +1722,41 @@ func ftsVisitRowTokens(row []any, cols []int, visit func(string)) {
 
 const ftsPersistentFormat = 2
 
+// ftsPersistentUsable reports whether index can be maintained in place. The
+// shape checks are O(1) and run on every call. The full validation walks every
+// posting list, document and term (O(V+N)); it runs once per index object, after
+// which Verified() holds until something that could damage the structure (a
+// decode, a clone, a mutation that did not finish) resets it. Every in-place
+// mutation below keeps the structure consistent by construction.
 func ftsPersistentUsable(index *storage.FTSIndex, table *storage.Table) bool {
+	if index == nil || index.BuiltRows > len(table.Rows) {
+		return false
+	}
+	return ftsPersistentShapeUsable(index)
+}
+
+// ftsPersistentShapeUsable is ftsPersistentUsable without the requirement that
+// the index covers no more rows than the table has: after a DELETE it does, and
+// the change log says which of them are gone.
+func ftsPersistentShapeUsable(index *storage.FTSIndex) bool {
 	if index == nil || index.Format != ftsPersistentFormat ||
-		index.BuiltRows < 0 || index.BuiltRows > len(table.Rows) || len(index.Docs) != index.BuiltRows ||
+		index.BuiltRows < 0 || len(index.Docs) != index.BuiltRows ||
 		len(index.DocTermIDs) != len(index.DocTermCounts) ||
 		(index.NumDocs > 0 && (index.Postings == nil || index.TermIDs == nil)) {
 		return false
 	}
+	if index.Verified() {
+		return true
+	}
+	if !ftsValidateStructure(index) {
+		return false
+	}
+	index.SetVerified(true)
+	return true
+}
+
+// ftsValidateStructure is the O(V+N) part of ftsPersistentUsable.
+func ftsValidateStructure(index *storage.FTSIndex) bool {
 	for term, rows := range index.Postings {
 		if len(index.PostingCounts[term]) != len(rows) || len(index.PostingBlocks[term]) != (len(rows)+storage.FTSPostingBlockSize-1)/storage.FTSPostingBlockSize {
 			return false
@@ -1748,17 +1776,46 @@ func ftsPersistentUsable(index *storage.FTSIndex, table *storage.Table) bool {
 	return true
 }
 
+// ftsRowTokensUnchanged reports whether tokenizing row over cols yields exactly
+// the token sequence the index holds for it (old). A token whose term the index
+// does not know yet counts as a change.
+func ftsRowTokensUnchanged(index *storage.FTSIndex, row []any, cols []int, old storage.FTSDocument) bool {
+	oldCount := 0
+	var oldTokens []int32
+	if old.Valid {
+		oldCount = int(old.TokenCount)
+		oldTokens = index.DocTokenIDs[old.TokenStart : old.TokenStart+old.TokenCount]
+	}
+	same := true
+	pos := 0
+	ftsVisitRowTokens(row, cols, func(term string) {
+		if !same {
+			return
+		}
+		id, ok := index.TermIDs[term]
+		if !ok || pos >= oldCount || oldTokens[pos] != id {
+			same = false
+			return
+		}
+		pos++
+	})
+	return same && pos == oldCount
+}
+
 // ftsRefreshUpdatedRows applies UPDATE-only changes directly to a persistent
 // index. Document arenas are append-only, but obsolete runs are unlinked from
-// postings and counted for later compaction. DELETE and schema changes cannot
-// use this path because their physical row positions may have shifted.
+// postings and counted for later compaction. It works on row positions as they
+// are now. A DELETE shifts them, so ftsFollowChanges first renumbers the index
+// (ftsApplyRemovals) and hands this function the new positions of the rows that
+// were updated; schema changes and deletes that cannot name their rows still
+// rebuild.
 func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSIndex, rows []int) {
-	termNames := make([]string, len(index.TermIDs))
-	for term, id := range index.TermIDs {
-		if id >= 0 && int(id) < len(termNames) {
-			termNames[id] = term
-		}
-	}
+	// The dense term-name table is kept with the index; rebuilding it from the
+	// TermIDs map on every call cost O(V) however few rows changed. Verified is
+	// dropped while the structure is being edited and restored once it is whole.
+	wasVerified := index.Verified()
+	index.SetVerified(false)
+	termNames := index.TermNames()
 	changedTerms := make(map[string]bool)
 	// Reuse per-document scratch space across the batch without retaining it
 	// in the persistent index or sharing mutable buffers between queries.
@@ -1769,6 +1826,12 @@ func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSI
 			continue
 		}
 		old := index.Docs[ri]
+		// A row whose token sequence is unchanged (an UPDATE that rewrote the
+		// text with itself, or one reported without a column set) needs no
+		// posting edit and leaves no stale run behind.
+		if ftsRowTokensUnchanged(index, table.Rows[ri], cols, old) {
+			continue
+		}
 		if old.Valid {
 			for _, id := range index.DocTermIDs[old.TermStart : old.TermStart+old.TermCount] {
 				if id >= 0 && int(id) < len(termNames) {
@@ -1825,8 +1888,23 @@ func ftsRefreshUpdatedRows(table *storage.Table, cols []int, index *storage.FTSI
 	for term := range changedTerms {
 		ftsRebuildPostingBlocks(index, term, 0)
 	}
+	index.SetTermNames(termNames)
+	index.SetVerified(wasVerified)
 	index.Version = table.Version
 	index.StructVersion = table.StructVersion()
+}
+
+// ftsRefreshRowLimit is how many updated rows of an indexed column are applied
+// to a persistent index in place; more are cheaper to rebuild. Per row the
+// refresh re-tokenizes and moves every touched posting list (0.16 ms at 30k
+// documents, 2-4 ms at 100k-1M), a rebuild costs a fixed amount per document, so
+// the break-even sits near one to a few thousand rows whatever the table size
+// (about 1700 at 30k documents of 150 tokens, 800 at 100k, 3-15k at 1M): a flat
+// 1024 floor keeps moderate rewrites (a re-chunked batch of documents) cheap on
+// mid-size tables, N/256 lets large tables patch more, and a small table never
+// patches more than a quarter of itself.
+func ftsRefreshRowLimit(tableRows int) int {
+	return min(max(1024, tableRows/256), max(64, tableRows/4))
 }
 
 func ftsPersistentNeedsCompaction(index *storage.FTSIndex) bool {
@@ -1847,13 +1925,63 @@ func ftsCacheFromPersistent(table *storage.Table, index *storage.FTSIndex) ftsDo
 }
 
 // ftsPostingBatch collects one term's appended rows before publishing them
-// to the persisted string-keyed maps. start == -1 means the term was untouched.
+// to the persisted string-keyed maps. A nil entry in the batch table means the
+// term was untouched.
 // The scratch lists borrow existing posting storage; the derived-table lock
 // held by getFTSDocCache serializes extension and publication.
 type ftsPostingBatch struct {
 	rows   []int32
 	counts []int32
 	start  int
+}
+
+// ftsTermCounter counts one document's tokens per term id. A bulk extension
+// (or a cold build, whose vocabulary starts empty) indexes it densely like a
+// slice; a small extension of a large index uses a map, because a slice sized
+// to the vocabulary would cost O(V) for a handful of new rows.
+type ftsTermCounter struct {
+	dense  []int32
+	sparse map[int32]int32
+}
+
+func newFTSTermCounter(dense bool, terms int) ftsTermCounter {
+	if dense {
+		return ftsTermCounter{dense: make([]int32, terms)}
+	}
+	return ftsTermCounter{sparse: make(map[int32]int32)}
+}
+
+// addTerm registers one more term id (always len(TermIDs) at the time).
+func (c *ftsTermCounter) addTerm() {
+	if c.sparse == nil {
+		c.dense = append(c.dense, 0)
+	}
+}
+
+// inc counts one token of id and reports whether it was the first of this document.
+func (c *ftsTermCounter) inc(id int32) (first bool) {
+	if c.sparse == nil {
+		c.dense[id]++
+		return c.dense[id] == 1
+	}
+	n := c.sparse[id] + 1
+	c.sparse[id] = n
+	return n == 1
+}
+
+func (c *ftsTermCounter) get(id int32) int32 {
+	if c.sparse == nil {
+		return c.dense[id]
+	}
+	return c.sparse[id]
+}
+
+func (c *ftsTermCounter) clear(id int32) {
+	if c.sparse == nil {
+		c.dense[id] = 0
+		return
+	}
+	delete(c.sparse, id)
 }
 
 // Large cold builds reuse dense term IDs for posting accumulation. Small
@@ -1870,6 +1998,12 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 		index.StructVersion = table.StructVersion()
 		return
 	}
+	// A fresh index is built here from nothing and is whole when this returns;
+	// an existing one keeps whatever verification it had. Either way it is not
+	// verified while it is being edited.
+	wasVerified := index.Verified() ||
+		(index.BuiltRows == 0 && len(index.TermIDs) == 0 && len(index.Docs) == 0 && len(index.Postings) == 0)
+	index.SetVerified(false)
 	changedTerms := make(map[string]int)
 	if index.PostingBlocks == nil {
 		index.PostingBlocks = make(map[string][]storage.FTSPostingBlock)
@@ -1886,10 +2020,6 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 	if len(index.Docs) < len(table.Rows) {
 		index.Docs = append(index.Docs, make([]storage.FTSDocument, len(table.Rows)-len(index.Docs))...)
 	}
-	termNames := make([]string, len(index.TermIDs))
-	for term, id := range index.TermIDs {
-		termNames[id] = term
-	}
 	bulk := len(table.Rows)-start >= ftsDensePostingMinRows
 	// A fresh large index can allocate postings exactly after counting them.
 	// Existing indexes retain the append path and its incremental ownership.
@@ -1901,18 +2031,22 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 			index.Version = table.Version
 			index.StructVersion = table.StructVersion()
 			index.BuiltRows = len(table.Rows)
+			index.SetVerified(wasVerified)
 			return
 		}
 	}
+	// The dense term-name table lives with the index (built once, appended to as
+	// terms appear) instead of being rebuilt from the TermIDs map on every call.
+	termNames := index.TermNames()
 	var postingSizes []int
-	var batches []ftsPostingBatch
+	// One pointer per term id (8 bytes each), grown as terms appear: indexing it is
+	// a slice access per (document, term) and it costs a fraction of the old
+	// vocabulary-sized slice of batch structs.
+	var batches []*ftsPostingBatch
 	if bulk && !packed {
-		batches = make([]ftsPostingBatch, len(index.TermIDs))
-		for i := range batches {
-			batches[i].start = -1
-		}
+		batches = make([]*ftsPostingBatch, len(index.TermIDs))
 	}
-	counts := make([]int32, len(index.TermIDs))
+	counts := newFTSTermCounter(bulk, len(index.TermIDs))
 	var touched []int32
 	for ri := start; ri < len(table.Rows); ri++ {
 		tokenStart := int32(len(index.DocTokenIDs))
@@ -1924,17 +2058,17 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 				id = int32(len(index.TermIDs))
 				index.TermIDs[term] = id
 				termNames = append(termNames, term)
-				counts = append(counts, 0)
+				counts.addTerm()
+				if batches != nil {
+					batches = append(batches, nil)
+				}
 				if packed {
 					postingSizes = append(postingSizes, 0)
-				} else if bulk {
-					batches = append(batches, ftsPostingBatch{start: -1})
 				}
 			}
-			if counts[id] == 0 {
+			if counts.inc(id) {
 				touched = append(touched, id)
 			}
-			counts[id]++
 			index.DocTokenIDs = append(index.DocTokenIDs, id)
 			tokenCount++
 		})
@@ -1944,20 +2078,21 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 		slices.Sort(touched)
 		termStart := int32(len(index.DocTermIDs))
 		for _, id := range touched {
+			count := counts.get(id)
 			index.DocTermIDs = append(index.DocTermIDs, id)
-			index.DocTermCounts = append(index.DocTermCounts, counts[id])
+			index.DocTermCounts = append(index.DocTermCounts, count)
 			term := termNames[id]
 			if packed {
 				postingSizes[id]++
 			} else if bulk {
-				batch := &batches[id]
-				if batch.start < 0 {
-					batch.rows = index.Postings[term]
-					batch.counts = index.PostingCounts[term]
+				batch := batches[id]
+				if batch == nil {
+					batch = &ftsPostingBatch{rows: index.Postings[term], counts: index.PostingCounts[term]}
 					batch.start = len(batch.rows)
+					batches[id] = batch
 				}
 				batch.rows = append(batch.rows, int32(ri))
-				batch.counts = append(batch.counts, counts[id])
+				batch.counts = append(batch.counts, count)
 			} else {
 				postings := index.Postings[term]
 				// Rows are appended in physical order. A tail before this batch
@@ -1966,9 +2101,9 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 					changedTerms[term] = len(postings)
 				}
 				index.Postings[term] = append(postings, int32(ri))
-				index.PostingCounts[term] = append(index.PostingCounts[term], counts[id])
+				index.PostingCounts[term] = append(index.PostingCounts[term], count)
 			}
-			counts[id] = 0
+			counts.clear(id)
 		}
 		index.Docs[ri] = storage.FTSDocument{
 			TermStart: termStart, TermCount: int32(len(touched)),
@@ -1993,7 +2128,7 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 		ftsBuildPackedPostings(index, termNames, postingSizes)
 	} else if bulk {
 		for id, batch := range batches {
-			if batch.start < 0 {
+			if batch == nil {
 				continue
 			}
 			term := termNames[id]
@@ -2006,10 +2141,12 @@ func ftsExtendPersistent(table *storage.Table, cols []int, index *storage.FTSInd
 			ftsRebuildPostingBlocks(index, term, start)
 		}
 	}
+	index.SetTermNames(termNames)
 	index.Format = ftsPersistentFormat
 	index.Version = table.Version
 	index.StructVersion = table.StructVersion()
 	index.BuiltRows = len(table.Rows)
+	index.SetVerified(wasVerified)
 }
 
 // ftsBuildPackedPostings transposes fresh document runs into exact-sized
@@ -2117,38 +2254,51 @@ func getFTSDocCacheKeyed(tenant string, table *storage.Table, colsKey string, co
 		ftsDocCacheBuildHook()
 	}
 
-	table.DerivedLock()
-	index := table.FTSIndexes[key.cols]
-	changed := false
-	if !ftsPersistentUsable(index, table) {
-		index = &storage.FTSIndex{}
-		changed = true
-	}
-	if !changed && index.StructVersion != table.StructVersion() {
-		rows, ok := table.UpdatedRowsSince(index.StructVersion)
-		if !ok {
+	// The lock is released by a deferred call: following a change edits the index in
+	// place and a panic in there (a damaged index, say) is recovered further up and
+	// must not leave the table's derived-data lock held. The half-edited index is
+	// stamped as not current, so the next search rebuilds it.
+	index := func() *storage.FTSIndex {
+		table.DerivedLock()
+		defer table.DerivedUnlock()
+		index := table.FTSIndexes[key.cols]
+		changed := false
+		pending := index != nil && index.StructVersion != table.StructVersion()
+		// An index that has to follow changes may cover more rows than the table has
+		// (a DELETE removed some); the change log accounts for them below.
+		usable := ftsPersistentUsable(index, table)
+		if pending {
+			usable = ftsPersistentShapeUsable(index)
+		}
+		if !usable {
 			index = &storage.FTSIndex{}
 			changed = true
-		} else {
-			ftsRefreshUpdatedRows(table, cols, index, rows)
-			changed = true
-			if ftsPersistentNeedsCompaction(index) {
-				index = &storage.FTSIndex{}
-			}
 		}
-	}
-	if changed || index.Version != table.Version || index.BuiltRows != len(table.Rows) {
-		ftsExtendPersistent(table, cols, index)
-		changed = true
-	}
-	if table.FTSIndexes == nil {
-		table.FTSIndexes = make(map[string]*storage.FTSIndex)
-	}
-	table.FTSIndexes[key.cols] = index
-	if changed {
-		table.MarkFTSIndexesChanged()
-	}
-	table.DerivedUnlock()
+		if !changed && pending {
+			// What happened to the rows this index covers: UPDATEs of an indexed text
+			// column and DELETEs change it (rows whose delta names other columns, a
+			// bookkeeping timestamp say, are not reported, so a touch batch of any size
+			// costs nothing here). Anything the log cannot vouch for rebuilds.
+			changes, ok := table.ChangesSince(index.StructVersion, index.BuiltRows, storage.ColumnMask(cols...))
+			// Persistence needs the change mark even when nothing indexed changed,
+			// because the stored index otherwise keeps an older stamp and a reopen
+			// could no longer prove it current.
+			index = ftsFollowChanges(table, cols, index, changes, ok)
+			changed = true
+		}
+		if changed || index.Version != table.Version || index.BuiltRows != len(table.Rows) {
+			ftsExtendPersistent(table, cols, index)
+			changed = true
+		}
+		if table.FTSIndexes == nil {
+			table.FTSIndexes = make(map[string]*storage.FTSIndex)
+		}
+		table.FTSIndexes[key.cols] = index
+		if changed {
+			table.MarkFTSIndexesChanged()
+		}
+		return index
+	}()
 	entry := ftsCacheFromPersistent(table, index)
 	ftsDocCacheMu.Lock()
 	if _, exists := ftsDocCache[key]; !exists {
@@ -2568,11 +2718,16 @@ func ftsInsertCountedPosting(rows, counts []int32, row, count int32) ([]int32, [
 // Only a partial final block and appended blocks need rebuilding on INSERT.
 // UPDATE can shift posting offsets, so affected terms rebuild from block zero.
 func ftsRebuildPostingBlocks(index *storage.FTSIndex, term string, start int) {
-	rows := index.Postings[term]
-	counts := index.PostingCounts[term]
+	index.PostingBlocks[term] = ftsPostingBlocksFrom(index.Docs, index.Postings[term], index.PostingCounts[term], index.PostingBlocks[term], start)
+}
+
+// ftsPostingBlocksFrom returns the block bounds of one posting list (rows with
+// their counts) from the block holding entry start on; earlier blocks are taken
+// from blocks as they are. It reads docs and writes only blocks (reused when it
+// has the capacity), so lists can be processed concurrently.
+func ftsPostingBlocksFrom(docs []storage.FTSDocument, rows, counts []int32, blocks []storage.FTSPostingBlock, start int) []storage.FTSPostingBlock {
 	size := storage.FTSPostingBlockSize
 	n := (len(rows) + size - 1) / size
-	blocks := index.PostingBlocks[term]
 	if cap(blocks) < n {
 		next := make([]storage.FTSPostingBlock, n)
 		copy(next, blocks)
@@ -2584,9 +2739,13 @@ func ftsRebuildPostingBlocks(index *storage.FTSIndex, term string, start int) {
 		block := storage.FTSPostingBlock{MinDocLen: math.Inf(1)}
 		for i := b * size; i < min((b+1)*size, len(rows)); i++ {
 			block.MaxFrequency = max(block.MaxFrequency, counts[i])
-			block.MinDocLen = math.Min(block.MinDocLen, index.Docs[rows[i]].DocLen)
+			// Document lengths are whole token counts, so a plain comparison is
+			// math.Min without its NaN and signed-zero handling.
+			if length := docs[rows[i]].DocLen; length < block.MinDocLen {
+				block.MinDocLen = length
+			}
 		}
 		blocks[b] = block
 	}
-	index.PostingBlocks[term] = blocks
+	return blocks
 }

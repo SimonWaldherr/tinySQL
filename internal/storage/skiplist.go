@@ -362,6 +362,84 @@ func (s *SkipList) Clone() *SkipList {
 	return out
 }
 
+// renumberAfterRemoval applies the row-position change of a DELETE to the list
+// in place: removed holds the deleted positions, strictly ascending and in the
+// numbering from before the statement. Every removed position disappears from the
+// row ID runs, and every surviving position drops by the number of removed
+// positions below it, which is exactly the renumbering of a table whose rows
+// closed up. Keys whose run became empty are unlinked, so the list ends up equal
+// to one rebuilt from the compacted table.
+//
+// It is one walk along level 0 and allocates nothing: runs are compacted in their
+// own backing arrays (they are private to this list, see Clone) and unlinked
+// nodes are skipped by the same "last node seen per level" relinking Clone uses.
+// A caller that shares the list with another index must copy it first
+// (SecondaryIndex.hydrateForWrite).
+//
+// The journal of the list is abandoned: replaying a renumbering as individual
+// inserts and removals would cost more than the copy a twin saves.
+func (s *SkipList) renumberAfterRemoval(removed []int) {
+	if len(removed) == 0 {
+		return
+	}
+	first := removed[0]
+	var last [skipListMaxLevel]*skipListNode
+	for i := range last {
+		last[i] = s.head
+	}
+	length := 0
+	for x := s.head.forward[0]; x != nil; {
+		next := x.forward[0]
+		// Runs are ascending, so a node whose largest position is below the first
+		// removed one is untouched: it keeps its place and its numbers.
+		if n := len(x.rowIDs); n == 0 || x.rowIDs[n-1] >= first {
+			x.rowIDs = renumberRowIDsAfterRemoval(x.rowIDs, removed)
+		}
+		if len(x.rowIDs) > 0 {
+			length++
+			for i := range x.forward {
+				if last[i].forward[i] != x {
+					last[i].forward[i] = x
+				}
+				last[i] = x
+			}
+		}
+		x = next
+	}
+	for i := range last {
+		if last[i].forward[i] != nil {
+			last[i].forward[i] = nil
+		}
+	}
+	for s.level > 1 && s.head.forward[s.level-1] == nil {
+		s.level--
+	}
+	s.length = length
+	s.mutations++
+	s.stopJournal()
+}
+
+// renumberRowIDsAfterRemoval compacts the ascending run ids in place: positions
+// in removed (strictly ascending) are dropped and every other position is reduced
+// by the number of removed positions below it. It returns the shortened run.
+func renumberRowIDsAfterRemoval(ids, removed []int) []int {
+	out, pos := 0, 0
+	for _, id := range ids {
+		// pos is the number of removed positions below id. The run ascends, so it
+		// only ever moves forward; a binary search keeps a sparse run cheap when
+		// many positions were removed in between.
+		if pos < len(removed) && removed[pos] < id {
+			pos += sort.SearchInts(removed[pos:], id)
+		}
+		if pos < len(removed) && removed[pos] == id {
+			continue
+		}
+		ids[out] = id - pos
+		out++
+	}
+	return ids[:out]
+}
+
 // Range walks entries in ascending key order starting at the first key >=
 // startKey (an empty/nil startKey starts at the very first entry), calling
 // fn for each one. fn's key and rowIDs alias internal storage exactly like

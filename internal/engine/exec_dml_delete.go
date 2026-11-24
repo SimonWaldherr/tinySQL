@@ -116,14 +116,30 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 		if len(s.Returning) > 0 {
 			keys = newTableRowKeys(t.Cols, strings.ToLower(s.Table)+".")
 		}
-		// Most no-match scans do not need an output slice or a position map.
-		// Allocate them only after the first deletion; rows before it retain
-		// their original positions.
+		// Most no-match scans do not need an output slice. Allocate it only
+		// after the first deletion; rows before it retain their original
+		// positions.
 		var kept [][]any
-		var oldToNew map[int]int
+		// removed lists the deleted positions. They renumber the secondary
+		// indexes (a survivor moves down by the number of removed rows before
+		// it, so no old-to-new map over the whole table is needed) and feed
+		// Table.MarkRowsRemoved.
+		var removed []int
 		del := 0
-		for i, r := range t.Rows {
-			if i&63 == 0 {
+		// A secondary index can name the rows the predicate has to be evaluated on
+		// (see deleteCandidateRows); the scan stays the default.
+		candidates, indexed := deleteCandidateRows(t, colIndex, s.Where)
+		visit := len(t.Rows)
+		if indexed {
+			visit = len(candidates)
+		}
+		for n := 0; n < visit; n++ {
+			i := n
+			if indexed {
+				i = candidates[n]
+			}
+			r := t.Rows[i]
+			if n&63 == 0 {
 				if err := checkCtx(env.ctx); err != nil {
 					return nil, err
 				}
@@ -145,39 +161,40 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 				if len(s.Returning) > 0 {
 					returningRows = append(returningRows, buildTableRow(keys, r))
 				}
-				if del == 0 {
-					kept = make([][]any, i, len(t.Rows)-1)
+				if del == 0 && !indexed {
+					kept = make([][]any, i, len(t.Rows)-1+deleteSpareRows(len(t.Rows)))
 					copy(kept, t.Rows[:i])
-					if len(t.Indexes) != 0 {
-						oldToNew = make(map[int]int, len(t.Rows)-1)
-						for j := 0; j < i; j++ {
-							oldToNew[j] = j
-						}
-					}
 				}
+				removed = append(removed, i)
 				del++
-			} else if del > 0 {
-				if oldToNew != nil {
-					oldToNew[i] = len(kept)
-				}
+			} else if del > 0 && !indexed {
 				kept = append(kept, r)
 			}
+		}
+		if indexed && del > 0 {
+			kept = rowsWithout(t.Rows, removed)
 		}
 		if err := wal.commit(); err != nil {
 			return nil, err
 		}
-		t.Version++
 		// A predicate that matched nothing left kept byte-for-byte identical
-		// to t.Rows and oldToNew as the identity mapping -- skip the row-slice
-		// swap and the full index rebuild in that case, the same way UPDATE
-		// already avoids re-touching a table it didn't change (see this
-		// file's UPDATE path) and executeConstraintPointDelete already gates
-		// its own reindex on having actually removed a row.
+		// to t.Rows -- skip the row-slice swap, the index renumbering and the
+		// version bump in that case, the same way UPDATE avoids re-touching a
+		// table it didn't change (see this file's UPDATE path) and
+		// executeConstraintPointDelete gates its own reindex on having actually
+		// removed a row. A version bump for a statement that changed nothing
+		// would invalidate every cache keyed on it, the full-text and vector
+		// structures included.
 		if del > 0 {
+			t.Version++
 			t.Rows = kept
-			t.ReindexSecondaryIndexRows(oldToNew)
+			if err := renumberIndexesAfterDelete(t, removed); err != nil {
+				return nil, err
+			}
 			t.InvalidateStats()
-			t.MarkDirtyFrom(-1)
+			// The statement named every row it removed, so derived full-text
+			// structures can renumber instead of rebuilding.
+			t.MarkRowsRemoved(removed)
 			markDependentMaterializedViewsStale(env, s.Table)
 		}
 		if len(s.Returning) > 0 {
@@ -188,8 +205,16 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 
 	// Slow path: triggers present or complex predicate – build full Row maps.
 	kept := make([][]any, 0, len(t.Rows))
-	oldToNew := make(map[int]int, len(t.Rows))
 	del := 0
+	// Triggers can observe and change the table while the scan runs, so a delete
+	// that has any cannot claim to know which rows left: it keeps the full
+	// invalidation and the old-to-new map that renumbers the indexes. Otherwise
+	// the removed positions are reported and renumber the indexes in place.
+	var removed []int
+	var oldToNew map[int]int
+	if hasTriggers {
+		oldToNew = make(map[int]int, len(t.Rows))
+	}
 	returningRows := make([]Row, 0)
 	tablePrefix := strings.ToLower(s.Table) + "."
 	keys := newTableRowKeys(t.Cols, tablePrefix)
@@ -209,7 +234,9 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			match = toTri(v) == tvTrue
 		}
 		if !match {
-			oldToNew[i] = len(kept)
+			if hasTriggers {
+				oldToNew[i] = len(kept)
+			}
 			kept = append(kept, r)
 		} else {
 			if hasBeforeDel {
@@ -228,25 +255,72 @@ func executeDelete(env ExecEnv, s *Delete) (*ResultSet, error) {
 			if len(s.Returning) > 0 {
 				returningRows = append(returningRows, row)
 			}
+			if !hasTriggers {
+				removed = append(removed, i)
+			}
 			del++
 		}
 	}
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}
-	t.Version++
 	// See the raw-predicate fast path above for why this is gated on del > 0.
 	if del > 0 {
+		t.Version++
 		t.Rows = kept
-		t.ReindexSecondaryIndexRows(oldToNew)
+		if hasTriggers {
+			t.ReindexSecondaryIndexRows(oldToNew)
+		} else if err := renumberIndexesAfterDelete(t, removed); err != nil {
+			return nil, err
+		}
 		t.InvalidateStats()
-		t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
+		if hasTriggers {
+			t.MarkDirtyFrom(-1) // DELETE is non-append; force full-table WAL
+		} else {
+			t.MarkRowsRemoved(removed)
+		}
 		markDependentMaterializedViewsStale(env, s.Table)
 	}
 	if len(s.Returning) > 0 {
 		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
 	}
 	return &ResultSet{Cols: []string{"deleted"}, Rows: []Row{{"deleted": del}}}, nil
+}
+
+// renumberIndexesAfterDelete brings t's secondary indexes up to date after a
+// DELETE that removed exactly the rows at removed (strictly ascending, in the
+// numbering from before the statement) and has already installed the compacted
+// t.Rows. The indexes are renumbered in place. A list that does not look like a
+// removal (the executor never produces one) is not trusted: the indexes are
+// rebuilt from the rows, which is always correct.
+func renumberIndexesAfterDelete(t *storage.Table, removed []int) error {
+	if len(t.Indexes) == 0 || len(removed) == 0 {
+		return nil
+	}
+	if t.RenumberSecondaryIndexRowsAfterRemoval(removed) {
+		return nil
+	}
+	return t.RebuildSecondaryIndexes()
+}
+
+// deleteSpareRows is the room the compacted row slice of a DELETE keeps for the
+// rows that are inserted next. An importer replaces a source by inserting its new
+// rows and deleting the old ones, so the following INSERT would otherwise find a
+// slice with no spare capacity and copy every row header (24 bytes per row, 24 MB
+// at a million rows) while it holds the write lock. About 3 percent is reserved.
+func deleteSpareRows(n int) int { return n/32 + 64 }
+
+// rowsWithout returns a new slice of rows without the positions in removed
+// (strictly ascending). The statement snapshot aliases the old backing array, so
+// the survivors are copied rather than compacted in place.
+func rowsWithout(rows [][]any, removed []int) [][]any {
+	kept := make([][]any, 0, len(rows)-len(removed)+deleteSpareRows(len(rows)))
+	from := 0
+	for _, p := range removed {
+		kept = append(kept, rows[from:p]...)
+		from = p + 1
+	}
+	return append(kept, rows[from:]...)
 }
 
 func executeConstraintPointDelete(env ExecEnv, s *Delete, table *storage.Table, wal *walAuto, colIndex map[string]int, rowIDs []int) (*ResultSet, error) {
@@ -309,13 +383,13 @@ func executeConstraintPointDelete(env ExecEnv, s *Delete, table *storage.Table, 
 		table.Rows[deleteRowID] = lastRow
 		table.Rows[last] = nil
 		table.Rows = table.Rows[:last]
+		table.Version++
 		table.InvalidateStats()
 		table.MarkDirtyFrom(-1)
 		markDependentMaterializedViewsStale(env, s.Table)
 	}
-	// Preserve DELETE's established version semantics: a successfully executed
-	// predicate advances the table version even when it matches no row.
-	table.Version++
+	// A predicate that matched no row changed nothing, so the version stays:
+	// see the same gate in executeDelete.
 	deleted := 0
 	if deleteRowID >= 0 {
 		deleted = 1

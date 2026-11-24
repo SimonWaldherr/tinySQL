@@ -100,6 +100,11 @@ type vecHNSWIndex struct {
 	// set exactly and merges it into the ANN top-k. A full rebuild clears it.
 	deltaRows []int
 	deltaSet  map[int]struct{}
+	// removed counts the graph nodes dropped by followed removals since the graph
+	// was last built from scratch (stored with the topology, so a reopened graph
+	// continues the count). It bounds how far a graph may drift from a fresh build,
+	// see followVecHNSWIndex.
+	removed int
 	// mu guards every field above against extendVecHNSWIndex mutating an
 	// already-published graph (see getVecHNSWIndex) while a concurrent
 	// search() call is reading it. A freshly built graph (buildVecHNSWIndex)
@@ -791,16 +796,19 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 
 		vecHNSWCacheMu.Lock()
 		idx = vecHNSWCache[key]
-		if idx != nil && idx.table == table && idx.dims == dims && idx.versionMatches(table.Version) {
-			vecHNSWCacheMu.Unlock()
-			return idx, nil
-		}
+		// A build in flight is looked at first: it holds idx.mu for writing while it
+		// edits the graph, and waiting for that lock with the cache lock held would
+		// stall the lookups of every other table.
 		if call := vecHNSWBuilds[key]; call != nil {
 			vecHNSWCacheMu.Unlock()
 			if err := waitVecIndexBuild(ctx, call.done); err != nil {
 				return nil, err
 			}
 			continue
+		}
+		if idx != nil && idx.table == table && idx.dims == dims && idx.versionMatches(table.Version) {
+			vecHNSWCacheMu.Unlock()
+			return idx, nil
 		}
 
 		// A runtime cache miss after reopening no longer has to mean a graph
@@ -827,28 +835,39 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 		// the incremental-append/full-rebuild-on-anything-else split already
 		// used for constraintIndexes (exec_dml_insert.go): appends are cheap
 		// to absorb, everything else re-derives the whole structure.
-		updatedRows, canRefresh := vecHNSWRefreshRows(idx, table, dims)
-		if canExtendVecHNSWIndex(idx, table, dims) || canRefresh {
+		updatedRows, canRefresh, canRestamp := vecHNSWRefreshRows(idx, table, colIdx, dims)
+		if canExtendVecHNSWIndex(idx, table, dims) || canRefresh || canRestamp {
 			call := &vecIndexBuildCall{done: make(chan struct{})}
 			vecHNSWBuilds[key] = call
 			vecHNSWCacheMu.Unlock()
+			return extendVecHNSWPass(ctx, key, call, idx, table, colIdx, metric, cache, updatedRows, canRefresh, canRestamp)
+		}
 
-			idx.mu.Lock()
-			err := extendVecHNSWIndex(ctx, idx, cache)
-			if err == nil {
-				if canRefresh {
-					idx.addDeltaRows(updatedRows)
+		call := &vecIndexBuildCall{done: make(chan struct{})}
+		vecHNSWBuilds[key] = call
+		vecHNSWCacheMu.Unlock()
+
+		// Rows the change log reports as removed can be dropped from the graph in
+		// place: the other nodes are renumbered and the edges to dead nodes go.
+		// The log is composed here, with the cache lock released: for a long window
+		// that takes a while and must not hold up the other tables.
+		if changes, ok := vecHNSWRemovalChanges(idx, table, colIdx, dims); ok && len(changes.Dead) == 0 {
+			// The window removed rows, but none the graph covers (appended since and
+			// deleted again): the graph is exactly as valid as before, and the
+			// window is the append-and-update case after all.
+			return extendVecHNSWPass(ctx, key, call, idx, table, colIdx, metric, cache, changes.Updated, len(changes.Updated) > 0, len(changes.Updated) == 0)
+		} else if ok {
+			followed, err := followVecHNSWIndex(ctx, idx, table, cache, changes)
+			if followed && err == nil {
+				idx.mu.RLock()
+				hasDeltas := len(idx.deltaRows) != 0
+				idx.mu.RUnlock()
+				// The stored topology still has the old node numbers and the old
+				// stamp, so a reopen would reject it: store the followed graph. As
+				// after an UPDATE, a graph with delta rows is not persisted.
+				if !hasDeltas {
+					persistVecHNSWIndex(table, colIdx, metric, idx)
 				}
-				idx.version = table.Version
-				idx.structVersion = table.StructVersion()
-			}
-			hasDeltas := len(idx.deltaRows) != 0
-			idx.mu.Unlock()
-			// A delta graph is correct at runtime because search merges deltaRows
-			// exactly. Persisting only its stale topology would lose that merge
-			// after reopen, so persistence resumes after the next compact rebuild.
-			if err == nil && !hasDeltas {
-				persistExtendedVecHNSWIndex(table, colIdx, metric, idx)
 			}
 
 			vecHNSWCacheMu.Lock()
@@ -858,12 +877,11 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 			if err != nil {
 				return nil, err
 			}
-			return idx, nil
+			if followed {
+				return idx, nil
+			}
+			continue // stamped as not current: the next pass rebuilds it
 		}
-
-		call := &vecIndexBuildCall{done: make(chan struct{})}
-		vecHNSWBuilds[key] = call
-		vecHNSWCacheMu.Unlock()
 
 		newIdx, err := buildVecHNSWIndex(ctx, table, metric, dims, cache)
 		if err == nil {
@@ -882,6 +900,49 @@ func getVecHNSWIndex(ctx context.Context, tenant string, table *storage.Table, c
 		vecHNSWCacheMu.Unlock()
 		return newIdx, err
 	}
+}
+
+// extendVecHNSWPass grows idx over the rows appended since it was stamped,
+// registers the rows whose vectors were updated as delta rows, stamps it current
+// and settles the persisted topology. call is the build registered under key; it
+// is released here. The caller has dropped the cache lock.
+func extendVecHNSWPass(ctx context.Context, key vecIndexCacheKey, call *vecIndexBuildCall, idx *vecHNSWIndex, table *storage.Table, colIdx int, metric string, cache vecSearchColumnCacheEntry, updatedRows []int, canRefresh, canRestamp bool) (*vecHNSWIndex, error) {
+	idx.mu.Lock()
+	err := extendVecHNSWIndex(ctx, idx, cache)
+	restampFrom := -1
+	if err == nil {
+		if canRefresh {
+			idx.addDeltaRows(updatedRows)
+		}
+		if canRestamp && len(idx.deltaRows) == 0 {
+			restampFrom = idx.structVersion
+		}
+		idx.version = table.Version
+		idx.structVersion = table.StructVersion()
+	}
+	hasDeltas := len(idx.deltaRows) != 0
+	idx.mu.Unlock()
+	if restampFrom >= 0 {
+		// Keep the persisted topology usable: it is stamped with the
+		// structVersion it was current at, and a reopen only accepts a
+		// graph stamped with the table's present one.
+		restampPersistedVecHNSW(table, colIdx, metric, restampFrom, table.StructVersion())
+	}
+	// A delta graph is correct at runtime because search merges deltaRows
+	// exactly. Persisting only its stale topology would lose that merge
+	// after reopen, so persistence resumes after the next compact rebuild.
+	if err == nil && !hasDeltas {
+		persistExtendedVecHNSWIndex(table, colIdx, metric, idx)
+	}
+
+	vecHNSWCacheMu.Lock()
+	delete(vecHNSWBuilds, key)
+	close(call.done)
+	vecHNSWCacheMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return idx, nil
 }
 
 // versionMatches reports whether idx.version equals v, under idx.mu.
@@ -934,21 +995,29 @@ func canExtendVecHNSWIndex(idx *vecHNSWIndex, table *storage.Table, dims int) bo
 // Every read of idx's mutable fields below holds idx.mu (see versionMatches
 // for why): table.UpdatedRowsSince between the two RLock sections touches
 // only table, never idx, so it is safe to run without idx.mu held.
-func vecHNSWRefreshRows(idx *vecHNSWIndex, table *storage.Table, dims int) ([]int, bool) {
+//
+// Only an UPDATE of the indexed vector column (colIdx) counts. restamp reports
+// that the table's structVersion moved solely through updates of other columns
+// since idx was stamped: the graph is exactly as valid as before and only needs
+// its stamps (and the rows appended in between) brought forward.
+func vecHNSWRefreshRows(idx *vecHNSWIndex, table *storage.Table, colIdx, dims int) (rows []int, ok, restamp bool) {
 	if idx == nil || idx.table != table || idx.dims != dims {
-		return nil, false
+		return nil, false, false
 	}
 	idx.mu.RLock()
 	levelsFit := len(idx.levels) <= len(table.Rows)
 	structVersion := idx.structVersion
 	idx.mu.RUnlock()
 	if !levelsFit {
-		return nil, false
+		return nil, false, false
 	}
 
-	rows, ok := table.UpdatedRowsSince(structVersion)
-	if !ok || len(rows) == 0 {
-		return nil, false
+	rows, valid := table.UpdatedRowsSinceCols(structVersion, storage.ColumnBit(colIdx))
+	if !valid {
+		return nil, false, false
+	}
+	if len(rows) == 0 {
+		return nil, false, structVersion != table.StructVersion()
 	}
 
 	idx.mu.RLock()
@@ -967,9 +1036,9 @@ func vecHNSWRefreshRows(idx *vecHNSWIndex, table *storage.Table, dims int) ([]in
 		limit = 1024
 	}
 	if unique > limit {
-		return nil, false
+		return nil, false, false
 	}
-	return rows, true
+	return rows, true, false
 }
 
 func (idx *vecHNSWIndex) addDeltaRows(rows []int) {
@@ -1254,7 +1323,13 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	if idx.entry < 0 {
-		return nil, nil
+		if len(idx.deltaRows) == 0 {
+			return nil, nil
+		}
+		// No node can start a graph search, but rows UPDATEd since the build may hold
+		// vectors the graph never linked (their rows were NULL, or the last node was
+		// removed): only the exact scan finds them.
+		return idx.searchFlat(ctx, query, queryNorm, k, cache)
 	}
 	// Each physical row contributes at most one hit. This request would
 	// always fall back to a flat scan after traversing the graph.
@@ -1275,7 +1350,10 @@ func (idx *vecHNSWIndex) search(ctx context.Context, query []float64, queryNorm 
 		// candidates is sorted nearest first and owned by scratch.
 		return append([]vecScoredRow(nil), candidates[:k]...), nil
 	}
-	if len(idx.deltaRows) != 0 {
+	// A graph that found no row at all (its entry row cannot be scored) says nothing
+	// about the table: with delta rows the merge below would answer from those alone,
+	// so the exact scan answers instead.
+	if len(idx.deltaRows) != 0 && len(candidates) > 0 {
 		// Graph candidates are distinct and already scored against current
 		// vectors. The best k graph rows suffice even after adding updates.
 		// Reset visitation marks to record only those candidates, so updates

@@ -58,6 +58,9 @@ current behavior and keep performance claims scoped to the workload they measure
   filtering, evaluation, and operations.
 - [RAG optimization roadmap](rag-optimization-roadmap.md) — implemented baseline
   and planned retrieval work.
+- [Retrieval maintenance](retrieval-maintenance.md) — cost model, bounds and
+  adoption guide for continuously re-imported RAG tables: what a write costs the
+  next search, how `Sync` behaves, and how to reproduce the measurements.
 - [IVF training](ivf-training-performance.md) — e-means research, reproducible
   initialization, exact convergence and retrieval-quality measurements.
 - [Exact vector pruning and selection](vector-pruning-selection.md) —

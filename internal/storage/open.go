@@ -65,6 +65,19 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 	if cfg.ReadOnly && (cfg.Mode == ModeWAL || cfg.Mode == ModeAdvancedWAL) {
 		return nil, fmt.Errorf("read-only open is not supported for %s; use a checkpointed disk, index, hybrid, or json artifact", cfg.Mode)
 	}
+	// RowBlockFiles exists to lift the 8 GiB single-message limit and the
+	// whole-table encode buffer. Where the layout cannot be used (an encrypted
+	// file is one AEAD blob; JSON files are one document) that promise would be
+	// broken silently, so refuse instead of ignoring the option. (Modes that
+	// have no table files at all ignore it, as they ignore every file option.)
+	if cfg.RowBlockFiles {
+		switch {
+		case cfg.Mode == ModeJSON:
+			return nil, fmt.Errorf("RowBlockFiles is not supported with %s: JSON table files are one document; use ModeDisk, ModeHybrid or ModeIndex", cfg.Mode)
+		case len(cfg.EncryptionKey) > 0 && (cfg.Mode == ModeDisk || cfg.Mode == ModeIndex || cfg.Mode == ModeHybrid):
+			return nil, fmt.Errorf("RowBlockFiles is not supported together with EncryptionKey: an encrypted table file is one AEAD message and keeps the single-message size limit")
+		}
+	}
 	// Persistent read-only modes must never turn a typo or missing artifact
 	// into a newly created directory. NewDiskBackend normally creates its root
 	// for import workflows, so validate before it is constructed.
@@ -199,6 +212,8 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			return nil, err
 		}
 		backend.SetReadOnly(cfg.ReadOnly)
+		backend.SetSkipSearchIndexPersistence(cfg.SkipSearchIndexPersistence)
+		backend.SetRowBlockFiles(cfg.RowBlockFiles)
 		db.backend = backend
 
 	case ModeJSON:
@@ -213,6 +228,7 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			return nil, err
 		}
 		backend.SetReadOnly(cfg.ReadOnly)
+		backend.SetSkipSearchIndexPersistence(cfg.SkipSearchIndexPersistence)
 		db.backend = backend
 
 	case ModeIndex:
@@ -231,6 +247,8 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			return nil, err
 		}
 		backend.SetReadOnly(cfg.ReadOnly)
+		backend.SetSkipSearchIndexPersistence(cfg.SkipSearchIndexPersistence)
+		backend.SetRowBlockFiles(cfg.RowBlockFiles)
 		db.backend = backend
 
 	case ModeHybrid:
@@ -249,6 +267,8 @@ func OpenDB(cfg StorageConfig) (*DB, error) {
 			return nil, err
 		}
 		backend.SetReadOnly(cfg.ReadOnly)
+		backend.SetSkipSearchIndexPersistence(cfg.SkipSearchIndexPersistence)
+		backend.SetRowBlockFiles(cfg.RowBlockFiles)
 		db.backend = backend
 
 	case ModePagedIndex:

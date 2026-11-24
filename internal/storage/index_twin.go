@@ -18,8 +18,12 @@ import "reflect"
 //
 // A twin is dropped, never trusted, when its journal overflowed
 // (skipListJournalMax), when the index's list was replaced wholesale (rebuilds,
-// DELETE compaction, statement rollback), or when another index may still read
-// the list that would be recycled (SkipList.sharers).
+// statement rollback), when it was renumbered in place by a DELETE
+// (RenumberSecondaryIndexRowsAfterRemoval keeps the list's identity, so it
+// invalidates the bookkeeping explicitly: SkipList.stopJournal ends the journal,
+// the mutation counter moves, and the index forgets its twin and returned list),
+// or when another index may still read the list that would be recycled
+// (SkipList.sharers).
 
 // skipListTwin is a spare skip list: list equals of with of's journal undone.
 type skipListTwin struct {

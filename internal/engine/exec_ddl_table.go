@@ -137,7 +137,9 @@ func executeCreateIndex(env ExecEnv, s *CreateIndex) (*ResultSet, error) {
 		return nil, err
 	}
 	t.Version++
-	t.MarkDirtyFrom(-1)
+	// No row changed: dirty for persistence and the WAL, but keep structVersion
+	// so the full-text and vector structures are not invalidated.
+	t.MarkDirtyKeepingRows()
 	return nil, nil
 }
 
@@ -156,7 +158,7 @@ func executeDropIndex(env ExecEnv, s *DropIndex) (*ResultSet, error) {
 	if t, err := env.db.Get(env.tenant, idx.Table); err == nil {
 		t.DropSecondaryIndex(name)
 		t.Version++
-		t.MarkDirtyFrom(-1)
+		t.MarkDirtyKeepingRows()
 	}
 	return nil, env.db.Catalog().DeleteIndexForTenant(env.tenant, schema, name)
 }

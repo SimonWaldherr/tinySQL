@@ -245,10 +245,8 @@ func (db *DB) Drop(tn, name string) error {
 		return db.noSuchTableError(tn, name)
 	}
 
-	if db.backend != nil && onDisk {
-		if err := db.backend.DeleteTable(tn, name); err != nil {
-			return fmt.Errorf("backend delete %s/%s: %w", tn, name, err)
-		}
+	if err := db.dropFromBackend(tn, name, onDisk); err != nil {
+		return fmt.Errorf("backend delete %s/%s: %w", tn, name, err)
 	}
 	return nil
 }
@@ -314,4 +312,33 @@ func (db *DB) ListTables(tn string) []*Table {
 	}
 	db.mu.RUnlock()
 	return out
+}
+
+// tableForgetter is implemented by backends that need to hear about the DROP of
+// a table they never persisted, so a snapshot write of that table that is in
+// flight (DB.Sync) does not install it afterwards. See DiskBackend.forgetTable.
+type tableForgetter interface {
+	forgetTable(tenant, name string)
+}
+
+// dropFromBackend removes a dropped table from the backend. onDisk is whether
+// the backend knew the table when the caller removed it from the catalog.
+func (db *DB) dropFromBackend(tn, name string, onDisk bool) error {
+	if db.backend == nil {
+		return nil
+	}
+	if onDisk {
+		return db.backend.DeleteTable(tn, name)
+	}
+	f, ok := db.backend.(tableForgetter)
+	if !ok {
+		return nil
+	}
+	f.forgetTable(tn, name)
+	// A snapshot write may have installed the table between the caller's
+	// existence check and the forget above; it cannot install after it.
+	if db.backend.TableExists(tn, name) {
+		return db.backend.DeleteTable(tn, name)
+	}
+	return nil
 }

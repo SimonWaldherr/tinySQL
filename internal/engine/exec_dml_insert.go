@@ -1360,7 +1360,11 @@ func currentConstraintIndex(t *storage.Table, colIdx int) *constraintIndexEntry 
 // (DELETE) or replace the table wholesale (DROP TABLE) — the incremental
 // index only knows how to grow by appending or patch a single row in place.
 func invalidateConstraintIndexes(t *storage.Table) {
-	if t == nil {
+	// Every caller is a statement under the content write lock. With nothing cached
+	// (a table without PRIMARY KEY or UNIQUE constraints, like a RAG chunk table)
+	// there is nothing to drop, and the derived-state lock, which a Sync holds
+	// while it copies the search images, is not touched.
+	if t == nil || !t.HasDerivedState() {
 		return
 	}
 	t.DerivedLock()
@@ -1372,6 +1376,9 @@ func invalidateConstraintIndexes(t *storage.Table) {
 // after row rowIdx is overwritten in place (UPDATE), moving it from its old
 // value's bucket to its new one instead of invalidating the whole cache.
 func patchConstraintIndexRow(t *storage.Table, rowIdx int, oldRow, newRow []any) {
+	if !t.HasDerivedState() { // under the content write lock; see invalidateConstraintIndexes
+		return
+	}
 	t.DerivedLock()
 	defer t.DerivedUnlock()
 	set := constraintIndexSetOf(t, false)

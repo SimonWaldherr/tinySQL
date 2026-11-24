@@ -259,6 +259,7 @@ func purgeCachesAfterRollback(db *storage.DB, snapshot *storage.StatementSnapsho
 			for _, table := range db.ListTables(rollbackTenant) {
 				invalidateConstraintIndexes(table)
 				purgeVectorCachesFor(rollbackTenant, table.Name)
+				purgeFTSCachesFor(rollbackTenant, table.Name)
 				purgeGeoGridCachesFor(rollbackTenant, table.Name)
 				purgeRouteGraphCachesFor(rollbackTenant, table.Name)
 				purgeVecQueryCacheFor(rollbackTenant, table.Name)
@@ -273,6 +274,7 @@ func purgeCachesAfterRollback(db *storage.DB, snapshot *storage.StatementSnapsho
 			invalidateConstraintIndexes(table)
 		}
 		purgeVectorCachesFor(ref.Tenant, ref.Table)
+		purgeFTSCachesFor(ref.Tenant, ref.Table)
 		purgeGeoGridCachesFor(ref.Tenant, ref.Table)
 		purgeRouteGraphCachesFor(ref.Tenant, ref.Table)
 		purgeVecQueryCacheFor(ref.Tenant, ref.Table)

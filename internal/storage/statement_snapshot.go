@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // StatementSnapshot is an in-memory rollback point for one SQL statement.
@@ -239,6 +240,9 @@ type rowsOnlyTableState struct {
 	// restoreRowsOnlyTable.
 	ftsGeneration    int
 	vectorGeneration int
+	// structVersion is the table's StructVersion before the statement. A removal
+	// the statement logged after it must not outlive a rollback.
+	structVersion int
 }
 
 type rowDeleteTableState struct {
@@ -251,6 +255,12 @@ type rowDeleteTableState struct {
 	dirtyFrom      int
 	dirtyRows      []int
 	dirtyRowsState dirtyRowsState
+	// lastRow and nextRow are the row headers (not copies) that sat at
+	// rowCount-1 and rowID+1. They tell a swap-and-pop point DELETE (the last row
+	// moves into rowID's slot) from a DELETE that closed the gap (the next row
+	// moves up), which logs a removal; see restoreRowDeleteTable.
+	lastRow, nextRow []any
+	structVersion    int
 }
 
 // SnapshotForStatement captures all table and catalog state needed to undo a
@@ -311,9 +321,9 @@ func (db *DB) SnapshotForTableStatement(tenant, name string) (*StatementSnapshot
 // vectors with one secondary index that was about 100 ms (UPDATE: about 450 ms,
 // the index copy included) per statement, matching or not.
 //
-// Secondary indexes are NOT copied: they are mutated in place by UPDATE and
-// replaced by DELETE, so the pre-image would have to be a deep copy of the skip
-// list. Instead, rollback rebuilds them from the restored rows. A rollback is the
+// Secondary indexes are NOT copied: UPDATE and DELETE both mutate them in place
+// (DELETE renumbers them, see RenumberSecondaryIndexRowsAfterRemoval), so the
+// pre-image would have to be a deep copy of the skip list. Instead, rollback rebuilds them from the restored rows. A rollback is the
 // rare path (a constraint violation on a later row), so it may cost O(rows); a
 // statement that succeeds, the overwhelming majority, pays nothing for the indexes.
 //
@@ -343,9 +353,10 @@ func (db *DB) SnapshotForRowsOnlyStatement(tenant, name string) (*StatementSnaps
 	}
 	rows := make([][]any, len(table.Rows))
 	copy(rows, table.Rows)
-	table.DerivedLock()
+	// The caller holds the content write lock, which excludes every search, the
+	// only writers of the generations; the derived-state lock is not needed, and
+	// a Sync holds it for the whole of its image copy.
 	ftsGeneration, vectorGeneration := table.ftsGeneration, table.vectorGeneration
-	table.DerivedUnlock()
 	return &StatementSnapshot{
 		tenant: tenant,
 		rowsOnly: &rowsOnlyTableState{
@@ -359,6 +370,7 @@ func (db *DB) SnapshotForRowsOnlyStatement(tenant, name string) (*StatementSnaps
 
 			ftsGeneration:    ftsGeneration,
 			vectorGeneration: vectorGeneration,
+			structVersion:    table.structVersion,
 		},
 		catalog: armCatalogRollback(db.Catalog()),
 	}, nil
@@ -458,12 +470,22 @@ func (db *DB) SnapshotForRowDeleteStatement(tenant, name string, rowIDs []int) (
 		}
 		row = cloneRows([][]any{table.Rows[rowID]})[0]
 	}
+	var lastRow, nextRow []any
+	if rowID >= 0 {
+		lastRow = table.Rows[len(table.Rows)-1]
+		if rowID+1 < len(table.Rows) {
+			nextRow = table.Rows[rowID+1]
+		}
+	}
 	return &StatementSnapshot{
 		tenant: tenant,
 		rowDelete: &rowDeleteTableState{
 			table:          table,
 			rowID:          rowID,
 			row:            row,
+			lastRow:        lastRow,
+			nextRow:        nextRow,
+			structVersion:  table.structVersion,
 			rowCount:       len(table.Rows),
 			version:        table.Version,
 			stats:          cloneTableStats(table.Stats),
@@ -595,7 +617,7 @@ func restoreAppendOnlyTable(state *appendOnlyTableState) {
 	}
 	table := state.table
 	removeAppendedIndexEntries(table, state.rowCount)
-	table.dropDerived()
+	table.dropDerivedExclusive()
 	table.Rows = table.Rows[:state.rowCount:state.rowCount]
 	table.Version = state.version
 	table.Stats = cloneTableStats(state.stats)
@@ -649,7 +671,7 @@ func restoreRowUpdateTable(state *rowUpdateTableState) {
 		return
 	}
 	table := state.table
-	table.dropDerived()
+	table.dropDerivedExclusive()
 	indexNames := table.SortedIndexNames()
 	for i, rowID := range state.rowIDs {
 		if len(indexNames) > 0 {
@@ -669,7 +691,7 @@ func restoreRowsOnlyTable(state *rowsOnlyTableState) {
 		return
 	}
 	table := state.table
-	table.dropDerived()
+	table.dropDerivedExclusive()
 	table.Rows = state.rows
 	// Rebuilt from the restored rows: the statement may have mutated an index in
 	// place (UPDATE) or replaced it (DELETE). Every index is built first and
@@ -705,18 +727,32 @@ func restoreRowsOnlyTable(state *rowsOnlyTableState) {
 	// always correct, so do it whenever their generation moved. A statement that
 	// did not search leaves them untouched, which is the common case and what
 	// keeps a searched RAG table cheap.
-	table.DerivedLock()
-	if table.ftsGeneration != state.ftsGeneration && len(table.FTSIndexes) > 0 {
-		table.FTSIndexes = make(map[string]*FTSIndex)
-		// Clearing is itself a new persistent change, including when an
-		// intervening sync already recorded the discarded generation.
-		table.MarkFTSIndexesChanged()
+	//
+	// Only a search the statement itself ran can have moved the generations (it
+	// holds the content write lock, which excludes every other search), so they are
+	// compared without the derived-state lock, and the lock, which a Sync holds for
+	// the whole of its image copy, is taken only when something has to be dropped.
+	if table.ftsGeneration != state.ftsGeneration || table.vectorGeneration != state.vectorGeneration {
+		table.DerivedLock()
+		if table.ftsGeneration != state.ftsGeneration && len(table.FTSIndexes) > 0 {
+			table.FTSIndexes = make(map[string]*FTSIndex)
+			// Clearing is itself a new persistent change, including when an
+			// intervening sync already recorded the discarded generation.
+			table.MarkFTSIndexesChanged()
+		}
+		if table.vectorGeneration != state.vectorGeneration && len(table.VectorIndexes) > 0 {
+			table.VectorIndexes = make(map[string]*VectorIndex)
+			table.MarkVectorIndexesChanged()
+		}
+		table.DerivedUnlock()
 	}
-	if table.vectorGeneration != state.vectorGeneration && len(table.VectorIndexes) > 0 {
-		table.VectorIndexes = make(map[string]*VectorIndex)
-		table.MarkVectorIndexesChanged()
+	// A statement that logged a removal (a DELETE) leaves positions in the change
+	// log that no longer describe the restored rows: drop the log, which also
+	// moves structVersion on, so every structure stamped before rebuilds. Rolled
+	// back UPDATEs keep their entries; they only over-report changed rows.
+	if table.hasRemovalSince(state.structVersion) {
+		table.noteStructuralInvalidation()
 	}
-	table.DerivedUnlock()
 	table.Version = state.version
 	table.Stats = cloneTableStats(state.stats)
 	table.dirtyFrom = state.dirtyFrom
@@ -729,7 +765,7 @@ func restoreRowDeleteTable(state *rowDeleteTableState) {
 		return
 	}
 	table := state.table
-	table.dropDerived()
+	table.dropDerivedExclusive()
 	if state.rowID >= 0 {
 		switch len(table.Rows) {
 		case state.rowCount - 1:
@@ -742,9 +778,25 @@ func restoreRowDeleteTable(state *rowDeleteTableState) {
 			// state.rowID was itself the last row, "moving it back to the
 			// end" and "restoring it at state.rowID" are the same slot, so
 			// this degrades to a plain append+overwrite.
+			//
+			// A DELETE that took the general scan instead (RETURNING, or a
+			// predicate the point path does not handle) closed the gap: every
+			// later row moved up one place, and the removal is in the change
+			// log. That is told apart by the row now at state.rowID, and undone by
+			// inserting the row back where it was. The log then describes
+			// positions that are gone again, so it is dropped.
 			table.Rows = append(table.Rows, nil)
-			table.Rows[state.rowCount-1] = table.Rows[state.rowID]
-			table.Rows[state.rowID] = state.row
+			if state.rowID < state.rowCount-1 && sameRowHeader(table.Rows[state.rowID], state.nextRow) &&
+				!sameRowHeader(state.nextRow, state.lastRow) {
+				copy(table.Rows[state.rowID+1:], table.Rows[state.rowID:])
+				table.Rows[state.rowID] = state.row
+			} else {
+				table.Rows[state.rowCount-1] = table.Rows[state.rowID]
+				table.Rows[state.rowID] = state.row
+			}
+			if table.hasRemovalSince(state.structVersion) {
+				table.noteStructuralInvalidation()
+			}
 		case state.rowCount:
 			table.Rows[state.rowID] = state.row
 		}
@@ -756,29 +808,52 @@ func restoreRowDeleteTable(state *rowDeleteTableState) {
 	table.dirtyRowsState = state.dirtyRowsState
 }
 
+// sameRowHeader reports whether a and b are the same row slice (same backing
+// array and length), as opposed to rows that merely hold equal values.
+func sameRowHeader(a, b []any) bool {
+	return len(a) == len(b) && unsafe.SliceData(a) == unsafe.SliceData(b)
+}
+
 func restoreTable(dst, saved *Table) {
 	if dst == nil || saved == nil {
 		return
 	}
 	// Executor state describes the rows being replaced, not the ones coming
 	// back. It rebuilds on next use.
-	dst.dropDerived()
+	dst.dropDerivedExclusive()
 	copy := cloneTable(saved)
 	dst.Name = copy.Name
 	dst.Cols = copy.Cols
 	dst.Rows = copy.Rows
 	dst.Indexes = copy.Indexes
+	// A Sync copies the search images under this lock without the content lock.
+	dst.DerivedLock()
 	dst.FTSIndexes = copy.FTSIndexes
 	dst.ftsGeneration = copy.ftsGeneration
 	dst.ftsPersistedGeneration = copy.ftsPersistedGeneration
 	dst.VectorIndexes = copy.VectorIndexes
 	dst.vectorGeneration = copy.vectorGeneration
 	dst.vectorPersistedGeneration = copy.vectorPersistedGeneration
+	dst.DerivedUnlock()
 	dst.IsTemp = copy.IsTemp
 	dst.CheckConstraints = copy.CheckConstraints
 	dst.colPos = copy.colPos
 	dst.Version = copy.Version
-	dst.structVersion = copy.structVersion
+	// A statement that changed no existing row (a pure append, or nothing)
+	// leaves structVersion and the UPDATE log exactly as saved, and so does a
+	// whole-database snapshot for every table the statement never touched: there
+	// is nothing to invalidate, and the restored search structures stay valid.
+	//
+	// Otherwise never move structVersion backwards and never keep the UPDATE log
+	// across the restore: the log (and any derived structure stamped while the
+	// statement ran) describes rows that are gone. Rewinding the counter would
+	// let the next UPDATE reuse a version number that a stale log entry still
+	// carries, so UpdatedRowsSince could name the wrong rows. Restoring is then
+	// itself a structural change: every structure stamped earlier rebuilds.
+	if dst.structVersion != copy.structVersion {
+		dst.structVersion = max(dst.structVersion, copy.structVersion)
+		dst.noteStructuralInvalidation()
+	}
 	dst.Stats = copy.Stats
 	dst.dirtyFrom = copy.dirtyFrom
 	dst.dirtyRows = copy.dirtyRows

@@ -74,6 +74,8 @@ malformed values:
 | `max_memory_bytes` | bytes, `KiB`/`MiB`/`GiB`, or decimal `KB`/`MB`/`GB` | Hybrid/Index buffer-pool budget |
 | `read_only` | strict boolean | Reject mutations and persistence actions |
 | `sync_on_mutate`, `compress_files` | strict boolean | Storage behaviour |
+| `skip_search_index_persistence` | strict boolean | Keep FTS/vector index images out of table files (`disk`/`json`/`hybrid`/`index`) |
+| `row_block_files` | strict boolean | Write table files as independent CRC-checked row blocks (`disk`/`hybrid`/`index`, unencrypted) |
 | `checkpoint_every` | unsigned integer | WAL checkpoint cadence (transactions in `wal`; row-operation records in `advanced_wal`) |
 | `checkpoint_interval` | non-negative Go duration | WAL checkpoint interval |
 | `checkpoint_max_bytes` | size, or `-1` to disable | WAL size trigger |
@@ -210,8 +212,107 @@ knobs, not alternative backends:
 - **`compress_files`** — gzip the on-disk files (`disk`/`hybrid`/`index`/
   `json`) or, for `advanced_wal`, only the periodic checkpoint snapshot
   (never the live log). Smaller files, more CPU per write.
+- **`SkipSearchIndexPersistence`** (DSN `skip_search_index_persistence`) —
+  table files of `disk`/`json`/`hybrid`/`index` carry no FTS or vector (ANN)
+  index image, and a search that merely builds such an index no longer makes
+  `Sync` rewrite the table. The indexes are rebuilt from the rows on first use
+  after a reopen. On a large retrieval corpus those images are roughly a third
+  of the file and dominate `Sync`'s memory and CPU. Ignored by `paged_index`,
+  `sqlite` and the log/checkpoint modes. Secondary (`CREATE INDEX`) indexes are
+  always persisted. Files stay readable by older versions.
+- **`RowBlockFiles`** (DSN `row_block_files`) — a table file becomes a header
+  (schema, secondary indexes, FTS/ANN images, statistics) followed by
+  independent blocks of about 32 MB of rows, each framed with its length and a
+  CRC-32C and, with `compress_files`, gzipped on its own. Blocks are encoded on
+  up to `GOMAXPROCS` workers (the bytes do not depend on the worker count) and
+  decoded in parallel. The classic layout is one GOB message per table, built
+  completely in memory before the first byte is written, single-threaded, and
+  `encoding/gob` refuses messages of 8 GiB or more, so a table of that size can
+  neither be saved nor loaded; row blocks have no such limit and save with
+  memory for a few blocks. The layout is recognised on read by its magic, so
+  both layouts open whatever the setting and it can be switched off again.
+  **A file written with it cannot be read by binaries that predate the option.**
+  Not used with `EncryptionKey` (one AEAD blob, classic layout; opening with
+  both set returns an error rather than silently keeping the 8 GiB limit),
+  `json` mode (also an error) or the other backends (ignored). **The header is
+  still one message**: schema, secondary indexes, statistics and, unless
+  `SkipSearchIndexPersistence` is set, the FTS/ANN images (about a third of a
+  retrieval table). The 8 GiB limit and the whole-message memory bound therefore
+  apply to the header, so they are removed for the *rows* only; for a corpus whose
+  images are large, combine the option with `SkipSearchIndexPersistence`. A table
+  file that has already grown past 8 GiB in the classic layout can no longer be
+  loaded at all, so switch the option on, and let a `Sync` rewrite the file,
+  *before* the table gets there. Each block's checksum covers its position and the
+  header's checksum, so reordered or foreign blocks are rejected as well as
+  damaged ones.
 - **`EncryptionKey`** — encrypts data at rest, independent of which backend
   manages it.
+
+**`Sync` does not block statements** (`disk`/`json`/`hybrid`/`index`). It copies
+each dirty table's row headers and schema under the engine's content read lock
+(a few milliseconds even for a million rows; secondary indexes are lent, not
+copied), then encodes and writes the copy with no engine lock held, replacing
+each table file atomically (temporary file, fsync, rename). Statements and DML
+on the table being written run meanwhile; what they change stays dirty for the
+next `Sync`. A `Sync` that returns nil means the state each table had when it was
+copied is on disk (every table that was dirty when `Sync` started is written; one
+that first changed after the search-index images were copied is left for the
+next `Sync`); a failed one leaves the previous files intact. `Sync` calls
+are serialized, and `Sync` must not be called from a goroutine that holds the
+content lock itself. Peak memory is still the encoded table (the GOB encoder
+builds one message per table file).
+
+Four things can still make a statement wait or cost more during a `Sync`, all
+bounded and none a stop-the-world:
+
+- With the FTS/ANN images persisted (the default), `Sync` deep-copies them
+  *before* it takes the content lock, holding the table's derived-state lock,
+  which an INSERT/UPDATE/DELETE that uses a PRIMARY KEY or UNIQUE constraint
+  index, and every FTS or vector search that has to follow a change, on that
+  table also take. Such a statement waits for the copy (`DB.LastSyncImageCopy`
+  reports its length; it grows with the size of the images, seconds on a
+  million-chunk corpus), and while it waits it holds the content write lock, so
+  every other statement queues behind it. If a committed explicit transaction (or
+  a statement issued while a direct SELECT stream is open, or a `Replace`) swaps
+  the table's object during that copy, the copy belongs to the old object and is
+  not used: that `Sync` still writes the table, but without FTS/ANN images (the
+  file carries rows and secondary indexes only; the images are derived and are
+  rebuilt on first use after a reopen), and flags the images so that the next
+  `Sync` writes them. A table whose object is swapped during the image copy of
+  every `Sync` therefore keeps its rows durable each time but its images out of
+  the file for as long as that goes on. A table without a PRIMARY KEY or
+  UNIQUE constraint (a RAG chunk table) pays nothing for INSERT, UPDATE and DELETE
+  statements, failed ones included: they find the constraint cache empty and
+  never touch the lock. Every statement on other tables is unaffected.
+  `SkipSearchIndexPersistence` removes the copy and the wait (the engine still
+  keeps its own in-memory copy of the HNSW topology that no file will carry; that
+  is a few hundred MB at a million rows and is refreshed after each followed
+  removal).
+- The skip lists of the secondary indexes are lent to the snapshot, not copied,
+  and stay lent until the snapshot's table file has been written (minutes for a
+  large table). The first INSERT, UPDATE or DELETE that touches an index in that
+  window deep-copies the list (hundreds of milliseconds for a million keys) under
+  the content write lock, and the copy is held next to the lent list until the
+  `Sync` is done. In-place renumbering by DELETE (see `insert-update-performance.md`)
+  therefore saves nothing for the first statement after a `Sync` started; it does
+  for the others. With `Sync` calls issued back to back, that is every cycle.
+- Every `Sync` rewrites the whole file of every table that changed, however few
+  rows changed: it is off the lock now, but still O(table) in I/O, index
+  materialisation and memory. At a million 768-dimensional chunks that is 8 to
+  10 GB per `Sync`, which is also where the classic file layout reaches its 8 GiB
+  limit; use `RowBlockFiles` (and `SkipSearchIndexPersistence`) from there on, and
+  do not call `Sync` more often than a table of that size can be written.
+- A table that was saved by someone else (a pool eviction, `SyncTable`, a
+  `Replace`) between the copy and the write is snapshotted again, up to five
+  times; if it keeps being superseded `Sync` returns an error, leaves every
+  table it did write intact and the others dirty, and the caller calls `Sync`
+  again. It never falls back to writing under the content lock. A pool eviction
+  does not wait for a snapshot write of the same table either: the table stays
+  cached until the write is done.
+
+The new options are available through `StorageConfig`, `driver.OpenConfig` and
+the DSN only; the `tinysql`/`tinysqld` command line flags and the language
+bindings do not expose them yet.
 
 JSON mode example:
 
