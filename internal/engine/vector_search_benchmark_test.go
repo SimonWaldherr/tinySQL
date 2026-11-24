@@ -274,6 +274,40 @@ func BenchmarkVecSearchCosineTopK_IVFCached(b *testing.B) {
 	benchmarkVecSearchIndexed(b, "ivf")
 }
 
+func BenchmarkVecSearchIVFAfterMetadataUpdate(b *testing.B) {
+	const rows, dims, k = 12000, 64, 20
+	db := makeRAGHybridBenchmarkTable(rows, dims)
+	b.Cleanup(func() {
+		purgeVectorCachesFor("default", "rag_hybrid")
+		_ = db.Close()
+	})
+	vector := make([]float64, dims)
+	for i := range vector {
+		vector[i] = math.Cos(0.08*float64(i) + 0.5)
+	}
+	query := mustParse(`SELECT id, _vec_distance FROM VEC_SEARCH('rag_hybrid', 'embedding', '` + retrievalVecLiteral(vector) + `', 20, 'cosine', 'ivf')`)
+	touch := mustParse(`UPDATE rag_hybrid SET score = score + 1 WHERE id < 360`)
+	search := func() {
+		result, err := Execute(b.Context(), db, "default", query)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(result.Rows) != k {
+			b.Fatalf("got %d hits, want %d", len(result.Rows), k)
+		}
+	}
+	search()
+	b.ReportAllocs()
+	for b.Loop() {
+		b.StopTimer()
+		if _, err := Execute(b.Context(), db, "default", touch); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		search()
+	}
+}
+
 func BenchmarkVecSearchCosineTopK_HNSWCached(b *testing.B) {
 	benchmarkVecSearchIndexed(b, "hnsw")
 }

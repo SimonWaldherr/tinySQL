@@ -20,7 +20,8 @@ import (
 // SELECT once retrieval itself was made fast. It is cached here the same way the
 // vector column cache and the tokenized-document cache are: keyed by
 // (source identity, tenant, table, columns), validated against table.Version.
-// Pure appends extend it lazily; structural changes require a full rebuild.
+// Appends extend it lazily. The change log lets it survive updates outside
+// the two indexed columns.
 //
 // Entries are immutable once published, so concurrent queries share one index.
 
@@ -79,21 +80,15 @@ func getRAGContextIndex(source ragSource, docCol, chunkCol string) ragContextInd
 		return ragBuildContextIndex(source, docCol, chunkCol)
 	}
 	key := ragContextCacheKey(source, docCol, chunkCol)
-	if index, ok := cachedRAGContextIndex(source, key); ok {
+	if index, ok := reuseRAGContextIndex(source, key, true); ok {
 		return index
 	}
+	index := ragBuildContextIndex(source, docCol, chunkCol)
+	cacheRAGContextIndex(source, key, index)
+	return index
+}
 
-	ragContextIndexCacheMu.RLock()
-	previous, exists := ragContextIndexCache[key]
-	ragContextIndexCacheMu.RUnlock()
-	var index ragContextIndex
-	if exists && source.rowFilter == nil && previous.table == source.table &&
-		previous.structVersion == source.table.StructVersion() && previous.rows <= len(source.rawRows) {
-		index = ragExtendContextIndex(previous.index, source, docCol, chunkCol, previous.rows)
-	} else {
-		index = ragBuildContextIndex(source, docCol, chunkCol)
-	}
-
+func cacheRAGContextIndex(source ragSource, key ragContextIndexCacheKey, index ragContextIndex) {
 	ragContextIndexCacheMu.Lock()
 	if _, exists := ragContextIndexCache[key]; !exists {
 		evictOverCap(ragContextIndexCache, ragContextIndexCacheMaxEntries)
@@ -106,7 +101,6 @@ func getRAGContextIndex(source ragSource, docCol, chunkCol string) ragContextInd
 		index:         index,
 	}
 	ragContextIndexCacheMu.Unlock()
-	return index
 }
 
 func ragContextCacheKey(source ragSource, docCol, chunkCol string) ragContextIndexCacheKey {
@@ -121,13 +115,42 @@ func ragContextCacheKey(source ragSource, docCol, chunkCol string) ragContextInd
 }
 
 func cachedRAGContextIndex(source ragSource, key ragContextIndexCacheKey) (ragContextIndex, bool) {
+	return reuseRAGContextIndex(source, key, false)
+}
+
+// Only lookups that need an index for multiple hits pay to index an appended
+// tail. Either lookup can reuse a warm index after a payload-only UPDATE.
+func reuseRAGContextIndex(source ragSource, key ragContextIndexCacheKey, allowAppend bool) (ragContextIndex, bool) {
 	ragContextIndexCacheMu.RLock()
-	entry, ok := ragContextIndexCache[key]
+	entry, exists := ragContextIndexCache[key]
 	ragContextIndexCacheMu.RUnlock()
-	if ok && entry.table == source.table && entry.version == source.table.Version {
+	rows := len(source.rawRows)
+	if !exists || entry.table != source.table || entry.version > source.table.Version || entry.rows > rows {
+		return ragContextIndex{}, false
+	}
+	structVersion := source.table.StructVersion()
+	if entry.version == source.table.Version && entry.structVersion == structVersion && entry.rows == rows {
 		return entry.index, true
 	}
-	return ragContextIndex{}, false
+	if source.rowFilter != nil || (!allowAppend && entry.rows != rows) {
+		return ragContextIndex{}, false
+	}
+	if entry.structVersion != structVersion {
+		docIdx, docOK := source.columnIdx[key.docCol]
+		chunkIdx, chunkOK := source.columnIdx[key.chunkCol]
+		if !docOK || !chunkOK {
+			return ragContextIndex{}, false
+		}
+		// The index stores only document IDs, chunk positions and row numbers.
+		// The log also rejects removals, reorders and untracked changes.
+		updated, ok := source.table.UpdatedRowsSinceCols(entry.structVersion, storage.ColumnMask(docIdx, chunkIdx))
+		if !ok || len(updated) != 0 {
+			return ragContextIndex{}, false
+		}
+	}
+	index := ragExtendContextIndex(entry.index, source, key.docCol, key.chunkCol, entry.rows)
+	cacheRAGContextIndex(source, key, index)
+	return index, true
 }
 
 // RAG_CONTEXT loads neighboring chunks for a single retrieved chunk.

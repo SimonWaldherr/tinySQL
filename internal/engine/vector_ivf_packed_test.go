@@ -28,7 +28,7 @@ func legacyIVFValidRows(cache vecSearchColumnCacheEntry, dims int) []int {
 func legacyIVFBuild(ctx context.Context, table *storage.Table, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecIVFIndex, error) {
 	rows := legacyIVFValidRows(cache, dims)
 	nlist := chooseIVFListCount(len(rows))
-	idx := &vecIVFIndex{table: table, version: table.Version, metric: metric, dims: dims}
+	idx := &vecIVFIndex{table: table, version: table.Version, columnShape: cache.shape, metric: metric, dims: dims}
 	if len(rows) == 0 || nlist == 0 {
 		return idx, nil
 	}

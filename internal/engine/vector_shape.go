@@ -8,7 +8,9 @@ type vecColumnShape struct {
 
 // A cache entry is copied by value and shared by concurrent readers. Keep
 // lazy state behind one pointer rather than copying a sync.Once with it.
-// Norm-only upgrades share this state; row changes create a fresh instance.
+// Norm upgrades and unrelated column updates share this state. Its identity
+// also identifies the vector values and row IDs, so any change to them needs
+// fresh state even if it would produce the same counts and dimensions.
 type vecColumnShapeCache struct {
 	once  sync.Once
 	value vecColumnShape

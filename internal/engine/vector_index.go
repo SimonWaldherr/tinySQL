@@ -68,11 +68,22 @@ func waitVecIndexBuild(ctx context.Context, done <-chan struct{}) error {
 type vecIVFIndex struct {
 	table         *storage.Table
 	version       int
+	columnShape   *vecColumnShapeCache
 	metric        string
 	dims          int
 	centroids     [][]float64
 	centroidNorms []float64
 	lists         [][]int
+}
+
+func (idx *vecIVFIndex) matches(table *storage.Table, dims int, cache *vecSearchColumnCacheEntry) bool {
+	if idx == nil || idx.table != table || idx.dims != dims {
+		return false
+	}
+	// A matching column shape identity also vouches for the vector values
+	// and physical row IDs used to train this immutable index.
+	return idx.version == table.Version ||
+		idx.columnShape != nil && idx.columnShape == cache.shape && cache.table == table && cache.version == table.Version
 }
 
 type vecHNSWIndex struct {
@@ -482,21 +493,21 @@ func getVecIVFIndex(ctx context.Context, tenant string, table *storage.Table, co
 
 	// Lock-free fast path — see publishVecIVFCacheSnapshotLocked.
 	if snap := vecIVFCacheSnapshot.Load(); snap != nil {
-		if idx := (*snap)[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+		if idx := (*snap)[key]; idx.matches(table, dims, &cache) {
 			return idx, nil
 		}
 	}
 
 	for {
 		vecIVFCacheMu.RLock()
-		if idx := vecIVFCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+		if idx := vecIVFCache[key]; idx.matches(table, dims, &cache) {
 			vecIVFCacheMu.RUnlock()
 			return idx, nil
 		}
 		vecIVFCacheMu.RUnlock()
 
 		vecIVFCacheMu.Lock()
-		if idx := vecIVFCache[key]; idx != nil && idx.table == table && idx.version == table.Version && idx.dims == dims {
+		if idx := vecIVFCache[key]; idx.matches(table, dims, &cache) {
 			vecIVFCacheMu.Unlock()
 			return idx, nil
 		}
@@ -531,7 +542,7 @@ func getVecIVFIndex(ctx context.Context, tenant string, table *storage.Table, co
 func buildVecIVFIndex(ctx context.Context, table *storage.Table, metric string, dims int, cache vecSearchColumnCacheEntry) (*vecIVFIndex, error) {
 	rows := validVectorRows(cache, dims)
 	nlist := chooseIVFListCount(len(rows))
-	idx := &vecIVFIndex{table: table, version: table.Version, metric: metric, dims: dims}
+	idx := &vecIVFIndex{table: table, version: table.Version, columnShape: cache.shape, metric: metric, dims: dims}
 	if len(rows) == 0 || nlist == 0 {
 		return idx, nil
 	}

@@ -154,6 +154,7 @@ controls is whether the next search pays for a rebuild.
 | Fold of UPDATEs | vouches only that no column the reader indexes changed | a structure that missed an UPDATE of its own column inside a fold rebuilds once |
 | Full-text index | follows UPDATE and DELETE events | rebuilds when more than min(max(1024, rows/256), max(64, rows/4)) rows with an updated indexed column are reported, when at least 1,024 token-arena entries (or 512 term-arena entries) are obsolete and exceed a quarter of that arena, and, after a DELETE, when at least 1,024 posting lists are empty and exceed a quarter of the terms |
 | Flat vector cache | follows DELETEs | rebuilds when more than 10 percent of the packed floats are garbage; keeps at most 24 segments (the smallest neighbours are merged beyond that); rebuilds when more than min(1024, max(32, rows/8)) rows have an updated vector |
+| IVF index | reuses the trained index when the vector column cache confirms unchanged vectors and row IDs | rebuilds when an append, removal or vector update changes that cache, or when the requested dimension changes |
 | HNSW graph | follows DELETEs | rebuilds when the removals since the graph was last brought up to date (the statements between two searches, added together) exceed 5 percent of the nodes, when more than 10 percent were removed since the last build (the count is persisted), or when more than min(1024, max(32, rows/8)) rows have an updated vector |
 | DELETE | by a non-key column reports its rows | `DELETE` without `WHERE`, swap-and-pop deletes by `PRIMARY KEY`/`UNIQUE` value (without `RETURNING`), a DELETE on a table with DELETE triggers, schema changes and a rollback that undoes a logged DELETE reset that table's log: every structure of the table rebuilds. A foreign-key cascade or `SET NULL` resets the log of the child table it changes |
 | Failed statement | the statement is rolled back | the flat cache and the HNSW/IVF graphs of the restored table (of every table when the rollback point is the whole database) are dropped from the process caches: the flat cache is rebuilt in full, a graph is rebuilt unless its persisted topology is still valid, and the full-text cache is re-derived from the index stored on the table (a full re-tokenization if the statement ran a search or logged a DELETE, and, when the rollback point is a copy of the table or of the whole database, also if the statement had changed an existing row) |
@@ -183,9 +184,10 @@ following remain proportional to the table, not to the change:
 - a write that touches an index while a `Sync` is still writing its snapshot copies
   that index's skip list (the snapshot borrows it until its table file is written);
   with `Sync` calls back to back this is the first write of every cycle;
-- the RAG context index rebuilds after any UPDATE or DELETE, IVF indexes after any
-  change of the table (their cache is keyed on `Table.Version`), the row-filter caches
-  and ACL-filtered graphs at least after a removal, and subscriptions after a DELETE
+- the unfiltered RAG context index rebuilds after a DELETE or when
+  the change log cannot confirm that document IDs and chunk positions are unchanged.
+  IVF indexes retrain when vectors or their row positions change. The row-filter caches
+  and ACL-filtered graphs rebuild at least after a removal, and subscriptions after a DELETE
   (they follow UPDATEs within 4,096 versions); row twins only matter for explicit
   transactions on tables without `VECTOR`, `JSON` or `BLOB` columns, so not for a chunk
   table.

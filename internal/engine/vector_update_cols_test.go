@@ -59,8 +59,8 @@ func TestVecColumnCacheSurvivesUpdateOfOtherColumns(t *testing.T) {
 		touchLoadedAt(table, 2+i, i%64)
 	}
 	second := getVecColumnCache("default", table, vecMaskColVector, true)
-	if &second.segments[0].data[0] != &first.segments[0].data[0] || len(second.segments) != len(first.segments) {
-		t.Fatal("a touch rebuilt the vector column")
+	if len(second.segments) != len(first.segments) || &second.segments[0] != &first.segments[0] {
+		t.Fatal("a touch copied the immutable vector segments")
 	}
 	if len(second.overrides) != 0 {
 		t.Fatalf("a touch created %d overrides", len(second.overrides))
@@ -103,6 +103,64 @@ func TestVecColumnCacheSurvivesUpdateOfOtherColumns(t *testing.T) {
 	fifth := getVecColumnCache("default", table, vecMaskColVector, true)
 	if !reflect.DeepEqual(fifth.vector(8), []float64{4, 4, 4}) {
 		t.Fatalf("mixed update vector = %v", fifth.vector(8))
+	}
+}
+
+func TestVecIVFIndexSurvivesUpdateOfOtherColumns(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	table := vecMaskTable(t, db, 96)
+	const metric, dims = "cosine", 3
+	lookup := func(dims int) (*vecIVFIndex, vecSearchColumnCacheEntry) {
+		t.Helper()
+		cache := getVecColumnCache("default", table, vecMaskColVector, true)
+		idx, err := getVecIVFIndex(t.Context(), "default", table, vecMaskColVector, metric, dims, cache)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return idx, cache
+	}
+	index, cache := lookup(dims)
+	query := persistentAppendVector(20)
+	norm := vectorL2Norm(query)
+	want, err := index.search(t.Context(), query, norm, 8, cache)
+	if err != nil || len(want) != 8 {
+		t.Fatalf("initial search = %v, %v", want, err)
+	}
+	touchLoadedAt(table, 2, 4, 8, 12)
+	reused, cache := lookup(dims)
+	if reused != index {
+		t.Fatal("an unrelated update rebuilt IVF")
+	}
+	if got, err := reused.search(t.Context(), query, norm, 8, cache); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("metadata update changed the ranking: got %v, %v, want %v", got, err, want)
+	}
+
+	for _, change := range []struct {
+		name  string
+		apply func()
+	}{
+		{"vector update", func() { setVector(table, 5, []float64{9, 9, 9}, storage.ColumnBit(vecMaskColVector)) }},
+		{"delete and insert at equal row count", func() {
+			execSQL(t, db, `DELETE FROM vec_mask WHERE loaded_at = 2`)
+			execSQL(t, db, `INSERT INTO vec_mask VALUES (3, '[1,2,3]'), (3, '[3,2,1]'), (3, '[1,3,2]')`)
+		}},
+		{"append", func() { execSQL(t, db, `INSERT INTO vec_mask VALUES (3, '[0,1,0]')`) }},
+	} {
+		change.apply()
+		rebuilt, _ := lookup(dims)
+		if rebuilt == index {
+			t.Fatalf("%s reused the old IVF index", change.name)
+		}
+		coldCache := buildVecColumnCache(table, vecMaskColVector, true)
+		cold, err := buildVecIVFIndex(t.Context(), table, metric, dims, coldCache)
+		if err != nil || !reflect.DeepEqual(rebuilt.lists, cold.lists) || !reflect.DeepEqual(rebuilt.centroids, cold.centroids) {
+			t.Fatalf("%s differs from a cold build: %v", change.name, err)
+		}
+		index = rebuilt
+	}
+	if other, _ := lookup(dims - 1); other == index || len(other.lists) != 0 {
+		t.Fatal("a query with a different dimension reused the old IVF index")
 	}
 }
 

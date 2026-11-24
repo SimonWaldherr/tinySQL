@@ -66,10 +66,18 @@ func TestVecSearchParallelLargeKIsBounded(t *testing.T) {
 			t.Fatalf("result not ordered at %d", i)
 		}
 	}
-	for _, k := range []int{5, math.MaxInt} {
-		got, err := vecSearchFlat(t.Context(), table.Rows, "l2", query, 0, k, cache)
-		if err != nil || !slices.Equal(got, result[:min(k, rows)]) {
-			t.Fatalf("parallel L2 top-%d differs from the generic ranking: got %d rows, error=%v", k, len(got), err)
+	const split = 2801 // second worker starts inside the first segment and crosses the boundary
+	segmented := cache
+	segmented.segments = []vecColumnSegment{
+		buildVecColumnSegment(table.Rows[:split], 1, false, 0),
+		buildVecColumnSegment(table.Rows[split:], 1, false, split),
+	}
+	for _, layout := range []vecSearchColumnCacheEntry{cache, segmented} {
+		for _, k := range []int{5, math.MaxInt} {
+			got, err := vecSearchFlat(t.Context(), table.Rows, "l2", query, 0, k, layout)
+			if err != nil || !slices.Equal(got, result[:min(k, rows)]) {
+				t.Fatalf("segments=%d: parallel L2 top-%d differs from the generic ranking: got %d rows, error=%v", len(layout.segments), k, len(got), err)
+			}
 		}
 	}
 }

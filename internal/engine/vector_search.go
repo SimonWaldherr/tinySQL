@@ -530,21 +530,6 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 		// immutable after we release the lock, so an append extension can share
 		// its segments safely without doing a speculative full rebuild first.
 		cached, exists := vecSearchColumnCache[key]
-		usable := exists && cached.table == table && cached.rows <= len(table.Rows)
-		var updatedRows []int
-		canRefresh := false
-		if usable {
-			// Only an UPDATE of this vector column changes the cache. A row
-			// reported for other columns (a bookkeeping timestamp) is not
-			// returned, so it costs nothing here.
-			updatedRows, canRefresh = table.UpdatedRowsSinceCols(cached.structVersion, storage.ColumnBit(colIdx))
-		}
-		canExtend := canRefresh && len(updatedRows) == 0 && cached.version <= table.Version
-		// A window that removed rows (the log reports them in order) can be
-		// followed too: the surviving rows keep their packed data.
-		// Composing the log is asked below, after the lock is released: it can
-		// take a while for a long window and must not hold up other tables.
-		mayFollow := exists && cached.table == table && !canRefresh
 		call := &vecColumnBuildCall{done: make(chan struct{})}
 		vecSearchColumnBuilds[key] = call
 		vecSearchColumnCacheMu.Unlock()
@@ -560,11 +545,21 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 				vecSearchColumnCacheMu.Unlock()
 			}
 		}()
+		// Read the change log outside the shared cache lock. Even an update
+		// that leaves embeddings alone may have changed thousands of rows.
+		interest := storage.ColumnBit(colIdx)
+		usable := exists && cached.table == table && cached.rows <= len(table.Rows)
+		var updatedRows []int
+		canRefresh := false
+		if usable {
+			updatedRows, canRefresh = table.UpdatedRowsSinceCols(cached.structVersion, interest)
+		}
+		canExtend := canRefresh && len(updatedRows) == 0 && cached.version <= table.Version
 		var removal storage.TableChanges
 		canFollow := false
-		if mayFollow {
+		if exists && cached.table == table && !canRefresh {
 			var vouched bool
-			removal, vouched = table.ChangesSince(cached.structVersion, cached.rows, storage.ColumnBit(colIdx))
+			removal, vouched = table.ChangesSince(cached.structVersion, cached.rows, interest)
 			switch {
 			case !vouched:
 			case len(removal.Dead) > 0:
@@ -587,10 +582,6 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 			// columns were updated): its stamps move forward and only the
 			// appended tail is read.
 			entry = extendVecColumnCache(cached, table, colIdx, includeNorms)
-			if cached.rows == len(table.Rows) && cached.shape != nil {
-				// Same rows, same vectors: the lazily computed shape still holds.
-				entry.shape = cached.shape
-			}
 		} else if canRefresh && usable {
 			entry = refreshVecColumnCache(cached, table, colIdx, includeNorms, updatedRows)
 		} else if canFollow {
@@ -858,49 +849,42 @@ func buildVecColumnSegmentSerial(rows [][]any, colIdx int, includeNorms bool, st
 // norms are requested for a previously non-cosine cache, it computes norms
 // from the existing packed vectors but still never recopies vector data.
 func extendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
-	shape := cached.shape
-	if shape == nil || cached.rows != len(table.Rows) || cached.structVersion != table.StructVersion() {
-		shape = new(vecColumnShapeCache)
+	rows := len(table.Rows)
+	upgradeNorms := includeNorms && !cached.normsReady
+	cached.table = table
+	cached.version = table.Version
+	cached.structVersion = table.StructVersion()
+	if cached.shape == nil || cached.rows != rows {
+		cached.shape = new(vecColumnShapeCache)
+	}
+	if cached.rows == rows && !upgradeNorms {
+		return cached
 	}
 	segments := append([]vecColumnSegment(nil), cached.segments...)
-	if includeNorms && !cached.normsReady {
+	if upgradeNorms {
 		for i := range segments {
-			segment := &segments[i]
-			segment.norms = make([]float64, len(segment.vectors))
-			for row, vector := range segment.vectors {
-				if segment.valid[row] {
-					segment.norms[row] = vectorL2Norm(vector)
-				}
-			}
+			segments[i].norms = vecSegmentNorms(segments[i])
 		}
 	}
-	if cached.rows < len(table.Rows) {
-		segments = append(segments, buildVecColumnSegment(table.Rows[cached.rows:], colIdx, includeNorms || cached.normsReady, cached.rows))
+	cached.normsReady = cached.normsReady || includeNorms
+	if cached.rows < rows {
+		segments = append(segments, buildVecColumnSegment(table.Rows[cached.rows:], colIdx, cached.normsReady, cached.rows))
 	}
-	segments = mergeVecColumnSegments(segments, includeNorms || cached.normsReady)
+	cached.segments = mergeVecColumnSegments(segments, cached.normsReady)
+	cached.rows = rows
 	// Appends do not change existing row overrides or computed norms. Share
 	// their immutable map; refresh takes a private copy before a later UPDATE.
-	overrides := cached.overrides
-	if len(overrides) != 0 && includeNorms && !cached.normsReady {
-		overrides = make(map[int]vecColumnOverride, len(cached.overrides))
+	if len(cached.overrides) != 0 && upgradeNorms {
+		overrides := make(map[int]vecColumnOverride, len(cached.overrides))
 		for row, value := range cached.overrides {
 			if value.valid {
 				value.norm = vectorL2Norm(value.vector)
 			}
 			overrides[row] = value
 		}
+		cached.overrides = overrides
 	}
-	return vecSearchColumnCacheEntry{
-		table:         table,
-		version:       table.Version,
-		structVersion: table.StructVersion(),
-		rows:          len(table.Rows),
-		shape:         shape,
-		segments:      segments,
-		overrides:     overrides,
-		overrideRows:  cached.overrideRows,
-		normsReady:    includeNorms || cached.normsReady,
-	}
+	return cached
 }
 
 // mergeVecColumnSegments performs binary-counter compaction on similarly
@@ -1142,15 +1126,13 @@ type vecFlatScan struct {
 	cache    vecSearchColumnCacheEntry
 	distance vecDistanceFunc
 	needNorm bool
-	l2Query  []float64 // non-nil only for a validated contiguous segment
+	l2Query  []float64 // non-nil only for adjacent segments without overrides
 }
 
 func vecSearchFlat(ctx context.Context, rows [][]any, metric string, query []float64, queryNorm float64, k int, cache vecSearchColumnCacheEntry) ([]vecScoredRow, error) {
-	if metric == "l2" && k > 0 && len(query) != 0 && len(rows) == cache.rows {
-		if _, ok := cache.contiguousSegment(); ok {
-			scan := vecFlatScan{cache: cache, l2Query: query}
-			return scan.topK(ctx, rows, len(query), k)
-		}
+	if metric == "l2" && k > 0 && len(query) != 0 && len(rows) == cache.rows && cache.directScanSegments(0, len(rows)) {
+		scan := vecFlatScan{cache: cache, l2Query: query}
+		return scan.topK(ctx, rows, len(query), k)
 	}
 	return vecSearchTopK(ctx, rows, len(query), k, cache, buildVecDistanceFunc(metric, query, queryNorm), vecDistanceFuncNeedsNorm(metric))
 }
@@ -1162,7 +1144,7 @@ func vecSearchTopK(ctx context.Context, rows [][]any, queryLen int, k int, cache
 
 func (scan *vecFlatScan) scanRange(ctx context.Context, rows [][]any, start, end, queryLen, k int) (vecScoredHeap, error) {
 	if scan.l2Query != nil {
-		return scanVecL2Range(ctx, &scan.cache.segments[0], scan.l2Query, start, end, k)
+		return scanVecL2Range(ctx, scan.cache.segments, scan.l2Query, start, end, k)
 	}
 	return vecSearchTopKRange(ctx, rows, start, end, queryLen, k, scan.cache, scan.distance, scan.needNorm)
 }

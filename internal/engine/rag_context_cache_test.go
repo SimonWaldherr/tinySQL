@@ -255,6 +255,51 @@ func TestRAGContextSingleReusesOnlyValidIndex(t *testing.T) {
 	}
 }
 
+func TestRAGContextIndexReusesAfterPayloadUpdate(t *testing.T) {
+	queries := []struct{ name, sql string }{
+		{"single", `SELECT chunk_text FROM RAG_CONTEXT('chunks', 'doc_id', 'chunk_index', 'doc-1', 1, 0)`},
+		{"multiple", `WITH hits AS (SELECT 'doc-1' AS doc_id, 1 AS chunk_index)
+			SELECT chunk_text FROM RAG_CONTEXT_FROM('chunks', 'doc_id', 'chunk_index', 'hits', 'doc_id', 'chunk_index', 0)`},
+	}
+	for _, query := range queries {
+		t.Run(query.name, func(t *testing.T) {
+			db, ctx := ragCacheSetup(t)
+			t.Cleanup(func() {
+				purgeRAGContextCachesFor("default", "chunks")
+				_ = db.Close()
+			})
+			table, err := db.Get("default", "chunks")
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := ragSourceFromTable("default", table)
+			key := ragContextCacheKey(source, "doc_id", "chunk_index")
+			doc := ragContextDocumentKey("doc-1")
+			oldIndex := getRAGContextIndex(source, "doc_id", "chunk_index")
+
+			mustExec(t, db, ctx, `UPDATE chunks SET chunk_text = 'new text' WHERE doc_id = 'doc-1' AND chunk_index = 1`)
+			got := mustExec(t, db, ctx, query.sql)
+			if len(got.Rows) != 1 || got.Rows[0]["chunk_text"] != "new text" {
+				t.Fatalf("payload update returned %v", got.Rows)
+			}
+			ragContextIndexCacheMu.RLock()
+			entry := ragContextIndexCache[key]
+			ragContextIndexCacheMu.RUnlock()
+			if entry.version != table.Version || entry.structVersion != table.StructVersion() {
+				t.Fatal("cache entry retained its old versions")
+			}
+			if chunks := entry.index.byDocument[doc]; len(chunks) != 3 || &chunks[0] != &oldIndex.byDocument[doc][0] {
+				t.Fatal("payload update rebuilt the chunk index")
+			}
+
+			mustExec(t, db, ctx, `UPDATE chunks SET doc_id = 'doc-3' WHERE doc_id = 'doc-1' AND chunk_index = 1`)
+			if got := mustExec(t, db, ctx, query.sql); len(got.Rows) != 0 {
+				t.Fatalf("document update returned a chunk at its old location: %v", got.Rows)
+			}
+		})
+	}
+}
+
 func TestRAGContextEmptyHitsDoNotWarmIndex(t *testing.T) {
 	db, _ := ragCacheSetup(t)
 	table, err := db.Get("default", "chunks")
