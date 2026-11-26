@@ -51,10 +51,13 @@ type AuditEntry struct {
 // still produce different hashes and can't be silently swapped for one
 // another.
 func (e AuditEntry) computeHash() string {
+	var prefix [128]byte
+	header := append(prefix[:0], e.PrevHash...)
+	header = strconv.AppendUint(header, e.Seq, 10)
+	header = e.Timestamp.UTC().AppendFormat(header, time.RFC3339Nano)
+
 	h := sha256.New()
-	h.Write([]byte(e.PrevHash))
-	h.Write([]byte(strconv.FormatUint(e.Seq, 10)))
-	h.Write([]byte(e.Timestamp.UTC().Format(time.RFC3339Nano)))
+	h.Write(header)
 	h.Write([]byte(e.Tenant))
 	h.Write([]byte(e.User))
 	h.Write([]byte(e.Statement))
@@ -64,7 +67,10 @@ func (e AuditEntry) computeHash() string {
 		h.Write([]byte{0})
 	}
 	h.Write([]byte(e.Error))
-	return hex.EncodeToString(h.Sum(nil))
+	var digest [sha256.Size]byte
+	var encoded [sha256.Size * 2]byte
+	hex.Encode(encoded[:], h.Sum(digest[:0]))
+	return string(encoded[:])
 }
 
 // AuditLog is an in-memory, optionally file-backed hash-chained log. Safe
@@ -161,9 +167,9 @@ func (a *AuditLog) Append(tenant, user, statement string, success bool, errMsg s
 	a.nextSeq++
 
 	if a.writer != nil {
-		if b, err := json.Marshal(e); err == nil {
-			_, _ = a.writer.Write(b)
-			_ = a.writer.WriteByte('\n')
+		// The encoder writes the newline with the entry and avoids copying
+		// the encoded bytes into a separate result slice.
+		if err := json.NewEncoder(a.writer).Encode(e); err == nil {
 			_ = a.writer.Flush()
 		}
 	}

@@ -32,6 +32,7 @@ var ftsGoldenQueries = []struct {
 	{"single_rare_term", "needle42"},
 	{"two_term_implicit_and", "term3 term7"},
 	{"explicit_or", "term3 OR term7"},
+	{"selective_or", "term100 OR term200 OR term300 OR needle42"},
 	{"explicit_and", "term3 AND term7"},
 	{"and_not", "term3 AND NOT term7"},
 	{"or_not", "term3 OR NOT term7"},

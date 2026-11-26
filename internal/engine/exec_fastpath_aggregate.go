@@ -19,6 +19,7 @@ package engine
 import (
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -591,10 +592,19 @@ func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, or
 		result.Rows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, result.Rows)
 		return result, nil
 	}
-	// Without ORDER BY the encounter order is already final. Page the states
-	// before allocating result maps, after evaluating every aggregate/HAVING
-	// expression so discarded groups still report errors and cancellation.
+	orderBy := plan.orderBy
+	if len(orderBy) == 1 && plan.limit != nil && *plan.limit > 0 {
+		keep := boundedLimitRows(plan.limit, plan.offset, len(order))
+		// Match the regular top-N path's cutoff so large pages still sort
+		// once rather than building a heap of nearly all groups.
+		if keep < len(order) && keep <= len(order)-len(order)/10 {
+			order = selectAggregatePage(env, plan, order, keep)
+			orderBy = nil
+		}
+	}
 	if len(plan.orderBy) == 0 {
+		// Encounter order is already final. Page only after all aggregate
+		// and HAVING expressions have been evaluated.
 		start := 0
 		if plan.offset != nil && *plan.offset > 0 {
 			start = *plan.offset
@@ -614,16 +624,54 @@ func finalizeSimpleAggregateResultSet(env ExecEnv, plan *simpleAggregatePlan, or
 	}
 	result := simpleAggregateResultSet(plan.projs, plan.outputCols, order)
 	projectPhase.finish(int64(len(result.Rows)))
-	if len(plan.orderBy) > 0 {
+	if len(orderBy) > 0 {
 		var sortPhase *queryPhase
 		if env.profile != nil {
 			_, sortPhase = startQueryPhase(env, "SORT", "order aggregate results")
 		}
-		result.Rows = applySortOrderWithLimit(plan.orderBy, result.Rows, plan.limit, plan.offset)
+		result.Rows = applySortOrderWithLimit(orderBy, result.Rows, plan.limit, plan.offset)
 		sortPhase.finish(int64(len(result.Rows)))
 		result.Rows = applyOffsetLimit(&Select{Limit: plan.limit, Offset: plan.offset}, result.Rows)
 	}
 	return result, nil
+}
+
+// selectAggregatePage sorts on a single result column before allocating row
+// maps. Its heap stores positions in encounter order, which also break ties.
+func selectAggregatePage(env ExecEnv, plan *simpleAggregatePlan, order []*simpleAggregateState, keep int) []*simpleAggregateState {
+	var phase *queryPhase
+	if env.profile != nil {
+		_, phase = startQueryPhase(env, "SORT", "order aggregate states")
+	}
+	sortBy := plan.orderBy[0]
+	column := strings.ToLower(sortBy.Col)
+	projection := -1
+	// As when writing a Row, the last occurrence of a duplicate alias wins.
+	for i := len(plan.projs) - 1; i >= 0; i-- {
+		if strings.ToLower(plan.projs[i].name) == column {
+			projection = i
+			break
+		}
+	}
+	heap := orderedValueRowSingleHeap{desc: sortBy.Desc, nulls: sortBy.Nulls, items: make([]orderedValueRowSingle, 0, keep)}
+	for i, state := range order {
+		var key any
+		if projection >= 0 {
+			key = simpleAggregateProjectionValue(state, plan.projs[projection], projection)
+		}
+		heap.pushBounded(orderedValueRowSingle{key: key, idx: i}, keep)
+	}
+	sort.Sort(orderedValueRowsSingleAsc{desc: sortBy.Desc, nulls: sortBy.Nulls, items: heap.items})
+	phase.finish(int64(keep))
+	start := 0
+	if plan.offset != nil {
+		start = max(*plan.offset, 0)
+	}
+	page := make([]*simpleAggregateState, keep-start)
+	for i, item := range heap.items[start:] {
+		page[i] = order[item.idx]
+	}
+	return page
 }
 
 // simpleAggregateResultSet materializes one output Row per accumulated group.

@@ -2637,13 +2637,13 @@ func ftsSearchCandidates(ctx context.Context, tenant string, table *storage.Tabl
 		return nil, nil
 	}
 
-	// Bounded top-k selection (O(m log k) for m candidate docs) instead of
-	// collecting every match into a slice and sorting the whole thing
-	// (O(m log m)) — the same fix VEC_SEARCH already applies via
-	// vecScoredHeap/topKFromHeap in vector_search.go. Only the k best-scoring
-	// docs are ever retained. ftsScanTopK additionally splits the scan across
-	// workers once there are enough documents to be worth it.
 	restricted := !candidates.unrestricted && ftsCandidateScanIsCheaper(candidates.rows, len(cache.docs))
+	// Bound terms and literal disjunctions can rank from postings even when
+	// their query-derived candidate set is selective. Keep the scan for small
+	// disjunctions where every matching row already fits in the result.
+	if restricted && ftsCanRankPostings(node, k) && (node.op == "TERM" || k < len(candidates.rows)) {
+		restricted = false
+	}
 	results, err := ftsScanTopK(ctx, cache, node, nil, candidates.rows, restricted, k)
 	if err != nil {
 		return nil, fmt.Errorf("FTS_SEARCH: %w", err)

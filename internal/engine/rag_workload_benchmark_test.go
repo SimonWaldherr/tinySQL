@@ -314,6 +314,15 @@ func BenchmarkRAGFTSSearchBranch(b *testing.B) {
 			'term7 OR term23 OR term180 OR needle42', 24, 'search_text')`, 24)
 }
 
+func BenchmarkRAGFTSSelectiveOR(b *testing.B) {
+	db := ragBenchCorpus(b)
+	b.Cleanup(func() { _ = db.Close() })
+	runRAGBench(b, db, `
+		SELECT chunk_id, _fts_score
+		FROM FTS_SEARCH('rag_chunks',
+			'term100 OR term200 OR term300 OR needle42', 24, 'search_text')`, 24)
+}
+
 // ─────────────────────────── lexical selectivity ───────────────────────────
 
 // BenchmarkRAGFTSSelectiveTerm queries a term present in exactly 3 of 20000

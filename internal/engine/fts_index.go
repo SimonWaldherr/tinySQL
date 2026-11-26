@@ -78,7 +78,7 @@ func ftsScanWorkerCount(docs int) int {
 func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, idf ftsIDFFunc, rows []int32, restricted bool, k int) ([]ftsScored, error) {
 	// OR scores are maxima, so the union of each term's top-k contains the
 	// exact global top-k. Restricted scans retain the authorization-aware path.
-	if !restricted && k > 0 && node != nil && ((node.op == "OR" && len(node.termIDNs) > 0) || (node.op == "TERM" && node.idfBound)) {
+	if !restricted && ftsCanRankPostings(node, k) {
 		return ftsDisjunctionTopK(ctx, cache, node, k, nil)
 	}
 	total := len(cache.docs)
@@ -134,7 +134,7 @@ func ftsScanTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode
 	}
 	wg.Wait()
 
-	mergedRows := make(ftsScoredHeap, 0, k)
+	mergedRows := make(ftsScoredHeap, 0, min(k, total))
 	merged := &mergedRows
 	for i := range results {
 		if results[i].err != nil {
@@ -302,7 +302,7 @@ func ftsPhraseMatchIDs(phrase []int32, tokens []int32) bool {
 // ftsScanRange scores the half-open slice [start, end) of either the candidate
 // row list (restricted) or the whole corpus, returning a size-k heap.
 func ftsScanRange(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, idf ftsIDFFunc, rows []int32, restricted bool, start, end, k int) (ftsScoredHeap, error) {
-	heapRows := make(ftsScoredHeap, 0, k)
+	heapRows := make(ftsScoredHeap, 0, min(k, end-start))
 	for i := start; i < end; i++ {
 		if i&1023 == 0 {
 			if err := checkCtx(ctx); err != nil {
@@ -766,8 +766,12 @@ func ftsCandidateScanIsCheaper(rows []int32, numRows int) bool {
 // every document. Any omitted document has at least k better documents for
 // the term supplying its maximum score, and thus cannot enter the OR top-k.
 func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQueryNode, k int, allowed []int32) ([]ftsScored, error) {
+	capacity := min(k, len(cache.docs))
+	if allowed != nil {
+		capacity = min(capacity, len(allowed))
+	}
 	if node.op == "TERM" {
-		h := make(ftsScoredHeap, 0, min(k, len(cache.postings[node.term])))
+		h := make(ftsScoredHeap, 0, min(capacity, len(cache.postings[node.term])))
 		if err := ftsTermPostingTopK(ctx, &cache, node.term, node.termID, node.termIDF, k, &h, allowed); err != nil {
 			return nil, err
 		}
@@ -786,7 +790,7 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 	}
 	sort.Slice(order, func(i, j int) bool { return node.termIDFs[order[i]] > node.termIDFs[order[j]] })
 	winners := make(map[int]float64)
-	merged := make(ftsScoredHeap, 0, k)
+	merged := make(ftsScoredHeap, 0, capacity)
 	// Reused across the term loop below (reset to length 0, capacity
 	// retained) instead of allocating a fresh top-k heap for every OR term.
 	var local ftsScoredHeap
@@ -826,6 +830,11 @@ func ftsDisjunctionTopK(ctx context.Context, cache ftsDocCacheEntry, node *ftsQu
 		}
 	}
 	return ftsTopKFromHeap(&merged, k), nil
+}
+
+func ftsCanRankPostings(node *ftsQueryNode, k int) bool {
+	return k > 0 && node != nil &&
+		(node.op == "TERM" && node.idfBound || node.op == "OR" && len(node.termIDNs) > 0)
 }
 
 // ftsTermPostingTopK scores one term with the same conservative block bounds

@@ -1220,7 +1220,7 @@ func ragFTSSearchCandidatesFiltered(ctx context.Context, tenant string, table *s
 	cache.avgDocLen = prepared.stats.avgDocLen
 	var results []ftsScored
 	var err error
-	if len(prepared.rows) >= 256 && k > 0 && prepared.node != nil && ((prepared.node.op == "OR" && len(prepared.node.termIDNs) > 0) || (prepared.node.op == "TERM" && prepared.node.idfBound)) {
+	if len(prepared.rows) >= 256 && ftsCanRankPostings(prepared.node, k) {
 		// Tiny candidate sets are cheaper to scan than to intersect and merge.
 		// These rows are sorted and unique. Score authorized postings directly,
 		// using the same ACL-local IDFs and average length as the scan fallback.

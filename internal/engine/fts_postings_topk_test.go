@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -38,7 +39,7 @@ func TestFTSPostingTopKMatchesDocumentScan(t *testing.T) {
 			terms = []string{"absent", "missing"}
 		}
 		bound := ftsBindIDF(ftsParseQuery(strings.Join(terms, " OR ")), idf, cache.termIDs)
-		for _, k := range []int{1, 3, 24, 500} {
+		for _, k := range []int{1, 3, 24, math.MaxInt} {
 			got, err := ftsScanTopK(t.Context(), cache, bound, idf, nil, false, k)
 			if err != nil {
 				t.Fatal(err)

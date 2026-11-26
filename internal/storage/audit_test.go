@@ -2,11 +2,50 @@
 package storage
 
 import (
+	"bufio"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func BenchmarkAuditAppend(b *testing.B) {
+	for _, mode := range []string{"memory", "jsonl"} {
+		b.Run(mode, func(b *testing.B) {
+			log := NewAuditLog()
+			// Measure append and encoding without retaining b.N entries.
+			log.entries = make([]AuditEntry, 0, 1024)
+			if mode == "jsonl" {
+				log.writer = bufio.NewWriter(io.Discard)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if len(log.entries) == cap(log.entries) {
+					log.entries = log.entries[:0]
+				}
+				log.Append("default", "alice", "INSERT INTO orders VALUES (42, 'pending')", true, "")
+			}
+		})
+	}
+}
+
+func TestAuditEntryHashCompatibility(t *testing.T) {
+	entry := AuditEntry{
+		Seq:       ^uint64(0),
+		Timestamp: time.Date(2026, 11, 27, 1, 0, 0, 123456789, time.FixedZone("CET", 3600)),
+		Tenant:    "default",
+		User:      "alice",
+		Statement: "INSERT INTO orders VALUES (42, 'ä')",
+		Error:     "write failed",
+		PrevHash:  strings.Repeat("a", 64),
+	}
+	const want = "a6c0522de9e391a30c4c8822068fe39fd76f42a91b0b9a864cad4226a4a95cbf"
+	if got := entry.computeHash(); got != want {
+		t.Fatalf("hash = %s, want %s", got, want)
+	}
+}
 
 func TestAuditLogAppendAndVerify(t *testing.T) {
 	log := NewAuditLog()

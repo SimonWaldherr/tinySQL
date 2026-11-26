@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/driver"
@@ -173,35 +174,78 @@ func (l *Log) Read(ctx context.Context, consumer string, limit int) (result *Bat
 	if err = tx.QueryRowContext(ctx, "SELECT position FROM _tiny_event_consumers WHERE name = ?", consumer).Scan(&cursor); err != nil {
 		return nil, err
 	}
-	floor, _, err := bounds(ctx, tx)
+	floor, last, err := bounds(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
 	if cursor < floor {
 		return nil, ErrCursorExpired
 	}
-	rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT seq, event_key, topic, payload, created_ms FROM _tiny_event_log WHERE seq > ? ORDER BY seq LIMIT %d", limit), cursor)
+	batch := &Batch{From: cursor, To: cursor, from: cursor, to: cursor, consumer: consumer, log: l}
+	if cursor >= last {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return batch, nil
+	}
+
+	const projection = "SELECT seq, event_key, topic, payload, created_ms FROM _tiny_event_log"
+	// Probe the primary key directly for dense batches. Stay within the SQL
+	// planner's IN-list limit, and cap the number of separate queries.
+	const seekPageSize = 64
+	const maxSeekPages = 4
+	next := cursor
+	if available := min(int64(limit), last-cursor); available <= seekPageSize*maxSeekPages {
+		end := cursor + available
+		var keys [seekPageSize]any
+		for next < end {
+			count := int(min(seekPageSize, end-next))
+			for i := range count {
+				keys[i] = next + int64(i) + 1
+			}
+			query := projection + " WHERE seq = ?"
+			if count > 1 {
+				query = projection + " WHERE seq IN (" + strings.Repeat("?,", count-1) + "?) ORDER BY seq"
+			}
+			start := len(batch.Events)
+			if err := batch.readEvents(ctx, tx, query, keys[:count]...); err != nil {
+				return nil, err
+			}
+			next += int64(count)
+			if len(batch.Events)-start < count {
+				break
+			}
+		}
+	}
+	if remaining := limit - len(batch.Events); remaining > 0 && next < last {
+		// Read large batches in one scan, or fill a short page after a
+		// sequence gap. Both paths use the same read-only snapshot.
+		query := fmt.Sprintf(projection+" WHERE seq > ? ORDER BY seq LIMIT %d", remaining)
+		if err := batch.readEvents(ctx, tx, query, next); err != nil {
+			return nil, err
+		}
+	}
+	return batch, nil
+}
+
+func (b *Batch) readEvents(ctx context.Context, tx *sql.Tx, query string, args ...any) (err error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer errutil.Close(rows, &err, "close event rows")
-	batch := &Batch{From: cursor, To: cursor, from: cursor, to: cursor, consumer: consumer, log: l}
 	for rows.Next() {
 		var e Event
 		var ms int64
 		if err = rows.Scan(&e.Sequence, &e.Key, &e.Topic, &e.Payload, &ms); err != nil {
-			return nil, err
+			return err
 		}
 		e.CreatedAt = time.UnixMilli(ms)
-		batch.Events = append(batch.Events, e)
-		batch.To = e.Sequence
-		batch.to = e.Sequence
+		b.Events = append(b.Events, e)
+		b.To = e.Sequence
+		b.to = e.Sequence
 	}
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-	// This is a read-only snapshot; rollback releases it without a needless commit.
-	return batch, nil
+	return rows.Err()
 }
 
 // Ack confirms all events in this batch after the caller has processed them.

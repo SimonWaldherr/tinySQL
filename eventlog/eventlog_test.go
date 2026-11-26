@@ -2,9 +2,11 @@ package eventlog_test
 
 import (
 	"errors"
+	"math"
+	"testing"
+
 	"github.com/SimonWaldherr/tinySQL/driver"
 	"github.com/SimonWaldherr/tinySQL/eventlog"
-	"testing"
 )
 
 func TestOutboxRollbackReplayAckAndRetention(t *testing.T) {
@@ -120,6 +122,48 @@ func TestEventCursorSurvivesReopen(t *testing.T) {
 	}
 	if len(batch.Events) != 1 || batch.Events[0].Key != "order-2" {
 		t.Fatal(batch)
+	}
+}
+
+func TestReadFillsBatchAcrossSequenceGap(t *testing.T) {
+	ctx := t.Context()
+	db, err := driver.OpenInMemory("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	log, err := eventlog.Open(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const last = int64(math.MaxInt)
+	// Leave a gap after the first event. The cursor window also needs to
+	// retain exact integer keys and avoid overflowing at the sequence limit.
+	if _, err = db.ExecContext(ctx, "UPDATE _tiny_event_state SET value = ? WHERE name = 'sequence'", last); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.ExecContext(ctx, "INSERT INTO _tiny_event_log VALUES (?, 'first', 'topic', NULL, 0), (?, 'last', 'topic', NULL, 0)", last-2, last); err != nil {
+		t.Fatal(err)
+	}
+	if err = log.RegisterConsumer(ctx, "worker", last-3); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := log.Read(ctx, "worker", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.From != last-3 || batch.To != last || len(batch.Events) != 2 || batch.Events[0].Sequence != last-2 || batch.Events[1].Sequence != last {
+		t.Fatalf("unexpected batch: %+v", batch)
+	}
+	if err := batch.Ack(ctx); err != nil {
+		t.Fatal(err)
+	}
+	idle, err := log.Read(ctx, "worker", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idle.From != last || idle.To != last || len(idle.Events) != 0 {
+		t.Fatalf("unexpected batch at the end of the log: %+v", idle)
 	}
 }
 

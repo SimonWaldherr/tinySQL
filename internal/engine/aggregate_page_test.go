@@ -43,6 +43,8 @@ func TestGroupedAggregatePagesMatchCompleteResult(t *testing.T) {
 		"SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM group_pages GROUP BY grp",
 		"SELECT grp, COUNT(*) AS n FROM group_pages GROUP BY grp HAVING COUNT(*) > 241",
 		"SELECT grp, SUM(val) AS total FROM group_pages GROUP BY grp HAVING SUM(val) > 0 ORDER BY total DESC",
+		"SELECT id, SUM(val) AS total FROM group_pages WHERE id < 55 GROUP BY id ORDER BY total DESC NULLS FIRST",
+		"SELECT grp, MIN(val) AS SCORE, COUNT(*) AS score FROM group_pages GROUP BY grp ORDER BY SCORE DESC",
 		"SELECT COUNT(*) AS n FROM group_pages WHERE id < 0",
 		"SELECT grp, COUNT(*) AS n FROM group_pages WHERE id < 0 GROUP BY grp",
 	} {
@@ -70,6 +72,7 @@ func TestGroupedAggregatePageStillEvaluatesAllInput(t *testing.T) {
 	execSQL(t, db, "INSERT INTO group_page_errors VALUES (1, 2), (2, 0)")
 	for _, query := range []string{
 		"SELECT grp, SUM(1 / val) FROM group_page_errors GROUP BY grp",
+		"SELECT grp, SUM(1 / val) AS total FROM group_page_errors GROUP BY grp ORDER BY grp",
 		"SELECT grp, SUM(val) FROM group_page_errors GROUP BY grp HAVING 1 / SUM(val) > 0",
 	} {
 		for _, page := range []string{"LIMIT 0", "LIMIT 1", "LIMIT 1 OFFSET 100"} {
