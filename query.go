@@ -335,7 +335,8 @@ func ExecSQLArgs(ctx context.Context, db *DB, tenant, sql string, args ...any) (
 // ExecScript executes a multi-statement SQL script in order and returns the
 // result of its last statement. Statements are split with SplitStatements
 // semantics (see package sqlutil): semicolons in literals, quoted identifiers,
-// comments and CREATE TRIGGER bodies do not split.
+// comments and CREATE TRIGGER bodies do not split. A standalone GO line is
+// a separator too.
 //
 // Execution stops at the first failing statement; the error names its
 // 1-based position and wraps the engine error. Statements that already ran

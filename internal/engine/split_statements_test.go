@@ -18,6 +18,9 @@ func TestSplitStatements(t *testing.T) {
 		{"identifier and blob", `SELECT "a;b", X'3b' FROM t; SELECT 2`, []string{`SELECT "a;b", X'3b' FROM t`, "SELECT 2"}},
 		{"comments", "-- lead; comment\nSELECT 1 /* ; */; -- tail;\nSELECT 2", []string{"SELECT 1 /* ; */", "SELECT 2"}},
 		{"transaction", "BEGIN; INSERT INTO t VALUES (1); COMMIT;", []string{"BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"}},
+		{"GO batches", "BEGIN\r\ngO -- next batch\r\nINSERT INTO t VALUES (1);\nCOMMIT\nGO", []string{"BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"}},
+		{"GO inside SQL", "SELECT (\ngo\n), 'hello\nGO\nworld',\n\"GO\"\nFROM t;\nGO", []string{"SELECT (\ngo\n), 'hello\nGO\nworld',\n\"GO\"\nFROM t"}},
+		{"GO inside trigger", "CREATE TRIGGER t BEGIN INSERT INTO audit SELECT\ngo\nFROM src; END\nGO\nSELECT 1", []string{"CREATE TRIGGER t BEGIN INSERT INTO audit SELECT\ngo\nFROM src; END", "SELECT 1"}},
 		{
 			"trigger body",
 			"CREATE TRIGGER trg AFTER INSERT ON t BEGIN UPDATE c SET n = CASE WHEN NEW.id > 0 THEN 1 ELSE 0 END; DELETE FROM d; END; SELECT 1",
@@ -72,7 +75,10 @@ func TestStatementComplete(t *testing.T) {
 		"CREATE TRIGGER t AFTER INSERT ON x BEGIN INSERT INTO y VALUES (1);":      false,
 		"CREATE TRIGGER t AFTER INSERT ON x BEGIN INSERT INTO y VALUES (1); END":  false,
 		"CREATE TRIGGER t AFTER INSERT ON x BEGIN INSERT INTO y VALUES (1); END;": true,
-		"BEGIN;": true,
+		"BEGIN;":                  true,
+		"BEGIN\nGO -- next batch": true,
+		"SELECT 1\nGO\nSELECT 2":  false,
+		"GO":                      false,
 	} {
 		if got := StatementComplete(script); got != want {
 			t.Errorf("StatementComplete(%q) = %v, want %v", script, got, want)

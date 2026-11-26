@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -45,7 +46,7 @@ func checkInteractiveMode() bool {
 // printREPLBanner prints the REPL startup banner
 func printREPLBanner(interactive, htmlMode bool) {
 	if interactive && !htmlMode {
-		fmt.Println("tinysql REPL (database/sql). Statement mit ';' beenden. '.help' für Hilfe.")
+		fmt.Println("tinysql REPL (database/sql). Statement mit ';' oder GO in eigener Zeile beenden. '.help' für Hilfe.")
 	}
 }
 
@@ -75,8 +76,16 @@ func handleInputError(err error, htmlMode bool, htmlParts *[]string) {
 	}
 }
 
+// Keep one driver session across input statements so BEGIN, temporary state
+// and GO-separated batches all use the same connection.
+type replSession interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 // executeStatement executes a complete SQL statement
-func executeStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly bool, format string, srcLines []string, htmlParts *[]string, interactive bool) []string {
+func executeStatement(db replSession, q string, beautiful, htmlMode, errorsOnly bool, format string, srcLines []string, htmlParts *[]string, interactive bool) []string {
 	if sqlutil.IsResultProducing(q) {
 		if err := handleSelectStatement(db, q, beautiful, htmlMode, errorsOnly, format, srcLines, htmlParts, interactive); err != nil {
 			return nil
@@ -91,6 +100,12 @@ func executeStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly bool
 }
 
 func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool, errorsOnly bool) {
+	session, err := db.Conn(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "connection error:", err)
+		return
+	}
+	defer session.Close()
 	sc := bufio.NewScanner(os.Stdin)
 	// Scanner token limit is 64K by default; allow larger statements/files.
 	sc.Buffer(make([]byte, 1024), 4*1024*1024)
@@ -146,7 +161,7 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 		}
 
 		if buf.Len() == 0 && strings.HasPrefix(line, ".") {
-			if handleMeta(db, line) {
+			if handleMeta(session, line) {
 				continue
 			}
 		}
@@ -165,7 +180,7 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 					fmt.Println("--", q)
 				}
 
-				newSrcLines := executeStatement(db, q, beautiful, htmlMode, errorsOnly, format, srcLines, &htmlParts, interactive)
+				newSrcLines := executeStatement(session, q, beautiful, htmlMode, errorsOnly, format, srcLines, &htmlParts, interactive)
 				if newSrcLines == nil && beautiful {
 					srcLines = nil
 				} else if newSrcLines != nil {
@@ -178,7 +193,7 @@ func runREPL(db *sql.DB, echo bool, format string, beautiful bool, htmlMode bool
 }
 
 // replReadAndExecFile reads SQL statements from filename and executes them.
-func replReadAndExecFile(db *sql.DB, filename string) {
+func replReadAndExecFile(db replSession, filename string) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		fmt.Println("Error:", err)
@@ -191,7 +206,7 @@ func replReadAndExecFile(db *sql.DB, filename string) {
 			continue
 		}
 		if sqlutil.IsResultProducing(s) {
-			rows, err := db.Query(s)
+			rows, err := db.QueryContext(context.Background(), s)
 			if err != nil {
 				fmt.Println("ERR:", err)
 				continue
@@ -200,7 +215,7 @@ func replReadAndExecFile(db *sql.DB, filename string) {
 			replPrintRows(rows, cols)
 			rows.Close()
 		} else {
-			if _, err := db.Exec(s); err != nil {
+			if _, err := db.ExecContext(context.Background(), s); err != nil {
 				fmt.Println("ERR:", err)
 			} else {
 				fmt.Println("(ok)")
@@ -209,7 +224,7 @@ func replReadAndExecFile(db *sql.DB, filename string) {
 	}
 }
 
-func handleMeta(db *sql.DB, line string) bool {
+func handleMeta(db replSession, line string) bool {
 	parts := strings.Fields(line)
 	if len(parts) == 0 {
 		return false
@@ -237,7 +252,7 @@ Commands:
 		os.Exit(0)
 
 	case ".tables":
-		rows, err := db.Query(`SELECT name FROM sys.tables ORDER BY name`)
+		rows, err := db.QueryContext(context.Background(), `SELECT name FROM sys.tables ORDER BY name`)
 		if err != nil {
 			fmt.Println("Error:", err)
 			return true
@@ -268,7 +283,7 @@ Commands:
 			tables = args
 		}
 		for _, t := range tables {
-			row := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", t))
+			row := db.QueryRowContext(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s", t))
 			var cnt int
 			if err := row.Scan(&cnt); err != nil {
 				fmt.Printf("  %-20s (error: %v)\n", t, err)
@@ -307,8 +322,8 @@ Commands:
 }
 
 // replListTableNames returns all table names sorted.
-func replListTableNames(db *sql.DB) []string {
-	rows, err := db.Query(`SELECT name FROM sys.tables ORDER BY name`)
+func replListTableNames(db replSession) []string {
+	rows, err := db.QueryContext(context.Background(), `SELECT name FROM sys.tables ORDER BY name`)
 	if err != nil {
 		return nil
 	}
@@ -323,8 +338,8 @@ func replListTableNames(db *sql.DB) []string {
 }
 
 // replShowSchema prints column info for a table.
-func replShowSchema(db *sql.DB, table string) {
-	r, err := db.Query(fmt.Sprintf("SELECT * FROM %s LIMIT 0", table))
+func replShowSchema(db replSession, table string) {
+	r, err := db.QueryContext(context.Background(), fmt.Sprintf("SELECT * FROM %s LIMIT 0", table))
 	if err != nil {
 		fmt.Printf("Cannot describe %s: %v\n", table, err)
 		return
@@ -347,8 +362,8 @@ func replShowSchema(db *sql.DB, table string) {
 }
 
 // replDumpTable outputs INSERT statements for a table.
-func replDumpTable(db *sql.DB, table string) {
-	rows, err := db.Query(fmt.Sprintf("SELECT * FROM %s", table))
+func replDumpTable(db replSession, table string) {
+	rows, err := db.QueryContext(context.Background(), fmt.Sprintf("SELECT * FROM %s", table))
 	if err != nil {
 		fmt.Printf("dump %s: %v\n", table, err)
 		return
@@ -444,7 +459,7 @@ func replPrintRows(rows *sql.Rows, cols []string) {
 }
 
 // handleSelectStatement executes a SELECT/CTE query and appends HTML parts when requested.
-func handleSelectStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly bool, format string, srcLines []string, htmlParts *[]string, interactive bool) error {
+func handleSelectStatement(db replSession, q string, beautiful, htmlMode, errorsOnly bool, format string, srcLines []string, htmlParts *[]string, interactive bool) error {
 	var sqlFrag string
 	if beautiful {
 		if htmlMode {
@@ -456,7 +471,7 @@ func handleSelectStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly
 		sqlFrag = renderSQLHTML(q)
 	}
 
-	rows, err := db.Query(q)
+	rows, err := db.QueryContext(context.Background(), q)
 	if err == nil && errorsOnly {
 		// Execute lazy projections too, without allocating display rows.
 		for rows.Next() {
@@ -525,9 +540,9 @@ func handleSelectStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly
 }
 
 // handleNonSelectStatement executes non-SELECT statements and updates HTML parts as needed.
-func handleNonSelectStatement(db *sql.DB, q string, beautiful, htmlMode, errorsOnly bool, htmlParts *[]string, interactive bool, srcLines []string) error {
+func handleNonSelectStatement(db replSession, q string, beautiful, htmlMode, errorsOnly bool, htmlParts *[]string, interactive bool, srcLines []string) error {
 	var sqlFrag string
-	if _, err := db.Exec(q); err != nil {
+	if _, err := db.ExecContext(context.Background(), q); err != nil {
 		friendly := friendlyErrorString(err)
 		if htmlMode {
 			if sqlFrag == "" {

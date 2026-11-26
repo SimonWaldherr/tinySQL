@@ -8,7 +8,8 @@ import (
 
 // splitStatements splits SQL on statement separators without treating
 // semicolons inside quoted strings, quoted identifiers, or comments as
-// separators. Keeping this separate from the WASM bridge makes the editor's
+// separators. A standalone GO line also ends a statement. Keeping this
+// separate from the WASM bridge makes the editor's
 // multi-statement behavior directly testable on every Go target.
 func splitStatements(raw string) []string {
 	const (
@@ -32,7 +33,7 @@ func splitStatements(raw string) []string {
 		prefixTrigger
 		prefixOther
 	)
-	prefix, triggerDepth := prefixStart, 0
+	prefix, triggerDepth, parens := prefixStart, 0, 0
 
 	appendStatement := func(end int) {
 		if statement := strings.TrimSpace(raw[start:end]); statement != "" && hasSQLContent(statement) {
@@ -51,6 +52,13 @@ func splitStatements(raw string) []string {
 
 		switch state {
 		case normal:
+			if triggerDepth == 0 && parens == 0 && (ch == 'G' || ch == 'g') && (next == 'O' || next == 'o') {
+				if end := goBatchLineEnd(raw, i); end >= 0 {
+					appendStatement(i)
+					start, i, prefix = end, end-1, prefixStart
+					continue
+				}
+			}
 			switch {
 			case ch == '\'':
 				if prefix != prefixTrigger {
@@ -76,9 +84,14 @@ func splitStatements(raw string) []string {
 				}
 				appendStatement(i)
 				start = i + 1
-				prefix = prefixStart
+				prefix, parens = prefixStart, 0
 				continue
 			default:
+				if ch == '(' {
+					parens++
+				} else if ch == ')' && parens > 0 {
+					parens--
+				}
 				// Once an ordinary statement is identified, no other tokens
 				// need inspecting until its terminating semicolon.
 				if prefix == prefixOther {
@@ -166,6 +179,22 @@ func splitStatements(raw string) []string {
 	}
 	appendStatement(len(raw))
 	return statements
+}
+
+func goBatchLineEnd(raw string, start int) int {
+	lineStart := strings.LastIndexAny(raw[:start], "\r\n") + 1
+	if strings.TrimSpace(raw[lineStart:start]) != "" {
+		return -1
+	}
+	end := len(raw)
+	if newline := strings.IndexAny(raw[start+2:], "\r\n"); newline >= 0 {
+		end = start + 2 + newline
+	}
+	trailing := strings.TrimSpace(raw[start+2 : end])
+	if trailing == "" || strings.HasPrefix(trailing, "--") {
+		return end
+	}
+	return -1
 }
 
 func isSQLIdentifierStart(text string) bool {

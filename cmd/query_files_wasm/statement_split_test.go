@@ -73,6 +73,11 @@ func TestSplitStatementsKeepsQuotedAndCommentSemicolons(t *testing.T) {
 			want: []string{"BEGIN", "SELECT 1", "COMMIT"},
 		},
 		{
+			name: "standalone GO lines separate batches",
+			sql:  "-- setup\nSELECT (\nGO\n), 'a\nGO\nb'\r\ngO -- next\r\nSELECT \"GO\"\nGO\n",
+			want: []string{"-- setup\nSELECT (\nGO\n), 'a\nGO\nb'", "SELECT \"GO\""},
+		},
+		{
 			name: "invalid trigger prefix does not hide separators",
 			sql:  "CREATE OR ALTER TRIGGER t BEGIN SELECT 1; SELECT 2;",
 			want: []string{"CREATE OR ALTER TRIGGER t BEGIN SELECT 1", "SELECT 2"},

@@ -19,6 +19,8 @@ func TestREPLExecutesScriptsWithCommentsAndMultilineStrings(t *testing.T) {
 		"INSERT INTO repl_script VALUES (2, -- keep this newline\n'second'); -- trailing comment\n" +
 		"/* block comment */ INSERT INTO repl_script VALUES (3, 'third');\n" +
 		"INSERT INTO repl_script VALUES (4, 'line one\n-- not a comment\nline three');\n" +
+		"BEGIN\nGO\nINSERT INTO repl_script VALUES (5, 'committed');\nCOMMIT\nGO\n" +
+		"BEGIN;\nINSERT INTO repl_script VALUES (6, 'rolled back');\nROLLBACK\nGO\n" +
 		"INSERT INTO repl_script VALUES (9876, 'returning') RETURNING id;\n"
 	stdin, err := os.CreateTemp(t.TempDir(), "stdin")
 	if err != nil {
@@ -53,11 +55,15 @@ func TestREPLExecutesScriptsWithCommentsAndMultilineStrings(t *testing.T) {
 	if !strings.Contains(string(output), "9876") {
 		t.Fatalf("RETURNING result missing from REPL output: %s", output)
 	}
-	for id, want := range map[int]string{1: "first", 2: "second", 3: "third", 4: "line one\n-- not a comment\nline three", 9876: "returning"} {
+	for id, want := range map[int]string{1: "first", 2: "second", 3: "third", 4: "line one\n-- not a comment\nline three", 5: "committed", 9876: "returning"} {
 		var got string
 		if err := db.QueryRow("SELECT value FROM repl_script WHERE id = ?", id).Scan(&got); err != nil || got != want {
 			t.Errorf("row %d: got %q, err %v; want %q", id, got, err, want)
 		}
+	}
+	var rolledBack int
+	if err := db.QueryRow("SELECT COUNT(*) FROM repl_script WHERE id = 6").Scan(&rolledBack); err != nil || rolledBack != 0 {
+		t.Fatalf("REPL rollback left %d rows, error %v", rolledBack, err)
 	}
 }
 
