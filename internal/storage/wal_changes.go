@@ -57,12 +57,8 @@ func CollectWALChanges(prev, next *DB) []WALChange {
 	if prev == nil || next == nil {
 		return nil
 	}
-	// Estimate capacity based on number of tables in next
-	var estCapacity int
-	for _, tdb := range next.tenants {
-		estCapacity += len(tdb.tables)
-	}
-	changes := make([]WALChange, 0, estCapacity)
+	// A transaction commonly writes just one of many visible tables.
+	changes := []WALChange{}
 	for tn, nextTenant := range next.tenants {
 		prevTenant := prev.tenants[tn]
 		for key, nt := range nextTenant.tables {
@@ -72,7 +68,7 @@ func CollectWALChanges(prev, next *DB) []WALChange {
 			}
 			// A table a transaction shadow still shares with the live database
 			// has not been written by that transaction.
-			if next.isTxShared(nt) {
+			if pv == nt || next.isTxShared(nt) {
 				continue
 			}
 			recreated := pv != nil && pv.incarnation != 0 && nt.incarnation != 0 && pv.incarnation != nt.incarnation

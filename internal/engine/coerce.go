@@ -206,7 +206,7 @@ func coerceToBlob(v any) (any, error) {
 func coerceToInt(v any) (any, error) {
 	switch x := v.(type) {
 	case int:
-		return x, nil
+		return v, nil
 	case int64:
 		return int(x), nil
 	case float64:

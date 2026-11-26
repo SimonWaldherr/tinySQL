@@ -23,8 +23,35 @@ func (db *DB) StagedInsertTable(tenant, table, owner string) *Table {
 func (db *DB) AppendStagedInsertRows(tenant, owner string, target *Table, rows [][]any) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	stage, err := db.stagedInsertTableForAppend(tenant, owner, target)
+	if err != nil {
+		return err
+	}
+	if len(stage.Rows) == 0 {
+		stage.Rows = rows
+	} else {
+		stage.Rows = append(stage.Rows, rows...)
+	}
+	return nil
+}
+
+// AppendStagedInsertRow takes ownership of a single row without allocating a
+// separate slice of row headers. The caller must hold the content write lock.
+func (db *DB) AppendStagedInsertRow(tenant, owner string, target *Table, row []any) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	stage, err := db.stagedInsertTableForAppend(tenant, owner, target)
+	if err != nil {
+		return err
+	}
+	stage.Rows = append(stage.Rows, row)
+	return nil
+}
+
+// stagedInsertTableForAppend requires db.mu for writing.
+func (db *DB) stagedInsertTableForAppend(tenant, owner string, target *Table) (*Table, error) {
 	if db.closed || db.closing {
-		return fmt.Errorf("database is closed or closing")
+		return nil, fmt.Errorf("database is closed or closing")
 	}
 	key := stagedInsertKey(tenant, target.Name)
 	if db.stagedInserts == nil {
@@ -38,12 +65,9 @@ func (db *DB) AppendStagedInsertRows(tenant, owner string, target *Table, rows [
 	stage := byOwner[owner]
 	if stage == nil {
 		stage = NewTable(target.Name, cloneColumnsDeep(target.Cols), true)
-		stage.Rows = rows
 		byOwner[owner] = stage
-		return nil
 	}
-	stage.Rows = append(stage.Rows, rows...)
-	return nil
+	return stage, nil
 }
 
 // DiscardStagedInserts releases this owner's buffer and returns its row count.

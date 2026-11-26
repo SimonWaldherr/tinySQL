@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -163,6 +164,39 @@ func TestSharedSnapshotReleaseKeepsStreamPins(t *testing.T) {
 	releaseStream()
 	if db.IsTablePinnedForStream(big) {
 		t.Fatal("stream pin leaked")
+	}
+}
+
+func TestSharedSnapshotPinsSameTableAcrossTenants(t *testing.T) {
+	for _, extra := range []int{0, 16} {
+		t.Run(fmt.Sprint(extra), func(t *testing.T) {
+			db, big, _ := newSharedTestDB(t)
+			if err := db.Put("other", big); err != nil {
+				t.Fatal(err)
+			}
+			for i := range extra {
+				if err := db.Put("other", NewTable(fmt.Sprint(i), nil, false)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, shadow, release := takeShared(t, db)
+			defer release()
+			for range 8 {
+				if !shadow.isTxShared(big) {
+					t.Fatal("missing initial pin")
+				}
+			}
+			if !shadow.DetachPinnedTableForWrite("default", "big") || !db.IsTablePinnedForStream(big) {
+				t.Fatal("detaching one tenant lost the other tenant's pin")
+			}
+			if !shadow.DetachPinnedTableForWrite("other", "big") || db.IsTablePinnedForStream(big) {
+				t.Fatal("detaching the second tenant did not consume the last pin")
+			}
+			release()
+			if len(db.streamSnapshots) != 0 {
+				t.Fatal("transaction pins leaked after release")
+			}
+		})
 	}
 }
 

@@ -253,6 +253,11 @@ func TestImportCSV_StreamedSampling(t *testing.T) {
 	if len(tbl.Rows) != 8 {
 		t.Fatalf("expected 8 rows in table, got %d", len(tbl.Rows))
 	}
+	for i, row := range tbl.Rows {
+		if row[0] != int64(i+1) || row[1] != "name"+strconv.Itoa(i+1) {
+			t.Errorf("row %d: got %v", i+1, row)
+		}
+	}
 }
 
 // TestImportJSON_ArrayOfObjects validates importing a JSON array of
@@ -364,6 +369,24 @@ func TestTypeInference_MixedDefaultsToText(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		if types[i] != storage.TextType {
 			t.Errorf("Column %d: expected TEXT type, got %v", i, types[i])
+		}
+	}
+}
+
+func TestTypeInferenceTextThreshold(t *testing.T) {
+	sample := [][]string{
+		{"text", "text", "text", "text"},
+		{"2", "2", "more text", "Jan"},
+		{"3", "3.5", "3", "Feb"},
+		{"4", "4", "4", "Mar"},
+		{"5", "5", "5", "Apr"},
+		{}, // Missing cells count as NULL.
+	}
+	got := inferColumnTypes(sample, 4, &ImportOptions{NullLiterals: []string{""}, DateTimeFormats: []string{"Jan"}})
+	want := []storage.ColType{storage.IntType, storage.Float64Type, storage.TextType, storage.TimeType}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("column %d: got %v, want %v", i, got[i], want[i])
 		}
 	}
 }

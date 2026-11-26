@@ -29,6 +29,7 @@ func TestAggregateCountBatchesMatchScalar(t *testing.T) {
 		`SELECT COUNT(amount) AS n FROM batch_facts WHERE id<0`,
 		`SELECT COUNT(amount) AS n FROM batch_facts WHERE id>=4096`,
 		`SELECT grp,COUNT(amount) AS n,COUNT(amount) AS again,COUNT(*) AS total FROM batch_facts GROUP BY grp`,
+		`SELECT grp,COUNT(1) AS n,COUNT(FALSE) AS again,COUNT(*) AS total FROM batch_facts WHERE id>=1024 GROUP BY grp`,
 		`SELECT grp,quantity,COUNT(amount) AS n,COUNT(*) AS total FROM batch_facts GROUP BY grp,quantity`,
 		`SELECT grp,COUNT(amount) AS n,COUNT(*) AS total FROM batch_facts WHERE id>=2048 GROUP BY grp HAVING COUNT(amount)>0 ORDER BY n DESC LIMIT 5 OFFSET 2`,
 		`SELECT grp,COUNT(amount) AS n FROM batch_facts WHERE id<0 GROUP BY grp`,

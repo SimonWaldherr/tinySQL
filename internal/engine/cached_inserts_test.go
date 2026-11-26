@@ -1,12 +1,66 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
+
+func TestCachedInsertAppendAfterCanceledFlush(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	execSQL(t, db, `CREATE TABLE docs (id INT)`)
+	execSQL(t, db, `INSERT INTO docs VALUES (1)`)
+	execSQL(t, db, `INSERT CACHED INTO docs VALUES (2), (3)`)
+
+	// The populated-table path checks cancellation before and after appending.
+	ctx := &cancelAfterTwoChecks{Context: t.Context(), done: make(chan struct{})}
+	flush := mustParse(`FLUSH INSERTS docs`)
+	if _, err := Execute(ctx, db, "default", flush); !errors.Is(err, context.Canceled) {
+		t.Fatalf("flush returned %v after %d cancellation checks", err, ctx.calls)
+	}
+	table, err := db.Get("default", "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(table.Rows, [][]any{{1}}) {
+		t.Fatalf("canceled flush left rows %v", table.Rows)
+	}
+	if n := execSQL(t, db, `FLUSH INSERTS docs`).Rows[0]["inserted"]; n != 2 {
+		t.Fatalf("retry inserted %v rows, want 2", n)
+	}
+	if !reflect.DeepEqual(table.Rows, [][]any{{1}, {2}, {3}}) {
+		t.Fatalf("rows after retry = %v", table.Rows)
+	}
+}
+
+func TestCachedInsertFlushValidatesUnindexedTable(t *testing.T) {
+	for _, tc := range []struct{ schema, invalid, wantError string }{
+		{"id INT NOT NULL", "NULL", "NOT NULL"},
+		{"id INT, CHECK (id > 0)", "-1", "CHECK"},
+	} {
+		t.Run(tc.wantError, func(t *testing.T) {
+			db := storage.NewDB()
+			t.Cleanup(func() { _ = db.Close() })
+			execSQL(t, db, "CREATE TABLE docs ("+tc.schema+")")
+			execSQL(t, db, "INSERT CACHED INTO docs VALUES (1), ("+tc.invalid+")")
+			_, err := Execute(t.Context(), db, "default", mustParse(`FLUSH INSERTS docs`))
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("flush error = %v, want %s", err, tc.wantError)
+			}
+			if rows := execSQL(t, db, `SELECT * FROM docs`).Rows; len(rows) != 0 {
+				t.Fatalf("failed flush published %v", rows)
+			}
+			if n := execSQL(t, db, `DISCARD INSERTS docs`).Rows[0]["discarded"]; n != 2 {
+				t.Fatalf("failed flush left %v staged rows, want 2", n)
+			}
+		})
+	}
+}
 
 func TestCachedInsertBatch(t *testing.T) {
 	db := storage.NewDB()
@@ -100,6 +154,29 @@ func TestCachedInsertIntoEmptyTableRetainsBufferOnFailure(t *testing.T) {
 	execSQL(t, db, `FLUSH INSERTS docs`)
 	if len(table.Rows) != 2 || &table.Rows[0] != &stage.Rows[0] {
 		t.Fatal("successful transfer did not reuse the staged row headers")
+	}
+}
+
+func TestCachedInsertRecognizesMutableDefaultChanges(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	defaultVector := []float64{1, 0}
+	table := storage.NewTable("docs", []storage.Column{
+		{Name: "id", Type: storage.IntType},
+		{Name: "embedding", Type: storage.VectorType, HasDefault: true, DefaultValue: defaultVector},
+	}, false)
+	if err := db.Put("default", table); err != nil {
+		t.Fatal(err)
+	}
+	execSQL(t, db, `INSERT CACHED INTO docs (id) VALUES (1)`)
+	execSQL(t, db, `INSERT CACHED INTO docs (id) VALUES (2), (3)`)
+	defaultVector[0] = 2
+	if _, err := Execute(t.Context(), db, "default", mustParse(`FLUSH INSERTS docs`)); err == nil || !strings.Contains(err.Error(), "different column schema") {
+		t.Fatalf("flush with changed default: %v", err)
+	}
+	defaultVector[0] = 1
+	if got := execSQL(t, db, `FLUSH INSERTS docs`).Rows[0]["inserted"]; got != 3 {
+		t.Fatalf("flushed %v rows, want 3", got)
 	}
 }
 

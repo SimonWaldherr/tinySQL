@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
@@ -54,6 +55,23 @@ func TestStrictUTF8ReaderRejectsInvalidFinalChunk(t *testing.T) {
 	_, err := io.ReadAll(newStrictUTF8Reader(&finalChunkReader{}))
 	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
 		t.Fatalf("error = %v, want invalid UTF-8", err)
+	}
+}
+
+func TestStrictUTF8ReaderSplitRunes(t *testing.T) {
+	// The four-byte rune starts in one 32 KiB buffer and ends in the next.
+	input := strings.Repeat("a", (32<<10)-3) + "🌍é日"
+	got, err := io.ReadAll(newStrictUTF8Reader(strings.NewReader(input)))
+	if err != nil || string(got) != input {
+		t.Fatalf("read %d of %d bytes: %v", len(got), len(input), err)
+	}
+	for _, tail := range []string{"", "\xf0", "\xf0\x9f", "\xf0\x9f\x8c"} {
+		const valid = "a🌍é日"
+		source := iotest.OneByteReader(strings.NewReader(valid + tail))
+		got, err := io.ReadAll(newStrictUTF8Reader(source))
+		if string(got) != valid || (err != nil) != (tail != "") {
+			t.Errorf("tail %x: got %q, error %v", tail, got, err)
+		}
 	}
 }
 

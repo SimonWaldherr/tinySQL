@@ -20,34 +20,26 @@ import (
 func inferColumnTypes(sampleData [][]string, numCols int, opts *ImportOptions) []storage.ColType {
 	types := make([]storage.ColType, numCols)
 
-	// Initialize type vote counters per column
-	votes := make([]map[storage.ColType]int, numCols)
-	for i := range votes {
-		votes[i] = make(map[storage.ColType]int)
-	}
-
-	// Analyze each column across all sample rows
-	for _, row := range sampleData {
-		for colIdx := 0; colIdx < numCols; colIdx++ {
+	for colIdx := range types {
+		votes := make(map[storage.ColType]int)
+		for _, row := range sampleData {
 			var val string
 			if colIdx < len(row) {
 				val = strings.TrimSpace(row[colIdx])
 			}
-
-			// Skip null values in type inference
 			if isNullValue(val, opts.NullLiterals) {
 				continue
 			}
-
-			// Try to determine type in order of specificity
-			detectedType := detectValueType(val, opts.DateTimeFormats)
-			votes[colIdx][detectedType]++
+			kind := detectValueType(val, opts.DateTimeFormats)
+			votes[kind]++
+			// Once over one fifth of the entire sample is TEXT, no other
+			// type can reach 80% of the non-NULL values, even if all the
+			// remaining rows agree. At exactly one fifth it still can.
+			if kind == storage.TextType && votes[kind] > len(sampleData)/5 {
+				break
+			}
 		}
-	}
-
-	// Determine final type for each column based on votes
-	for colIdx := 0; colIdx < numCols; colIdx++ {
-		types[colIdx] = determineColumnType(votes[colIdx])
+		types[colIdx] = determineColumnType(votes)
 	}
 
 	return types
@@ -132,7 +124,7 @@ func isTimeLike(val string, layouts []string) bool {
 }
 
 // determineColumnType picks the final type based on vote counts.
-// Strategy: Pick most specific type that covers >80% of non-null values, else TEXT.
+// Pick the most specific type that covers at least 80% of non-NULL values.
 func determineColumnType(votes map[storage.ColType]int) storage.ColType {
 	if len(votes) == 0 {
 		return storage.TextType

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,10 +32,22 @@ func insertCacheCount(column string, count int) *ResultSet {
 }
 
 func checkInsertStageSchema(target, stage *storage.Table) error {
-	if stage != nil && !reflect.DeepEqual(target.Cols, stage.Cols) {
+	if stage == nil || stage == target {
+		return nil
+	}
+	if (target.Cols == nil) != (stage.Cols == nil) || !slices.EqualFunc(target.Cols, stage.Cols, sameInsertStageColumn) {
 		return fmt.Errorf("cached inserts for %q have a different column schema; discard the pending rows first", target.Name)
 	}
 	return nil
+}
+
+func sameInsertStageColumn(a, b storage.Column) bool {
+	// The usual schema contains scalar defaults and no foreign key. Compare
+	// it directly, keeping deep equality for mutable defaults and FK metadata.
+	if a.ForeignKey == nil && b.ForeignKey == nil && immutableInsertDefault(a.DefaultValue) && immutableInsertDefault(b.DefaultValue) {
+		return a == b
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 func executeCachedInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
@@ -97,7 +110,11 @@ func executeCachedInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 		return insertCacheCount("cached", 0), nil
 	}
 
-	rows := make([][]any, 0, rowCount)
+	var singleRow []any
+	var rows [][]any
+	if rowCount > 1 {
+		rows = make([][]any, rowCount)
+	}
 	arena := dmlRowArena{rowsPerBlock: min(rowCount, 64)}
 	var defaults []insertColumnDefault
 	hasDefaults := len(s.Cols) != 0 && tableHasDefaults(target.Cols)
@@ -131,7 +148,7 @@ func executeCachedInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 			if len(columns) != 0 {
 				index = columns[j]
 			}
-			value, err := evalExpr(env, expr, nil)
+			value, err := evalInsertValue(&env, expr, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -147,15 +164,24 @@ func executeCachedInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
 			}
 			row[index] = cell
 		}
-		rows = append(rows, row)
+		if rows == nil {
+			singleRow = row
+		} else {
+			rows[i] = row
+		}
 	}
 	if err := checkCtx(env.ctx); err != nil {
 		return nil, err
 	}
-	if err := env.db.AppendStagedInsertRows(env.tenant, owner, target, rows); err != nil {
+	if rows == nil {
+		err = env.db.AppendStagedInsertRow(env.tenant, owner, target, singleRow)
+	} else {
+		err = env.db.AppendStagedInsertRows(env.tenant, owner, target, rows)
+	}
+	if err != nil {
 		return nil, err
 	}
-	return insertCacheCount("cached", len(rows)), nil
+	return insertCacheCount("cached", rowCount), nil
 }
 
 // Publishing the staged batch is the last step of enqueue. Neither private

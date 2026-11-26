@@ -140,6 +140,15 @@ func (s *insertRowSource) at(i int) []Expr {
 	return s.expressions
 }
 
+// VALUES literals, bound parameters and INSERT SELECT's reusable literal slots
+// already hold their value. Only expressions need the evaluation environment.
+func evalInsertValue(env *ExecEnv, expr Expr, row Row) (any, error) {
+	if literal, ok := expr.(*Literal); ok {
+		return literal.Val, nil
+	}
+	return evalExpr(*env, expr, row)
+}
+
 func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, rows *insertRowSource) (*ResultSet, error) {
 	rowCount := rows.len()
 	expected := len(t.Cols)
@@ -203,6 +212,23 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	// success. A trigger or ON CONFLICT can change how many rows are appended.
 	copyStaged := needsInsertRow || len(t.CheckConstraints) != 0
 	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && onConflictPrep == nil {
+		if rows.staged != nil && !copyStaged && len(constrainedCols) == 0 && len(indexNames) == 0 && wal == nil {
+			// Staging already owns the typed cells. With no per-row work,
+			// an empty table can adopt the batch, and a populated table
+			// only needs one append of its row headers.
+			if err := checkCtx(env.ctx); err != nil {
+				return nil, err
+			}
+			if len(t.Rows) == 0 {
+				t.Rows = rows.staged[:rowCount:rowCount]
+			} else {
+				t.Rows = append(t.Rows, rows.staged...)
+				if err := checkCtx(env.ctx); err != nil {
+					return nil, err
+				}
+			}
+			return finishInsert(env, s, t, wal, rowCount, 0, nil)
+		}
 		if rows.staged != nil && !copyStaged && len(t.Rows) == 0 {
 			// Append reuses the staged row headers as it publishes each
 			// validated row. The rollback point restores the old empty slice
@@ -234,7 +260,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 			}
 			row = arena.row(expected)
 			for i, e := range vals {
-				v, err := evalExpr(env, e, tmp)
+				v, err := evalInsertValue(&env, e, tmp)
 				if err != nil {
 					return nil, err
 				}
@@ -277,10 +303,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 				continue
 			}
 		}
-		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
-			return nil, err
-		}
-		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
+		if err := validateInsertRow(&env, t, row, constrainedCols, fks); err != nil {
 			return nil, err
 		}
 		if needsInsertRow {
@@ -299,11 +322,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 				return nil, err
 			}
 		}
-		t.Rows = append(t.Rows, row)
-		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row, indexNames); err != nil {
-			return nil, err
-		}
-		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
+		if err := appendInsertRow(&env, t, row, indexNames, wal); err != nil {
 			return nil, err
 		}
 		if hasAfter {
@@ -316,24 +335,7 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 		}
 		inserted++
 	}
-	if err := wal.commit(); err != nil {
-		return nil, err
-	}
-	if inserted > 0 || updated > 0 {
-		if inserted > 0 && updated == 0 {
-			tryFastPathAppend(env, s.Table, t, inserted)
-			t.MarkDirtyFrom(len(t.Rows) - inserted)
-		} else if inserted > 0 {
-			t.MarkDirtyFrom(-1)
-		}
-		t.Version++
-		t.InvalidateStats()
-		markDependentMaterializedViewsStale(env, s.Table)
-	}
-	if len(s.Returning) > 0 {
-		return projectReturningRows(env, t.Cols, s.Returning, returningRows)
-	}
-	return nil, nil
+	return finishInsert(env, s, t, wal, inserted, updated, returningRows)
 }
 
 func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, rows *insertRowSource) (*ResultSet, error) {
@@ -427,7 +429,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			}
 		}
 		for i, idx := range colIdx {
-			v, err := evalExpr(env, vals[i], tmp)
+			v, err := evalInsertValue(&env, vals[i], tmp)
 			if err != nil {
 				return nil, err
 			}
@@ -469,10 +471,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 				continue
 			}
 		}
-		if err := validateRowConstraintsWith(env, t, row, -1, constrainedCols, fks); err != nil {
-			return nil, err
-		}
-		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
+		if err := validateInsertRow(&env, t, row, constrainedCols, fks); err != nil {
 			return nil, err
 		}
 		if needsInsertRow {
@@ -491,11 +490,7 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 				return nil, err
 			}
 		}
-		t.Rows = append(t.Rows, row)
-		if err := t.InsertSecondaryIndexRow(len(t.Rows)-1, row, indexNames); err != nil {
-			return nil, err
-		}
-		if err := wal.logInsert(env, len(t.Rows)-1, row, t.Cols); err != nil {
+		if err := appendInsertRow(&env, t, row, indexNames, wal); err != nil {
 			return nil, err
 		}
 		if hasAfter {
@@ -508,6 +503,36 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		}
 		inserted++
 	}
+	return finishInsert(env, s, t, wal, inserted, updated, returningRows)
+}
+
+func validateInsertRow(env *ExecEnv, t *storage.Table, row []any, constrainedCols []int, fks *fkTargetCache) error {
+	if len(constrainedCols) != 0 || len(t.CheckConstraints) != 0 {
+		if err := validateRowConstraintsWith(*env, t, row, -1, constrainedCols, fks); err != nil {
+			return err
+		}
+	}
+	if len(t.Indexes) != 0 {
+		return t.CheckSecondaryIndexConstraints(row, -1)
+	}
+	return nil
+}
+
+func appendInsertRow(env *ExecEnv, t *storage.Table, row []any, indexNames []string, wal *walAuto) error {
+	rowID := len(t.Rows)
+	t.Rows = append(t.Rows, row)
+	if len(indexNames) != 0 {
+		if err := t.InsertSecondaryIndexRow(rowID, row, indexNames); err != nil {
+			return err
+		}
+	}
+	if wal != nil {
+		return wal.logInsert(*env, rowID, row, t.Cols)
+	}
+	return nil
+}
+
+func finishInsert(env ExecEnv, s *Insert, t *storage.Table, wal *walAuto, inserted, updated int, returningRows []Row) (*ResultSet, error) {
 	if err := wal.commit(); err != nil {
 		return nil, err
 	}

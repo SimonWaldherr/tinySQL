@@ -9,6 +9,18 @@ import (
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 )
 
+func BenchmarkCountLiteralCardinality(b *testing.B) {
+	db := setupPerfTable(b, 100_000)
+	b.Cleanup(func() { _ = db.Close() })
+	runBench(b, db, "SELECT COUNT(1) AS n FROM t")
+}
+
+func BenchmarkFilteredCountLiteral(b *testing.B) {
+	db := setupPerfTable(b, 100_000)
+	b.Cleanup(func() { _ = db.Close() })
+	runBench(b, db, "SELECT COUNT(1) AS n FROM t WHERE id >= 50000")
+}
+
 func TestCountStarCardinality(t *testing.T) {
 	db := storage.NewDB()
 	execSQL(t, db, `CREATE TABLE counts (id INT, val FLOAT)`)
@@ -38,6 +50,10 @@ func TestCountStarCardinality(t *testing.T) {
 		{"mixed-aggregates", `SELECT COUNT(*) AS n, SUM(val) AS total, AVG(val) AS mean FROM counts`, []Row{{"n": 3, "total": float64(4), "mean": float64(2)}}},
 		{"mixed-empty", `SELECT COUNT(*) AS n, SUM(val) AS total FROM empty_counts`, []Row{{"n": 0, "total": nil}}},
 		{"count-null-expression", `SELECT COUNT(*) AS n, COUNT(NULL) AS missing FROM counts`, []Row{{"n": 3, "missing": 0}}},
+		{"literal-counts", `SELECT COUNT(1) AS n, COUNT(FALSE) AS present, COUNT(NULL) AS missing FROM counts HAVING COUNT(1) = 3`, []Row{{"n": 3, "present": 3, "missing": 0}}},
+		{"literal-empty", `SELECT COUNT('x') AS n FROM empty_counts`, []Row{{"n": 0}}},
+		{"literal-filter", `SELECT COUNT(1) FILTER (WHERE val IS NULL) AS n FROM counts`, []Row{{"n": 1}}},
+		{"literal-distinct", `SELECT COUNT(DISTINCT 1) AS n FROM counts`, []Row{{"n": 1}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			rs := execSQL(t, db, tt.sql)

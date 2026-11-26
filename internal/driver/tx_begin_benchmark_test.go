@@ -90,6 +90,39 @@ func BenchmarkTxSmallWrite(b *testing.B) {
 	}
 }
 
+// A one-row write changes a single table even when BEGIN sees a large schema.
+func BenchmarkTxWriteManyTables(b *testing.B) {
+	for _, end := range []string{"commit", "rollback"} {
+		b.Run(end, func(b *testing.B) {
+			db := openTxBenchDB(b, 1)
+			for i := 1; i < 500; i++ {
+				if _, err := db.Exec(fmt.Sprintf("CREATE TABLE extra_%d (id INT)", i)); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				tx, err := db.Begin()
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := tx.Exec("UPDATE bench SET score = score + 1 WHERE id = 0"); err != nil {
+					_ = tx.Rollback()
+					b.Fatal(err)
+				}
+				if end == "commit" {
+					err = tx.Commit()
+				} else {
+					err = tx.Rollback()
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func openTxBenchDB(b *testing.B, rows int) *sql.DB {
 	b.Helper()
 	db, err := sql.Open("tinysql", fmt.Sprintf("mem://?tenant=tx_bench_%d_%s", rows, b.Name()))

@@ -1,6 +1,10 @@
 package storage
 
-import "sync"
+import (
+	"maps"
+	"slices"
+	"sync"
+)
 
 // Lazily shared transaction snapshots.
 //
@@ -30,6 +34,51 @@ import "sync"
 //
 // Backends whose tables are owned by an evictable pool cannot be pinned, so
 // those databases keep using the eager SnapshotForTx / SnapshotForReadTx.
+
+// txTablePins keeps the release list compact. A read transaction can often
+// release it without a single membership lookup. A few linear probes are
+// cheaper than indexing every table for a transaction touching only one.
+type txTablePins struct {
+	source *DB
+	tables []*Table
+	refs   map[*Table]int
+	probes int
+}
+
+// lookup optionally consumes one pin. Multiple tenant names can refer to the
+// same table, so both representations retain one pin per directory entry.
+func (p *txTablePins) lookup(t *Table, take bool) bool {
+	if p == nil {
+		return false
+	}
+	if p.refs == nil {
+		if len(p.tables) <= 8 || p.probes < 4 {
+			p.probes++
+			i := slices.Index(p.tables, t)
+			if i >= 0 && take {
+				last := len(p.tables) - 1
+				p.tables[i] = p.tables[last]
+				p.tables[last] = nil
+				p.tables = p.tables[:last]
+			}
+			return i >= 0
+		}
+		p.refs = make(map[*Table]int, len(p.tables))
+		for _, table := range p.tables {
+			p.refs[table]++
+		}
+		p.tables = nil
+	}
+	n := p.refs[t]
+	if take && n > 0 {
+		if n == 1 {
+			delete(p.refs, t)
+		} else {
+			p.refs[t] = n - 1
+		}
+	}
+	return n > 0
+}
 
 // canShareTablesWithTx reports whether tx shadows of db may share its tables.
 func (db *DB) canShareTablesWithTx() bool {
@@ -79,7 +128,8 @@ func (db *DB) shareTablesInto(shadow, base *DB) (release func()) {
 	for _, tdb := range db.tenants {
 		count += len(tdb.tables)
 	}
-	shadow.txShared = make(map[*Table]*DB, count)
+	pins := &txTablePins{source: db, tables: make([]*Table, 0, count)}
+	shadow.txShared = pins
 	shadow.txBase = base
 	db.streamSnapshotMu.Lock()
 	if db.streamSnapshots == nil {
@@ -91,22 +141,15 @@ func (db *DB) shareTablesInto(shadow, base *DB) (release func()) {
 		// re-lowering any name.
 		shadowTables := make(map[string]*Table, len(tdb.tables))
 		shadow.tenants[tn] = &tenantDB{tables: shadowTables}
-		var baseTables map[string]*Table
-		if base != nil {
-			baseTables = make(map[string]*Table, len(tdb.tables))
-			base.tenants[tn] = &tenantDB{tables: baseTables}
-		}
 		for key, t := range tdb.tables {
-			if base != nil {
-				// A pinned table cannot change, so while the shadow shares
-				// it the live table is its own record of the Version it had
-				// at BEGIN. recordBaseVersion swaps in a stub when the
-				// shadow gives up the pin.
-				baseTables[key] = t
-			}
 			shadowTables[key] = t
-			shadow.txShared[t] = db
+			pins.tables = append(pins.tables, t)
 			db.streamSnapshots[t]++
+		}
+		if base != nil {
+			// Pinned tables retain their BEGIN version. The base needs its
+			// own directory so recordBaseVersion can replace an entry.
+			base.tenants[tn] = &tenantDB{tables: maps.Clone(shadowTables)}
 		}
 	}
 	db.streamSnapshotMu.Unlock()
@@ -162,8 +205,18 @@ func (db *DB) releaseSharedTables() {
 	for _, t := range private {
 		db.returnTwins(t)
 	}
-	for t, src := range remaining {
-		src.unpinTxTable(t)
+	if remaining != nil {
+		source := remaining.source
+		source.streamSnapshotMu.Lock()
+		for _, t := range remaining.tables {
+			source.unpinLocked(t)
+		}
+		for t, n := range remaining.refs {
+			for range n {
+				source.unpinLocked(t)
+			}
+		}
+		source.streamSnapshotMu.Unlock()
 	}
 }
 
@@ -190,8 +243,7 @@ func (db *DB) pinnedLocked(t *Table) bool {
 	if db.streamSnapshots[t] != 0 {
 		return true
 	}
-	_, shared := db.txShared[t]
-	return shared
+	return db.txShared.lookup(t, false)
 }
 
 // isTxShared reports whether t is still shared with the database this
@@ -202,7 +254,7 @@ func (db *DB) isTxShared(t *Table) bool {
 		return false
 	}
 	db.streamSnapshotMu.Lock()
-	_, shared := db.txShared[t]
+	shared := db.txShared.lookup(t, false)
 	db.streamSnapshotMu.Unlock()
 	return shared
 }
@@ -214,12 +266,14 @@ func (db *DB) isTxShared(t *Table) bool {
 func (db *DB) takeTxShared(t *Table) (*DB, bool) {
 	db.streamSnapshotMu.Lock()
 	defer db.streamSnapshotMu.Unlock()
-	src, shared := db.txShared[t]
-	if !shared {
+	pins := db.txShared
+	if !pins.lookup(t, true) {
 		return nil, false
 	}
-	delete(db.txShared, t)
-	return src, true
+	if len(pins.tables) == 0 && len(pins.refs) == 0 {
+		db.txShared = nil
+	}
+	return pins.source, true
 }
 
 // privateCopyOfShared returns the table a transaction shadow writes to in place
@@ -250,7 +304,7 @@ func (db *DB) DetachAllPinnedForWrite() {
 	var pinned []ref
 	db.mu.RLock()
 	db.streamSnapshotMu.Lock()
-	if len(db.streamSnapshots) > 0 || len(db.txShared) > 0 {
+	if len(db.streamSnapshots) > 0 || db.txShared != nil {
 		for tn, tdb := range db.tenants {
 			for _, t := range tdb.tables {
 				if db.pinnedLocked(t) {

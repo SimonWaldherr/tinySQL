@@ -264,7 +264,9 @@ func ImportCSV(
 		}
 	}
 
-	// Insert the sampled rows first, then continue streaming from the reader.
+	// Sampled records retain their original slices. Subsequent records are
+	// converted synchronously and can reuse the CSV reader's field slice.
+	csvr.ReuseRecord = true
 	rows, skipped, errs, insertErr := insertCSVRecords(ctx, db, tenant, tableName, colNames, colTypes, sampleData, csvr, opts)
 	result.RowsInserted = rows
 	result.RowsSkipped = skipped
@@ -366,19 +368,23 @@ func textDecoder(enc string) (transform.Transformer, error) {
 // U+FFFD replacement, preserving the TEXT/BLOB boundary.
 type strictUTF8Reader struct {
 	r       io.Reader
+	buf     []byte
 	out     []byte
 	tail    []byte
 	readErr error
 }
 
-func newStrictUTF8Reader(r io.Reader) *strictUTF8Reader { return &strictUTF8Reader{r: r} }
+func newStrictUTF8Reader(r io.Reader) *strictUTF8Reader {
+	return &strictUTF8Reader{r: r, buf: make([]byte, 32*1024)}
+}
 
 func (r *strictUTF8Reader) Read(p []byte) (int, error) {
 	for len(r.out) == 0 && r.readErr == nil {
-		buf := make([]byte, 32*1024)
-		n, err := r.r.Read(buf)
+		prefix := copy(r.buf, r.tail)
+		r.tail = r.buf[:prefix]
+		n, err := r.r.Read(r.buf[prefix:])
 		if n > 0 {
-			r.process(append(r.tail, buf[:n]...))
+			r.process(r.buf[:prefix+n])
 		}
 		if err != nil && r.readErr == nil {
 			if err == io.EOF && len(r.tail) > 0 {
@@ -400,11 +406,15 @@ func (r *strictUTF8Reader) Read(p []byte) (int, error) {
 }
 
 func (r *strictUTF8Reader) process(data []byte) {
-	r.tail = r.tail[:0]
+	r.tail = nil
+	if utf8.Valid(data) {
+		r.out = data
+		return
+	}
 	i := 0
 	for i < len(data) {
 		if !utf8.FullRune(data[i:]) {
-			r.tail = append(r.tail, data[i:]...)
+			r.tail = data[i:]
 			break
 		}
 		_, size := utf8.DecodeRune(data[i:])
@@ -414,7 +424,7 @@ func (r *strictUTF8Reader) process(data []byte) {
 		}
 		i += size
 	}
-	r.out = append(r.out, data[:i]...)
+	r.out = data[:i]
 }
 
 // initCSVFromReader samples the reader to detect delimiter/header and returns a
@@ -425,8 +435,10 @@ func initCSVFromReader(rr io.Reader, opts *ImportOptions) (*bufio.Reader, *csv.R
 	lines := splitUniversal(string(peek))
 
 	delim := detectDelimiter(lines, candidateDelims(opts.DelimiterCandidates))
-	records := parseRecords(lines, delim, opts.SampleRecords)
-	hasHeader := decideHeader(records, opts.HeaderMode)
+	hasHeader, explicit := explicitHeaderMode(opts.HeaderMode)
+	if !explicit {
+		hasHeader = decideHeader(parseRecords(lines, delim, opts.SampleRecords), opts.HeaderMode)
+	}
 	lineEnding := detectLineEnding(string(peek))
 
 	csvr := csv.NewReader(sr)
@@ -758,13 +770,17 @@ func naiveSplitOutsideQuotes(ln string, delim rune) []string {
 // returning the answer and whether it was decided here (decided == false
 // means the caller must run its own heuristic).
 func explicitOrTooShortHeader(records [][]string, mode string) (value bool, decided bool) {
+	if header, explicit := explicitHeaderMode(mode); explicit {
+		return header, true
+	}
+	return false, len(records) < 2
+}
+
+func explicitHeaderMode(mode string) (value bool, explicit bool) {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "present":
 		return true, true
 	case "absent":
-		return false, true
-	}
-	if len(records) < 2 {
 		return false, true
 	}
 	return false, false

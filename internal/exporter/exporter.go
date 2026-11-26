@@ -102,7 +102,7 @@ func manifestDefaultSQL(col storage.Column) string {
 	if !col.HasDefault {
 		return ""
 	}
-	return valueToSQLLiteral(col.DefaultValue)
+	return string(appendSQLLiteral(nil, col.DefaultValue))
 }
 
 func tableDataSHA256(rows [][]any) string {
@@ -418,38 +418,68 @@ func jsonValue(v any, opts Options) any {
 
 // ExportSQL writes ResultSet rows as INSERT statements for tableName.
 func ExportSQL(w io.Writer, rs *engine.ResultSet, tableName string) error {
+	if len(rs.Rows) == 0 {
+		return nil
+	}
+	keys := resultColumnKeys(rs.Cols)
+	stmt := []byte("INSERT INTO " + tableName + " (" + strings.Join(rs.Cols, ", ") + ") VALUES (")
+	prefixLen := len(stmt)
 	for _, r := range rs.Rows {
-		values := make([]string, len(rs.Cols))
-		for i, c := range rs.Cols {
-			values[i] = valueToSQLLiteral(r[strings.ToLower(c)])
+		stmt = stmt[:prefixLen]
+		for i, key := range keys {
+			if i > 0 {
+				stmt = append(stmt, ", "...)
+			}
+			stmt = appendSQLLiteral(stmt, r[key])
 		}
-		if _, err := fmt.Fprintf(w, "INSERT INTO %s (%s) VALUES (%s);\n",
-			tableName, strings.Join(rs.Cols, ", "), strings.Join(values, ", ")); err != nil {
+		stmt = append(stmt, ");\n"...)
+		if _, err := w.Write(stmt); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func valueToSQLLiteral(v any) string {
-	if v == nil {
-		return "NULL"
-	}
+func appendSQLLiteral(dst []byte, v any) []byte {
 	switch t := v.(type) {
+	case nil:
+		return append(dst, "NULL"...)
 	case string:
-		return "'" + strings.ReplaceAll(t, "'", "''") + "'"
+		return appendSQLText(dst, t)
 	case json.RawMessage:
-		// GEOMETRY/JSON columns (e.g. from GeoJSON/TopoJSON/GeoPackage/OSM
-		// import) carry their value as json.RawMessage, a distinct named
-		// []byte type that a type switch's `case []byte` does not match.
-		// Treat it as text, not as an opaque blob.
-		return "'" + strings.ReplaceAll(string(t), "'", "''") + "'"
+		// JSON and GEOMETRY columns use SQL text literals.
+		return appendSQLText(dst, string(t))
 	case time.Time:
-		return "'" + t.Format(time.RFC3339) + "'"
+		dst = t.AppendFormat(append(dst, '\''), time.RFC3339)
+		return append(dst, '\'')
 	case []byte:
-		return "X'" + fmt.Sprintf("%X", t) + "'"
+		const hex = "0123456789ABCDEF"
+		dst = append(dst, "X'"...)
+		for _, b := range t {
+			dst = append(dst, hex[b>>4], hex[b&15])
+		}
+		return append(dst, '\'')
+	case int:
+		return strconv.AppendInt(dst, int64(t), 10)
+	case int64:
+		return strconv.AppendInt(dst, t, 10)
+	case float64:
+		return strconv.AppendFloat(dst, t, 'f', -1, 64)
 	default:
-		return valueToString(v, "base64")
+		return append(dst, valueToString(v, "base64")...)
+	}
+}
+
+func appendSQLText(dst []byte, value string) []byte {
+	dst = append(dst, '\'')
+	for {
+		before, after, found := strings.Cut(value, "'")
+		dst = append(dst, before...)
+		if !found {
+			return append(dst, '\'')
+		}
+		dst = append(dst, "''"...)
+		value = after
 	}
 }
 
@@ -471,12 +501,16 @@ func ExportXML(w io.Writer, rs *engine.ResultSet) error {
 		return err
 	}
 	keys := resultColumnKeys(rs.Cols)
+	row := xmlRow{Fields: make([]xmlField, len(keys))}
+	for i, col := range rs.Cols {
+		row.Fields[i].XMLName.Local = col
+	}
+	rowElement := xml.StartElement{Name: xml.Name{Local: "row"}}
 	for _, r := range rs.Rows {
-		xrRow := xmlRow{Fields: make([]xmlField, 0, len(rs.Cols))}
-		for i, c := range rs.Cols {
-			xrRow.Fields = append(xrRow.Fields, xmlField{XMLName: xml.Name{Local: c}, Value: valueToString(r[keys[i]], "base64")})
+		for i, key := range keys {
+			row.Fields[i].Value = valueToString(r[key], "base64")
 		}
-		if err := enc.EncodeElement(xrRow, xml.StartElement{Name: xml.Name{Local: "row"}}); err != nil {
+		if err := enc.EncodeElement(&row, rowElement); err != nil {
 			return err
 		}
 	}

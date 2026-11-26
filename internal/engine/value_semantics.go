@@ -65,7 +65,7 @@ func coerceToFloat(v any) (any, error) {
 	case int64:
 		return float64(x), nil
 	case float64:
-		return x, nil
+		return v, nil
 	case *big.Rat:
 		f, _ := x.Float64()
 		return f, nil

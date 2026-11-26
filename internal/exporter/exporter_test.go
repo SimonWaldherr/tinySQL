@@ -127,13 +127,13 @@ func TestExportNDJSON(t *testing.T) {
 
 func TestExportSQL(t *testing.T) {
 	rs := &engine.ResultSet{
-		Cols: []string{"id", "name", "created_at", "payload", "geom"},
+		Cols: []string{"ID", "name", "created_at", "payload", "geom"},
 		Rows: []engine.Row{
 			{
 				"id":         1,
 				"name":       "O'Hara",
 				"created_at": time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
-				"payload":    []byte("a'b"),
+				"payload":    []byte{0xab, 0x27, 0xff},
 				"geom":       json.RawMessage(`{"type":"Point","coordinates":[1,2]}`),
 			},
 			{"id": 2, "name": nil},
@@ -143,12 +143,11 @@ func TestExportSQL(t *testing.T) {
 	if err := ExportSQL(&buf, rs, "people"); err != nil {
 		t.Fatalf("ExportSQL failed: %v", err)
 	}
-	out := buf.String()
-	if !bytes.Contains(buf.Bytes(), []byte(`INSERT INTO people (id, name, created_at, payload, geom) VALUES (1, 'O''Hara', '2020-01-02T03:04:05Z', X'612762', '{"type":"Point","coordinates":[1,2]}');`)) {
-		t.Fatalf("SQL missing escaped row: %s", out)
-	}
-	if !bytes.Contains(buf.Bytes(), []byte("VALUES (2, NULL")) {
-		t.Fatalf("SQL missing NULL row: %s", out)
+	const prefix = "INSERT INTO people (ID, name, created_at, payload, geom) VALUES "
+	want := prefix + `(1, 'O''Hara', '2020-01-02T03:04:05Z', X'AB27FF', '{"type":"Point","coordinates":[1,2]}');` + "\n" +
+		prefix + "(2, NULL, NULL, NULL, NULL);\n"
+	if buf.String() != want {
+		t.Fatalf("got %q, want %q", buf.String(), want)
 	}
 }
 
@@ -200,18 +199,26 @@ func TestExportTableManifest(t *testing.T) {
 
 func TestExportXML(t *testing.T) {
 	rs := makeSample()
+	rs.Rows[0]["name"] = "a<&\nb"
+	delete(rs.Rows[1], "name")
 	var buf bytes.Buffer
 	if err := ExportXML(&buf, rs); err != nil {
 		t.Fatalf("ExportXML failed: %v", err)
 	}
 	var xr struct {
-		Rows []struct{} `xml:"row"`
+		Rows []struct {
+			ID   int    `xml:"id"`
+			Name string `xml:"name"`
+		} `xml:"row"`
 	}
 	if err := xml.Unmarshal(buf.Bytes(), &xr); err != nil {
 		t.Fatalf("XML unmarshal failed: %v", err)
 	}
 	if len(xr.Rows) != 2 {
 		t.Fatalf("expected 2 xml rows, got %d", len(xr.Rows))
+	}
+	if xr.Rows[0].ID != 1 || xr.Rows[0].Name != "a<&\nb" || xr.Rows[1].ID != 2 || xr.Rows[1].Name != "" {
+		t.Fatalf("unexpected XML values: %+v", xr.Rows)
 	}
 }
 

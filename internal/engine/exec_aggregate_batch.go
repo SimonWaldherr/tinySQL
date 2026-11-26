@@ -26,11 +26,12 @@ type aggregateBatchColumn struct {
 type aggregateBatchOp struct {
 	kind       aggKind
 	projection int
-	column     int // -1 for COUNT(*)
+	column     int // -1 counts every selected row
 	copyFrom   int // canonical projection + 1; zero means accumulate this op
 }
 
-// aggregateBatchEligible admits only pure, direct-column COUNT/SUM/AVG operations.
+// aggregateBatchEligible admits counts of selected rows and COUNT/SUM/AVG
+// over direct columns.
 // MIN/MAX preserve the original input type; decimals require exact rational
 // promotion. Those semantics remain in the scalar implementation. Runtime
 // nonnumeric values also switch to scalar accumulation, without rereading or
@@ -59,7 +60,10 @@ func aggregateBatchEligible(plan *simpleAggregatePlan, source *simpleSelectPlan)
 			continue
 		case aggCount:
 			if proj.arg != nil && proj.argColumn == 0 {
-				return false
+				// A non-NULL literal counts the same selected rows as COUNT(*).
+				if arg, ok := proj.arg.(*Literal); !ok || isNull(arg.Val) {
+					return false
+				}
 			}
 			hasAggregate = true
 		case aggSum, aggAvg:

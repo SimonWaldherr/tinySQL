@@ -101,7 +101,7 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 	if !ok || err != nil {
 		return nil, ok, err
 	}
-	if rs, used, err := executeUnfilteredCountStar(env, plan); used || err != nil {
+	if rs, used, err := executeUnfilteredCount(env, plan); used || err != nil {
 		return rs, used, err
 	}
 	if rs, used, err := executeConstraintMaximum(env, plan); used || err != nil {
@@ -135,17 +135,19 @@ func executeSimpleAggregateFastPath(env ExecEnv, s *Select) (*ResultSet, bool, e
 	return executeSimpleMultiGroupAggregate(env, plan, rawPlan)
 }
 
-// A physical table's rows already contain exactly the visible records. Pure
-// COUNT(*) projections without filtering or grouping can use that cardinality
-// directly, including on an empty table, instead of scanning every record.
+// A physical table's rows already contain exactly the visible records. COUNT(*)
+// and COUNT(literal) can use that cardinality directly. COUNT(NULL) is zero.
 // Read the current slice length on every execution so prepared queries also
 // observe inserts and deletes. The normal finalizer retains HAVING and paging.
-func executeUnfilteredCountStar(env ExecEnv, plan *simpleAggregatePlan) (*ResultSet, bool, error) {
+func executeUnfilteredCount(env ExecEnv, plan *simpleAggregatePlan) (*ResultSet, bool, error) {
 	if plan.where != nil || len(plan.groupCols) != 0 {
 		return nil, false, nil
 	}
 	for _, proj := range plan.projs {
-		if proj.kind != aggCount || proj.arg != nil || proj.filter != nil {
+		if proj.kind != aggCount || proj.filter != nil {
+			return nil, false, nil
+		}
+		if _, literal := proj.arg.(*Literal); proj.arg != nil && !literal {
 			return nil, false, nil
 		}
 	}
@@ -157,8 +159,10 @@ func executeUnfilteredCountStar(env ExecEnv, plan *simpleAggregatePlan) (*Result
 		_, phase = startQueryPhase(env, "COUNT", "visible table cardinality")
 	}
 	state := newSimpleAggregateState(nil, len(plan.projs))
-	for i := range state.counts {
-		state.counts[i] = len(plan.table.Rows)
+	for i, proj := range plan.projs {
+		if arg, ok := proj.arg.(*Literal); !ok || !isNull(arg.Val) {
+			state.counts[i] = len(plan.table.Rows)
+		}
 	}
 	phase.finish(1)
 	rs, err := finalizeSimpleAggregateResultSet(env, plan, []*simpleAggregateState{state})

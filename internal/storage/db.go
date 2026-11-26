@@ -115,12 +115,9 @@ type DB struct {
 	streamSnapshotMu sync.Mutex
 	streamSnapshots  map[*Table]uint32
 
-	// txShared belongs to a transaction shadow built by SnapshotForTxShared. It
-	// maps each table the shadow still shares with the live database to that
-	// database, which holds a pin on the table (also recorded in
-	// streamSnapshots) until the shadow takes a private copy of it or the
-	// transaction ends. Protected by streamSnapshotMu.
-	txShared map[*Table]*DB
+	// txShared tracks the live tables still pinned by a transaction shadow.
+	// Protected by streamSnapshotMu.
+	txShared *txTablePins
 	// txBase is the conflict-detection base that belongs to this transaction
 	// shadow, or nil for a read-only one. See shareTablesInto.
 	txBase *DB

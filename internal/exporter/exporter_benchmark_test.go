@@ -34,6 +34,7 @@ func BenchmarkStreamingExports(b *testing.B) {
 		{name: "json", fn: ExportJSON},
 		{name: "ndjson", fn: ExportNDJSON},
 		{name: "xml", fn: func(w io.Writer, rs *engine.ResultSet, _ Options) error { return ExportXML(w, rs) }},
+		{name: "sql", fn: func(w io.Writer, rs *engine.ResultSet, _ Options) error { return ExportSQL(w, rs, "items") }},
 		{name: "gob", fn: func(w io.Writer, rs *engine.ResultSet, _ Options) error { return ExportGOB(w, rs) }},
 	}
 	for _, benchmark := range benchmarks {
