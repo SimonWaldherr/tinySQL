@@ -23,7 +23,7 @@ func TestBufferPoolReleasesEmptyTenants(t *testing.T) {
 			for i, entry := range [][2]string{{"one", "a"}, {"one", "b"}, {"two", "c"}} {
 				if evict {
 					bp.mu.Lock()
-					bp.evictLRU(EstimateTableSize(table))
+					bp.evictLRU(EstimateTableSize(table), nil)
 					bp.mu.Unlock()
 				} else {
 					bp.Remove(entry[0], entry[1])

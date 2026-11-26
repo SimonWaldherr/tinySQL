@@ -942,6 +942,24 @@ func (c *CatalogManager) ListEnabledJobs() []*CatalogJob {
 	return jobs
 }
 
+// dueIntervalJobs copies only definitions the interval poll can submit. CRON
+// runs separately, and a poll with no due work needs no temporary job list.
+func (c *CatalogManager) dueIntervalJobs(now time.Time) []*CatalogJob {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var jobs []*CatalogJob
+	for _, job := range c.jobs {
+		if !job.Enabled || (job.ScheduleType != "INTERVAL" && job.ScheduleType != "ONCE") ||
+			job.NextRunAt == nil || now.Before(*job.NextRunAt) {
+			continue
+		}
+		copy := cloneScheduledJob(job)
+		jobs = append(jobs, &copy)
+	}
+	return jobs
+}
+
 // UpdateJobRuntime updates runtime bookkeeping fields for a named job.
 // It sets `LastRunAt`, `NextRunAt` and marks the job as recently updated.
 func (c *CatalogManager) UpdateJobRuntime(name string, lastRun, nextRun time.Time) error {

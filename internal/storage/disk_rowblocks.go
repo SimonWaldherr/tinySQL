@@ -200,15 +200,16 @@ func writeFrame(w io.Writer, binding, payload []byte) (uint32, error) {
 	return crc, err
 }
 
-// writeRowBlocks writes dt (rows already in their on-disk form) to tmp in the
-// row-block layout and makes it durable. On error tmp is removed.
-func (c tableFileConfig) writeRowBlocks(tmp string, dt diskTable) (err error) {
+// writeRowBlocks writes dt to tmp in the row-block layout and makes it durable.
+// dt holds the table's original rows. On error tmp is removed.
+func (c tableFileConfig) writeRowBlocks(tmp string, dt diskTable) error {
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
+	durable := false
 	defer func() {
-		if err != nil {
+		if !durable {
 			_ = f.Close()
 			_ = os.Remove(tmp)
 		}
@@ -245,13 +246,21 @@ func (c tableFileConfig) writeRowBlocks(tmp string, dt diskTable) (err error) {
 	}
 	payload = nil
 
-	encodeBlock := func(i int) ([]byte, error) {
-		return encodeFramePayload(diskRowBlock{Rows: rows[spans[i].start:spans[i].end]}, c.gzip)
+	hasJSON := hasDiskJSONColumns(dt.Cols)
+	prepareBlock := func(i int) [][]any {
+		block := rows[spans[i].start:spans[i].end]
+		if hasJSON {
+			block = diskRowsFromTable(dt.Cols, block)
+		}
+		return block
+	}
+	encodeBlock := func(_ int, block [][]any) ([]byte, error) {
+		return encodeFramePayload(diskRowBlock{Rows: block}, c.gzip)
 	}
 	workers := min(rowBlockWorkers(), len(spans))
 	if workers <= 1 {
 		for i := range spans {
-			p, e := encodeBlock(i)
+			p, e := encodeBlock(i, prepareBlock(i))
 			if e != nil {
 				return fmt.Errorf("encode row block %d: %w", i, e)
 			}
@@ -259,7 +268,7 @@ func (c tableFileConfig) writeRowBlocks(tmp string, dt diskTable) (err error) {
 				return err
 			}
 		}
-	} else if err = writeBlocksParallel(bw, headerCRC, len(spans), workers, encodeBlock); err != nil {
+	} else if err = writeBlocksParallel(bw, headerCRC, len(spans), workers, prepareBlock, encodeBlock); err != nil {
 		return err
 	}
 
@@ -269,7 +278,11 @@ func (c tableFileConfig) writeRowBlocks(tmp string, dt diskTable) (err error) {
 	if err = f.Sync(); err != nil {
 		return err
 	}
-	return f.Close()
+	if err = f.Close(); err != nil {
+		return err
+	}
+	durable = true
+	return nil
 }
 
 type blockResult struct {
@@ -277,63 +290,67 @@ type blockResult struct {
 	err     error
 }
 
-// writeBlocksParallel encodes blocks on workers goroutines and writes the
-// frames in block order. At most 2*workers encoded blocks exist at a time. All
-// goroutines it starts have ended when it returns.
-func writeBlocksParallel(w io.Writer, headerCRC uint32, n, workers int, encode func(int) ([]byte, error)) error {
-	results := make([]chan blockResult, n)
+// writeBlocksParallel prepares and writes blocks in order on the caller's
+// goroutine, keeping custom JSON marshaling and its panics there. Workers
+// encode at most 2*workers blocks ahead and finish before the call unwinds.
+func writeBlocksParallel(w io.Writer, headerCRC uint32, n, workers int, prepare func(int) [][]any, encode func(int, [][]any) ([]byte, error)) error {
+	type encodeJob struct {
+		idx  int
+		rows [][]any
+	}
+	window := min(n, 2*workers)
+	results := make([]chan blockResult, window)
 	for i := range results {
 		results[i] = make(chan blockResult, 1)
 	}
-	window := make(chan struct{}, 2*workers)
-	jobs := make(chan int)
-	abort := make(chan struct{})
+	jobs := make(chan encodeJob)
 	var wg sync.WaitGroup
 	for k := 0; k < workers; k++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := range jobs {
-				p, err := encode(i)
-				results[i] <- blockResult{p, err}
+			for job := range jobs {
+				p, err := encode(job.idx, job.rows)
+				results[job.idx%window] <- blockResult{p, err}
 			}
 		}()
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(jobs)
-		for i := 0; i < n; i++ {
-			select {
-			case window <- struct{}{}:
-			case <-abort:
-				return
-			}
-			select {
-			case jobs <- i:
-			case <-abort:
-				return
-			}
-		}
+	defer func() {
+		close(jobs)
+		// Each submitted job owns a buffered result slot, including on error.
+		wg.Wait()
 	}()
-	var firstErr error
-	for i := 0; i < n; i++ {
-		res := <-results[i]
-		if res.err != nil {
-			firstErr = fmt.Errorf("encode row block %d: %w", i, res.err)
-			break
+	var pending encodeJob
+	prepared := false
+	for next, written := 0, 0; written < n; {
+		var submit chan<- encodeJob
+		var result <-chan blockResult
+		if next < n && next-written < window {
+			if !prepared {
+				pending = encodeJob{idx: next, rows: prepare(next)}
+				prepared = true
+			}
+			submit = jobs
 		}
-		if _, err := writeFrame(w, blockBinding(headerCRC, i), res.payload); err != nil {
-			firstErr = err
-			break
+		if written < next {
+			result = results[written%window]
 		}
-		<-window
+		select {
+		case submit <- pending:
+			next++
+			pending = encodeJob{}
+			prepared = false
+		case res := <-result:
+			if res.err != nil {
+				return fmt.Errorf("encode row block %d: %w", written, res.err)
+			}
+			if _, err := writeFrame(w, blockBinding(headerCRC, written), res.payload); err != nil {
+				return err
+			}
+			written++
+		}
 	}
-	if firstErr != nil {
-		close(abort)
-	}
-	wg.Wait()
-	return firstErr
+	return nil
 }
 
 // ──── reading ───────────────────────────────────────────────────────────
@@ -347,11 +364,11 @@ func hasRowBlockMagic(b []byte) bool {
 
 // readFrame reads one frame and verifies its checksum against binding (see
 // frameChecksum). It returns the payload and the checksum. The payload buffer
-// grows with the bytes that actually arrive, so a corrupt length cannot make a
-// short file allocate gigabytes; it is presized for a plausible frame (up to
-// 64 MiB) so that an ordinary block is read without the doubling copies of a
-// buffer that grows from nothing.
+// is exact-sized for ordinary blocks and grows with the bytes that actually
+// arrive for larger frames, so a corrupt length cannot make a short file
+// allocate gigabytes.
 func readFrame(r io.Reader, binding []byte) ([]byte, uint32, error) {
+	const directFrameBytes = 64 << 20
 	var head [12]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -364,18 +381,31 @@ func readFrame(r io.Reader, binding []byte) ([]byte, uint32, error) {
 	if n > 1<<40 {
 		return nil, 0, fmt.Errorf("%w: implausible frame length %d", errRowBlockCorrupt, n)
 	}
-	var buf bytes.Buffer
-	buf.Grow(int(min(n, 64<<20)))
-	if _, err := buf.ReadFrom(io.LimitReader(r, int64(n))); err != nil {
-		return nil, 0, err
+	var payload []byte
+	if n <= directFrameBytes {
+		// Buffer.ReadFrom can grow a filled buffer before the final EOF probe.
+		payload = make([]byte, int(n))
+		if read, err := io.ReadFull(r, payload); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil, 0, fmt.Errorf("%w: frame cut short (%d of %d bytes)", errRowBlockCorrupt, read, n)
+			}
+			return nil, 0, err
+		}
+	} else {
+		var buf bytes.Buffer
+		buf.Grow(directFrameBytes)
+		if _, err := buf.ReadFrom(io.LimitReader(r, int64(n))); err != nil {
+			return nil, 0, err
+		}
+		if uint64(buf.Len()) != n {
+			return nil, 0, fmt.Errorf("%w: frame cut short (%d of %d bytes)", errRowBlockCorrupt, buf.Len(), n)
+		}
+		payload = buf.Bytes()
 	}
-	if uint64(buf.Len()) != n {
-		return nil, 0, fmt.Errorf("%w: frame cut short (%d of %d bytes)", errRowBlockCorrupt, buf.Len(), n)
-	}
-	if frameChecksum(binding, buf.Bytes()) != want {
+	if frameChecksum(binding, payload) != want {
 		return nil, 0, fmt.Errorf("%w: checksum mismatch", errRowBlockCorrupt)
 	}
-	return buf.Bytes(), want, nil
+	return payload, want, nil
 }
 
 func decodeFramePayload(payload []byte, compressed bool, v any) error {

@@ -107,10 +107,12 @@ name the rows it removed is one event of the change log (internal:
 the document directory, drops the dead documents from the posting lists and
 renumbers the rest in place, without tokenizing the corpus again.
 
-**C. Vector structures that follow DELETEs.** The packed vector column of the flat
-scan shares its arrays with the previous cache entry and only rebuilds the small
-per-row arrays; the floats of dead rows are counted as garbage until they exceed
-10 percent. The HNSW graph drops the dead nodes and renumbers nodes and edges in
+**C. Vector structures that follow DELETEs.** The flat cache packs large columns
+into segments of up to 32 MiB and 65,536 rows. A single wider vector gets its own
+segment. On a small removal, unaffected segments are shared with the previous
+cache. Fully removed segments can be freed. When dead vectors exceed 10 percent
+of the retained packed data, a segmented cache compacts the segments that exceed
+that threshold. The HNSW graph drops the dead nodes and renumbers nodes and edges in
 place under its write lock. Edges to dead nodes are dropped and neighbours are not
 repaired, so a followed graph is approximate (section 3).
 A graph with no node left that can start a search is not followed when rows were
@@ -128,6 +130,11 @@ opt-in options address the remaining costs: `SkipSearchIndexPersistence` keeps t
 search-index images out of the table files, and `RowBlockFiles` writes the rows as
 independent, checksummed blocks of about 32 MB, which removes the 8 GiB limit for
 the rows (disk, hybrid and index modes only).
+
+Ordinary frames up to 64 MiB are read into one exact-sized buffer. In hybrid
+mode, publishing a saved snapshot charges only growth in the resident table's
+estimated size. The snapshot path never invokes an eviction callback to save
+a second live image of the table.
 
 **E. A DELETE statement that scales with what it deletes.** A DELETE that reports
 its removed rows renumbers each secondary index in place instead of rebuilding it
@@ -153,7 +160,7 @@ controls is whether the next search pays for a rebuild.
 | Removed positions in log and folds | 2^20; composing removal events costs at most 2^28 element moves | the oldest folds, then the oldest log blocks are forgotten and only structures stamped before them rebuild; a single DELETE of more than 2^20 rows resets the log (every structure of the table rebuilds); a window whose removal events would cost more than 2^28 moves to compose makes the reader rebuild |
 | Fold of UPDATEs | vouches only that no column the reader indexes changed | a structure that missed an UPDATE of its own column inside a fold rebuilds once |
 | Full-text index | follows UPDATE and DELETE events | rebuilds when more than min(max(1024, rows/256), max(64, rows/4)) rows with an updated indexed column are reported, when at least 1,024 token-arena entries (or 512 term-arena entries) are obsolete and exceed a quarter of that arena, and, after a DELETE, when at least 1,024 posting lists are empty and exceed a quarter of the terms |
-| Flat vector cache | follows DELETEs | rebuilds when more than 10 percent of the packed floats are garbage; keeps at most 24 segments (the smallest neighbours are merged beyond that); rebuilds when more than min(1024, max(32, rows/8)) rows have an updated vector |
+| Flat vector cache | packs up to 32 MiB and 65,536 rows per segment, except for a single larger vector | follows DELETEs by sharing intact segments and reclaiming garbage-heavy segments. When vector overrides exceed min(1024, max(32, rows/8)), a dense update on an adjacent cache repacks only the affected segments. Other layouts can still require a full rebuild. |
 | IVF index | reuses the trained index when the vector column cache confirms unchanged vectors and row IDs | rebuilds when an append, removal or vector update changes that cache, or when the requested dimension changes |
 | HNSW graph | follows DELETEs | rebuilds when the removals since the graph was last brought up to date (the statements between two searches, added together) exceed 5 percent of the nodes, when more than 10 percent were removed since the last build (the count is persisted), or when more than min(1024, max(32, rows/8)) rows have an updated vector |
 | DELETE | by a non-key column reports its rows | `DELETE` without `WHERE`, swap-and-pop deletes by `PRIMARY KEY`/`UNIQUE` value (without `RETURNING`), a DELETE on a table with DELETE triggers, schema changes and a rollback that undoes a logged DELETE reset that table's log: every structure of the table rebuilds. A foreign-key cascade or `SET NULL` resets the log of the child table it changes |
@@ -172,8 +179,8 @@ following remain proportional to the table, not to the change:
   million rows), and walks every secondary index once (about 5 to 7 ms per index per
   400,000 keys);
 - the first search after a DELETE shifts the posting lists behind the first removed
-  row and visits every term of the vocabulary; the flat cache allocates 33 bytes of
-  per-row arrays per row (33 MB per million rows); the graph pass costs about 90 ms
+  row and visits every term of the vocabulary. The flat cache copies up to 33 bytes of
+  metadata per row in affected segments. The graph pass costs about 90 ms
   per million nodes for a six-row removal (100 to 160 ms for 600 to 30,000 rows) and
   the deep copy that persists the graph another 61 ms and 321 MB of transient memory
   (figures of the synthetic benchmarks `BenchmarkVecHNSWRemovalPass` and
@@ -305,13 +312,30 @@ with row blocks at most 2 x `GOMAXPROCS` blocks of about 32 MB, but the header w
 the images is still one message), a deep copy of the search-index images unless
 `SkipSearchIndexPersistence` is set, and 24 bytes of row header per row. A cold
 rebuild of the flat cache adds the packed column again while searches still hold the
-old one. At a million 768-dimensional rows a `Sync` writes roughly 9 to 10 GB without
+old one. Row-block writes normalize JSON metadata within the same in-flight block
+window, so `Sync` does not need a second full image of the rows with converted JSON.
+At a million 768-dimensional rows a `Sync` writes roughly 9 to 10 GB without
 search-index images and 12 GB or more with them (extrapolated from 20,000-row files of
 188 MB without and 250 MB with images), either way past the 8 GiB limit of the classic
 layout: a corpus of that size needs `RowBlockFiles` (with `SkipSearchIndexPersistence`)
 from the start. These large-corpus figures are extrapolations, not measurements. Measure scale behaviour with `cmd/ragmaint -dim 16`
 (the vector part scales with the dimension, the text and index parts do not) and the
 real dimension up to what the machine can hold.
+
+### Concurrent exact searches
+
+A simple top-level `SELECT` with explicit columns and literal `VEC_SEARCH` or
+`VEC_TOP_K` arguments can score a resident flat cache outside the content lock. This
+applies from 4,096 rows and about one million candidate coordinates when RBAC,
+profiling and the optional vector query cache are off. The engine builds or updates
+the cache under the lock, then releases it for ranking. The scan keeps up to 32
+extra candidates. When it takes the lock again, it can drop removed or updated
+candidates, fix their surviving row positions and score only updated or appended
+vectors. This works for up to 1,024 changed rows and one million coordinates to
+rescore when the change log and remaining candidates are enough to prove the
+result. Otherwise it reruns the scan once under the lock. The resident-table check
+uses only memory, so a rejected hybrid cache admission does not trigger a second
+disk load for ranking validation.
 
 ### Monitoring
 

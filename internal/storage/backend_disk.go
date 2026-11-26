@@ -300,7 +300,8 @@ func (b *DiskBackend) saveTableOpt(tenant string, t *Table, wait bool) (installe
 		return false, fmt.Errorf("disk backend: mkdir: %w", err)
 	}
 	cfg := b.fileConfig()
-	dt := tableToDiskImage(tn, t, 0, len(t.Rows), true, !b.skipSearchIndexes.Load())
+	dt := tableToDiskMetadata(tn, t, true, !b.skipSearchIndexes.Load())
+	dt.Rows = t.Rows
 	tmp := absPath + ".tmp"
 	if err := cfg.writeTemp(tmp, dt); err != nil {
 		return false, fmt.Errorf("disk backend: save %s/%s: %w", tenant, t.Name, err)
@@ -472,7 +473,7 @@ func (b *DiskBackend) saveTableSnapshot(s *tableSnapshot) error {
 		return fmt.Errorf("disk backend: mkdir: %w", err)
 	}
 	cfg := b.fileConfig()
-	dt := snapshotToDisk(tn, s, cfg.format == diskFormatGob)
+	dt := snapshotFileImage(tn, s)
 	tmp := absPath + ".tmp"
 	if err := cfg.writeTemp(tmp, dt); err != nil {
 		return fmt.Errorf("disk backend: save %s/%s: %w", s.tenant, snap.Name, err)

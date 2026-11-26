@@ -87,10 +87,14 @@ func (b *DiskBackend) encodeTableInto(w io.Writer, dt diskTable) error {
 // writeTemp writes dt to the temporary file tmp and makes it durable (fsync,
 // close). On any error the temporary file is removed and nothing else is
 // touched: the table's current file stays as it was. Installing the result is
-// installTableFile's job.
+// installTableFile's job. dt holds the table's original rows. Row-block files
+// convert them block by block.
 func (c tableFileConfig) writeTemp(tmp string, dt diskTable) error {
 	if c.rowBlocks && c.encryptor == nil && c.format == diskFormatGob {
 		return c.writeRowBlocks(tmp, dt)
+	}
+	if c.format != diskFormatGob || hasDiskJSONColumns(dt.Cols) {
+		dt.Rows = diskRowsFromTable(dt.Cols, dt.Rows)
 	}
 	f, err := os.Create(tmp)
 	if err != nil {

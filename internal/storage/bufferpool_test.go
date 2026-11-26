@@ -124,6 +124,40 @@ func TestBufferPoolEviction(t *testing.T) {
 	}
 }
 
+func TestBufferPoolResizeAccountsForResidentSize(t *testing.T) {
+	policy := LimitedMemoryPolicy(1)
+	policy.MaxMemoryBytes = 100
+	policy.EvictionThreshold = 0.85
+	bp := NewBufferPool(policy)
+	primary := NewTable("primary", nil, false)
+	other := NewTable("other", nil, false)
+	put := func(table *Table, size int64) {
+		t.Helper()
+		if err := bp.putWithSize("default", table.Name, table, size); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(primary, 50)
+	put(other, 30)
+	put(primary, 54)
+	if stats := bp.GetStats(); stats.MemoryUsed != 84 || stats.EvictionCount != 0 {
+		t.Fatalf("small growth: used %d bytes, %d evictions", stats.MemoryUsed, stats.EvictionCount)
+	}
+
+	// Make the resize target the least-recently-used entry. It should still
+	// stay resident while the pool reclaims space from the other entry.
+	bp.Get("default", other.Name)
+	var evicted []string
+	bp.SetEvictionSaver(func(_, name string, _ *Table) bool {
+		evicted = append(evicted, name)
+		return true
+	})
+	put(primary, 90)
+	if len(evicted) != 1 || evicted[0] != other.Name || bp.GetMemoryUsage() != 90 {
+		t.Fatalf("resize should evict only %s, got %v, memory used %d", other.Name, evicted, bp.GetMemoryUsage())
+	}
+}
+
 func TestBufferPoolPinnedTables(t *testing.T) {
 	policy := &MemoryPolicy{
 		MaxMemoryBytes:    5 * 1024, // 5 KB

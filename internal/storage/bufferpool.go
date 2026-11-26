@@ -271,11 +271,13 @@ func (bp *BufferPool) putWithSize(tenant, name string, table *Table, tableSize i
 // copied: when the pool holds a DIFFERENT table object under the name by now (the
 // live one was evicted and reloaded from the file just written, or replaced), that
 // object is newer and is left alone; replacing it would drop its unsaved changes.
+// A snapshot save holds no content lock, so it also cannot evict tables whose
+// eviction callback might need to save their live rows.
 func (bp *BufferPool) mirrorWithSize(tenant, name string, table *Table, tableSize int64) error {
 	return bp.putSized(tenant, name, table, tableSize, true)
 }
 
-func (bp *BufferPool) putSized(tenant, name string, table *Table, tableSize int64, keepNewer bool) error {
+func (bp *BufferPool) putSized(tenant, name string, table *Table, tableSize int64, snapshotMirror bool) error {
 	key := tenant + ":" + name
 
 	// Check if table is pinned or should be ignored
@@ -289,42 +291,32 @@ func (bp *BufferPool) putSized(tenant, name string, table *Table, tableSize int6
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
-	if keepNewer {
-		if cached, exists := bp.cache[tenant][name]; exists && cached.Table != table {
+	resident := bp.cache[tenant][name]
+	growth := tableSize
+	if resident != nil {
+		if snapshotMirror && resident.Table != table {
 			return nil
 		}
+		growth -= resident.Size
 	}
 
-	// Check memory limit. EvictionThreshold (a fraction like 0.9, not 1.0)
-	// triggers eviction before the pool is completely full, leaving
-	// headroom rather than evicting reactively only once MaxMemoryBytes is
-	// already exceeded. evictLRU is asked to free exactly tableSize —
-	// enough room for this one Put, not to drive memory back down below
-	// threshold as a whole — so a Put right at the edge may trigger
-	// eviction again on the very next call; that's an intentional
-	// trade-off favoring simplicity over minimizing eviction churn.
-	if bp.policy.MaxMemoryBytes > 0 && !pinned {
+	// Replacing a resident entry only needs space for its growth. In
+	// particular, syncing a table that takes up most of the budget must
+	// not evict or save the table again merely to update its accounting.
+	if limit := bp.policy.MaxMemoryBytes; limit > 0 && !pinned && growth > 0 {
 		currentMem := bp.currentMemory.Load()
-		newTotal := currentMem + tableSize
-		threshold := int64(float64(bp.policy.MaxMemoryBytes) * bp.policy.EvictionThreshold)
-
-		if newTotal > threshold {
-			if bp.policy.EnableEviction {
-				// Evict to make space
-				bp.evictLRU(tableSize)
-				// The pool must remain an actual bound, not merely an eviction
-				// hint. A table larger than the budget (or a set of pinned tables)
-				// cannot be admitted; callers still receive their query-scoped
-				// table lease but it is deliberately not cached.
-				if bp.currentMemory.Load()+tableSize > bp.policy.MaxMemoryBytes {
-					bp.recordAdmissionReject(tableSize)
-					return fmt.Errorf("memory limit exceeded: table requires %d bytes with %d/%d resident", tableSize, bp.currentMemory.Load(), bp.policy.MaxMemoryBytes)
-				}
-			} else {
+		threshold := int64(float64(limit) * bp.policy.EvictionThreshold)
+		if !snapshotMirror && currentMem+growth > threshold {
+			if !bp.policy.EnableEviction {
 				bp.recordAdmissionReject(tableSize)
-				return fmt.Errorf("memory limit exceeded: %d/%d bytes",
-					currentMem, bp.policy.MaxMemoryBytes)
+				return fmt.Errorf("memory limit exceeded: %d/%d bytes", currentMem, limit)
 			}
+			bp.evictLRU(growth, resident)
+			currentMem = bp.currentMemory.Load()
+		}
+		if currentMem+growth > limit {
+			bp.recordAdmissionReject(tableSize)
+			return fmt.Errorf("memory limit exceeded: table requires %d bytes with %d/%d resident", tableSize, currentMem, limit)
 		}
 	}
 
@@ -415,7 +407,17 @@ func (bp *BufferPool) Snapshot() []PooledEntry {
 	return out
 }
 
-// Get retrieves a table from the buffer pool.
+// peek reports the resident table without recording an access.
+func (bp *BufferPool) peek(tenant, name string) *Table {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	if cached := bp.cache[tenant][name]; cached != nil {
+		return cached.Table
+	}
+	return nil
+}
+
+// Get retrieves a table from the buffer pool and records the access.
 func (bp *BufferPool) Get(tenant, name string) (*Table, bool) {
 	key := tenant + ":" + name
 
@@ -490,11 +492,11 @@ func (bp *BufferPool) remove(tenant, name string, only *Table) {
 	bp.updateStats()
 }
 
-// evictLRU evicts least recently used tables to free up space. Bounded by
+// evictLRU evicts least recently used tables, except keep, to free up space. Bounded by
 // two independent limits — freed >= needed (enough memory reclaimed) or
 // evicted == EvictionBatchSize (don't stall a single Put call evicting
 // unboundedly) — whichever comes first.
-func (bp *BufferPool) evictLRU(needed int64) {
+func (bp *BufferPool) evictLRU(needed int64, keep *CachedTable) {
 	freed := int64(0)
 	evicted := 0
 	type vetoedEntry struct {
@@ -525,6 +527,10 @@ func (bp *BufferPool) evictLRU(needed int64) {
 		// the loop still terminates (lru.size strictly decreases each
 		// iteration via RemoveLRU, so key == "" is reached eventually).
 		if cached.Pinned {
+			continue
+		}
+		if cached == keep {
+			vetoed = append(vetoed, vetoedEntry{key: key, cached: cached})
 			continue
 		}
 

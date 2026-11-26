@@ -95,10 +95,8 @@ func (c *conn) queryStatementWithCleanup(ctx context.Context, st engine.Statemen
 		}
 		return nil, err
 	}
-	c.srv.mu.RLock()
 	if !engine.MayStreamIncrementally(st) {
-		rs, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
-		c.srv.mu.RUnlock()
+		rs, err := engine.ExecuteWithReadGuard(ctx, c.currentDB(), c.tenant, st, &c.srv.mu)
 		c.srv.releaseReader()
 		if onClose != nil {
 			onClose()
@@ -111,6 +109,7 @@ func (c *conn) queryStatementWithCleanup(ctx context.Context, st engine.Statemen
 		}
 		return &rows{rs: rs}, nil
 	}
+	c.srv.mu.RLock()
 	stream, err := engine.ExecuteStream(ctx, c.currentDB(), c.tenant, st)
 	// ExecuteStream does not return until its producer has either pinned an
 	// immutable table snapshot, opened a read-only paged cursor, retained the

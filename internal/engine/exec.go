@@ -186,6 +186,8 @@ type ExecEnv struct {
 	// projections must preserve their schema without executing the source twice.
 	tableFuncColumns map[*TableFuncCall][]string
 	ctx              context.Context
+	vectorReadRoot   *Select       // only the original SELECT owns the statement read lock
+	vectorReadGuard  *sync.RWMutex // optional driver lock, acquired before the content lock
 	// Profiling is execution-local and opt-in.
 	// Child environments retain the collector and carry their own parent span.
 	profile       *queryProfile
@@ -295,19 +297,10 @@ func envNow(env ExecEnv) time.Time {
 // SELECT (nil for DDL/DML). The context is checked at safe points to support
 // cancellation.
 //
-// Concurrency: storage.DB's own mutex only protects the tenant->table map
-// structure, not the contents of a *storage.Table (Rows/Cols/Version) once a
-// caller holds one — INSERT/UPDATE/DELETE mutate Table.Rows with no lock of
-// their own, so two goroutines calling Execute concurrently on the same DB
-// would otherwise race on that slice (a real data race, not just stale
-// reads: concurrent unsynchronized slice append + range is undefined
-// behavior in Go). Execute closes that gap with a single coarse
-// read/write lock around the whole statement: SELECT/EXPLAIN/PRAGMA take a
-// shared read lock (so concurrent reads still run in parallel with each
-// other), everything else takes an exclusive write lock. This is coarser
-// than per-table locking — a write to table A blocks a concurrent read of
-// unrelated table B — but it is correct and simple to audit, which matters
-// more for a safety fix than maximum parallelism.
+// The database content lock guards table rows, columns and version stamps.
+// Read-only statements take the shared lock; writes take it exclusively.
+// Eligible flat vector searches can score an immutable cache outside the
+// lock, then validate and materialize their hits under the lock again.
 func Execute(ctx context.Context, db *storage.DB, tenant string, stmt Statement) (*ResultSet, error) {
 	return executeStatement(ctx, db, tenant, stmt)
 }

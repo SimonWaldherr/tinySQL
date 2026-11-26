@@ -12,16 +12,13 @@ import (
 )
 
 const (
-	// vecColumnGarbagePercent is how much of a cache's packed vector data may belong
-	// to rows that no longer exist before the next removal rebuilds the cache. A
-	// followed removal keeps the packed arrays of the old cache (copying a million
-	// 768-dimensional vectors is what a rebuild costs) and only drops the rows from
-	// the per-row arrays, so the dead rows' floats stay allocated until then.
+	// vecColumnGarbagePercent is how much packed data can belong to removed
+	// rows before the next follow needs to reclaim it. Until then, a followed
+	// removal shares the packed array and drops entries in the per-row arrays.
 	vecColumnGarbagePercent = 10
-	// vecColumnMaxSegments bounds the number of segments a followed cache keeps.
-	// Appends add a small tail segment each, and the binary-counter merge of
-	// mergeVecColumnSegments only joins equally long neighbours, which removals no
-	// longer guarantee.
+	// vecColumnMaxSegments is the slack allowed beyond the segments needed to
+	// hold the vectors. Small append batches and removals can leave fragments
+	// that the binary-counter merge cannot join.
 	vecColumnMaxSegments = 24
 )
 
@@ -38,7 +35,7 @@ var vecColumnFollowCount atomic.Int64
 // never written to.
 //
 // ok is false whenever following is not possible or not worthwhile (the entry is
-// not what the change log describes, too much of the packed data would be dead);
+// not what the change log describes, or a single packed segment needs rebuilding);
 // the caller then builds a cache from scratch. A panic is treated the same way.
 func followVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table, colIdx int, includeNorms bool, changes storage.TableChanges) (entry vecSearchColumnCacheEntry, ok bool) {
 	defer func() {
@@ -59,18 +56,25 @@ func followVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 		}
 	}
 
-	// The floats the removal leaves unreachable, on top of those earlier removals
-	// left: beyond the bound a rebuild is the better deal.
+	// Count retained backing arrays only. A fully removed segment will drop
+	// its whole array, including garbage already in it.
 	total, garbage := 0, 0
 	j := 0
 	for _, segment := range cached.segments {
+		from := j
+		for end := segment.start + len(segment.vectors); j < len(dead) && dead[j] < end; j++ {
+		}
+		if j-from == len(segment.vectors) {
+			continue
+		}
 		total += len(segment.data)
 		garbage += segment.garbage
-		for end := segment.start + len(segment.vectors); j < len(dead) && dead[j] < end; j++ {
-			garbage += len(segment.vectors[dead[j]-segment.start])
+		for _, row := range dead[from:j] {
+			garbage += len(segment.vectors[row-segment.start])
 		}
 	}
-	if garbage*100 > total*vecColumnGarbagePercent {
+	compact := vecColumnGarbageTooHigh(garbage, total)
+	if compact && len(cached.segments) == 1 {
 		return vecSearchColumnCacheEntry{}, false
 	}
 
@@ -95,13 +99,18 @@ func followVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 		default:
 			segment = removeRowsFromVecColumnSegment(segment, gone, start, cached.normsReady)
 		}
+		// For a wide corpus reclaim only arrays that exceed the garbage
+		// limit. Every other segment can still be shared with active readers.
+		if compact && vecColumnGarbageTooHigh(segment.garbage, len(segment.data)) {
+			segment = repackVecColumnSegments(cached.normsReady, segment)
+		}
 		if upgrade {
 			segment.norms = vecSegmentNorms(segment)
 		}
 		segments = append(segments, segment)
 	}
 	if survivors := changes.Survivors; survivors < len(table.Rows) {
-		segments = append(segments, buildVecColumnSegment(table.Rows[survivors:], colIdx, normsReady, survivors))
+		segments = appendVecColumnSegments(segments, table.Rows[survivors:], colIdx, normsReady, survivors)
 	}
 	if len(segments) == 0 {
 		return vecSearchColumnCacheEntry{}, false
@@ -158,6 +167,10 @@ func followVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 	}
 	vecColumnFollowCount.Add(1)
 	return entry, true
+}
+
+func vecColumnGarbageTooHigh(garbage, total int) bool {
+	return int64(garbage)*100 > int64(total)*vecColumnGarbagePercent
 }
 
 // removeRowsFromVecColumnSegment returns segment without the rows at the ascending
@@ -223,19 +236,33 @@ func vecColumnOverrideOf(row []any, colIdx int, withNorm bool) vecColumnOverride
 	return value
 }
 
-// limitVecColumnSegments merges the adjacent pair of segments with the fewest rows
-// until at most vecColumnMaxSegments remain. The pair is copied compactly (without
-// the garbage of either), and a small pair is cheap, so the large first segment of
-// a big corpus is only touched when it is all that is left to merge.
+// limitVecColumnSegments merges small neighbours that fit within the packing
+// budget. Let a large column keep a proportional number of segments and a
+// small tail before forcing a merge of unequally sized neighbours.
 func limitVecColumnSegments(segments []vecColumnSegment, normsReady bool) []vecColumnSegment {
-	for len(segments) > vecColumnMaxSegments {
+	if len(segments) <= vecColumnMaxSegments {
+		return segments
+	}
+	rows, floats := 0, 0
+	for _, segment := range segments {
+		rows += len(segment.vectors)
+		floats += len(segment.data) - segment.garbage
+	}
+	limit := vecColumnMaxSegments + rows/vecColumnSegmentMaxRows + floats/vecColumnSegmentMaxFloats
+	for len(segments) > limit {
 		best, bestRows := 0, -1
 		for i := 0; i+1 < len(segments); i++ {
+			if !vecColumnSegmentsFit(segments[i], segments[i+1]) {
+				continue
+			}
 			if rows := len(segments[i].vectors) + len(segments[i+1].vectors); bestRows < 0 || rows < bestRows {
 				best, bestRows = i, rows
 			}
 		}
-		segments[best] = mergeTwoVecColumnSegments(segments[best], segments[best+1], normsReady)
+		if bestRows < 0 {
+			break
+		}
+		segments[best] = repackVecColumnSegments(normsReady, segments[best], segments[best+1])
 		segments = slices.Delete(segments, best+1, best+2)
 	}
 	return segments

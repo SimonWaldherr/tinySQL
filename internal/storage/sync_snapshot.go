@@ -182,7 +182,7 @@ func cloneColumnsDeep(in []Column) []Column {
 }
 
 // attachSearchImages stores the copies on the snapshot's table, ready for
-// snapshotToDisk, and remembers their generations.
+// snapshotFileImage, and remembers their generations.
 func (s *tableSnapshot) attachSearchImages(images searchImages) {
 	s.table.FTSIndexes = images.fts
 	s.table.VectorIndexes = images.vec
@@ -251,12 +251,9 @@ func (s *tableSnapshot) release() {
 	s.lists = nil
 }
 
-// snapshotToDisk builds the encodable image of a snapshot. With aliasRows set
-// (GOB files) and no JSON column, the snapshot's rows are encoded as they are:
-// converting them would allocate a second copy of every row, a quarter of a
-// gigabyte at a million rows, and the encoder only reads them. JSON files and
-// tables with JSON columns convert row by row as tableToDiskImage does.
-func snapshotToDisk(tn string, s *tableSnapshot, aliasRows bool) diskTable {
+// snapshotFileImage builds the table metadata and passes the immutable rows
+// directly to the file writer, which converts them as required by the format.
+func snapshotFileImage(tn string, s *tableSnapshot) diskTable {
 	t := s.table
 	dt := diskTable{
 		Tenant:           tn,
@@ -266,6 +263,7 @@ func snapshotToDisk(tn string, s *tableSnapshot, aliasRows bool) diskTable {
 		Version:          t.Version,
 		StructVersion:    t.structVersion,
 		Cols:             make([]diskColumn, len(t.Cols)),
+		Rows:             t.Rows,
 		Indexes:          materializeSecondaryIndexesForEncode(t.Indexes),
 		FTSIndexes:       t.FTSIndexes,
 		VectorIndexes:    t.VectorIndexes,
@@ -273,21 +271,6 @@ func snapshotToDisk(tn string, s *tableSnapshot, aliasRows bool) diskTable {
 	}
 	for i, c := range t.Cols {
 		dt.Cols[i] = diskColumn(c)
-	}
-	hasJSON := false
-	for _, c := range t.Cols {
-		if c.Type == JsonType {
-			hasJSON = true
-			break
-		}
-	}
-	if aliasRows && !hasJSON {
-		dt.Rows = t.Rows
-		return dt
-	}
-	dt.Rows = make([][]any, len(t.Rows))
-	for i, r := range t.Rows {
-		dt.Rows[i] = diskRowFromTable(t, r)
 	}
 	return dt
 }

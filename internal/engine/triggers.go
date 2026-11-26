@@ -162,6 +162,10 @@ func (r *triggerListRunner) prepare() error {
 }
 
 func (r *triggerListRunner) fire(env ExecEnv, newRow Row, oldRow Row) error {
+	return r.fireWithBinding(env, triggerRowBinding{newRow: newRow, oldRow: oldRow})
+}
+
+func (r *triggerListRunner) fireWithBinding(env ExecEnv, binding triggerRowBinding) error {
 	if len(r.triggers) == 0 {
 		return nil
 	}
@@ -172,7 +176,7 @@ func (r *triggerListRunner) fire(env ExecEnv, newRow Row, oldRow Row) error {
 	}
 	// Execution is synchronous and nested DML owns a separate runner. Reuse
 	// this statement-local binding rather than escaping a new object per row.
-	r.binding = triggerRowBinding{newRow: newRow, oldRow: oldRow}
+	r.binding = binding
 	for i := range r.programs {
 		program := &r.programs[i]
 		if err := executePreparedTrigger(env, program, &r.binding); err != nil {
@@ -189,13 +193,24 @@ func (r *triggerListRunner) fire(env ExecEnv, newRow Row, oldRow Row) error {
 // duplicated, table-qualified-plus-bare) keys into a third map under
 // new./old.-renamed keys on every single trigger firing.
 //
-// newRow and oldRow are themselves produced by buildTableRow, so each already
-// maps both a column's bare lowercased name and its table-qualified name to
-// the same value; lookupTriggerRow strips a leading "new."/"old." and reuses
-// that existing key space instead of re-deriving it.
+// A batch INSERT without RETURNING binds its immutable values by column
+// position. Other callers can reuse the maps they already need for DML.
 type triggerRowBinding struct {
-	newRow Row
-	oldRow Row
+	newRow    Row
+	oldRow    Row
+	newValues []any
+	newCols   map[string]int
+}
+
+func indexInsertTriggerColumns(keys tableRowKeys) map[string]int {
+	columns := make(map[string]int, len(keys.key)*2)
+	for i, key := range keys.key {
+		// Keep fillTableRow's precedence when a dotted column name
+		// collides with a table-qualified key.
+		columns[key] = i
+		columns[keys.prefix[i]] = i
+	}
+	return columns
 }
 
 // lookupTriggerRow resolves a lowercased column reference against a trigger's
@@ -208,12 +223,17 @@ type triggerRowBinding struct {
 func lookupTriggerRow(tb *triggerRowBinding, lower string) (any, bool) {
 	switch {
 	case strings.HasPrefix(lower, "new."):
-		return getValLower(tb.newRow, lower[len("new."):])
+		lower = lower[len("new."):]
 	case strings.HasPrefix(lower, "old."):
 		return getValLower(tb.oldRow, lower[len("old."):])
-	default:
-		return getValLower(tb.newRow, lower)
 	}
+	if tb.newCols != nil {
+		if i, ok := tb.newCols[lower]; ok {
+			return tb.newValues[i], true
+		}
+		return nil, false
+	}
+	return getValLower(tb.newRow, lower)
 }
 
 // triggerRowSuggestionRow reconstructs the merged new./old./bare-keyed map
@@ -222,7 +242,12 @@ func lookupTriggerRow(tb *triggerRowBinding, lower string) (any, bool) {
 // columnSuggestionFromRow. Correctness there matters more than allocating,
 // and this path is only ever reached once a query has already failed.
 func triggerRowSuggestionRow(tb *triggerRowBinding) Row {
-	row := make(Row, len(tb.newRow)*2+len(tb.oldRow))
+	row := make(Row, (len(tb.newRow)+len(tb.newCols))*2+len(tb.oldRow))
+	for k, i := range tb.newCols {
+		v := tb.newValues[i]
+		row["new."+k] = v
+		row[k] = v
+	}
 	for k, v := range tb.newRow {
 		row["new."+k] = v
 		row[k] = v

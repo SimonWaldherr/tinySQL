@@ -32,7 +32,16 @@ func resolveProjectedVecSearch(env ExecEnv, s *Select, fn TableFunction) ([]Row,
 	if err != nil {
 		return nil, err
 	}
-	table, hits, err := vecSearchCandidates(env.ctx, env, args)
+	allowConcurrent := env.vectorReadRoot == s && len(s.CTEs) == 0
+	if allowConcurrent {
+		for _, arg := range s.From.TableFunc.Args {
+			if _, ok := arg.(*Literal); !ok {
+				allowConcurrent = false
+				break
+			}
+		}
+	}
+	table, hits, err := findVecSearchCandidates(env.ctx, env, args, allowConcurrent)
 	if err != nil {
 		return nil, err
 	}

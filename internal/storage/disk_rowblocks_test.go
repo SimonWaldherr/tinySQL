@@ -2,19 +2,21 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func setRowBlockTuning(t *testing.T, target, workers int) {
+func setRowBlockTuning(t testing.TB, target, workers int) {
 	t.Helper()
 	oldTarget, oldWorkers := rowBlockTargetBytes, rowBlockWorkers
 	rowBlockTargetBytes = target
@@ -99,6 +101,62 @@ func readHeaderOf(t *testing.T, path string) diskRowBlockHeader {
 	return hdr
 }
 
+func BenchmarkRowBlockReadFrame(b *testing.B) {
+	for _, size := range []int{1 << 20, 32 << 20} {
+		b.Run(fmt.Sprintf("MiB=%d", size>>20), func(b *testing.B) {
+			binding := blockBinding(123, 0)
+			var frame bytes.Buffer
+			frame.Grow(size + 12)
+			crc, err := writeFrame(&frame, binding, make([]byte, size))
+			if err != nil {
+				b.Fatal(err)
+			}
+			var reader bytes.Reader
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				reader.Reset(frame.Bytes())
+				payload, gotCRC, err := readFrame(&reader, binding)
+				if err != nil || len(payload) != size || gotCRC != crc {
+					b.Fatalf("read frame: len=%d crc=%08x err=%v", len(payload), gotCRC, err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkRowBlockSaveJSONMetadata(b *testing.B) {
+	setRowBlockTuning(b, 2<<20, 3)
+	backend, err := NewDiskBackend(b.TempDir(), false)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer backend.Close()
+	backend.SetRowBlockFiles(true)
+	table := NewTable("vectors", []Column{
+		{Name: "id", Type: IntType},
+		{Name: "embedding", Type: VectorType},
+		{Name: "metadata", Type: JsonType, StrictJSON: true},
+	}, false)
+	const rowCount, dimensions, metadataBytes = 32_768, 256, 1024
+	metadata := map[string]any{"text": strings.Repeat("x", metadataBytes)}
+	table.Rows = make([][]any, rowCount)
+	for i := range table.Rows {
+		vector := make([]float64, dimensions)
+		for d := range vector {
+			vector[d] = float64(i+d) / 3
+		}
+		table.Rows[i] = []any{i, vector, metadata}
+	}
+	b.SetBytes(rowCount * (dimensions*8 + metadataBytes))
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := backend.SaveTable("default", table); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestRowBlockFilesRoundTripAllColumnTypes(t *testing.T) {
 	setRowBlockTuning(t, 400, 3)
 	for _, gzip := range []bool{false, true} {
@@ -152,6 +210,82 @@ func TestRowBlockFilesRoundTripAllColumnTypes(t *testing.T) {
 				t.Fatalf("flag-on backend cannot read the classic file: %v", err)
 			}
 		})
+	}
+}
+
+type rowBlockJSONSequence struct{ next *atomic.Int32 }
+
+func (v rowBlockJSONSequence) MarshalJSON() ([]byte, error) {
+	return strconv.AppendInt(nil, int64(v.next.Add(1)), 10), nil
+}
+
+type rowBlockJSONPanic struct{ err error }
+
+func (v rowBlockJSONPanic) MarshalJSON() ([]byte, error) { panic(v.err) }
+
+func TestRowBlockFilesConvertJSONWhenWriting(t *testing.T) {
+	setRowBlockTuning(t, 70, 3)
+	dir := t.TempDir()
+	b := newBlockBackend(t, dir, false, true)
+	table := NewTable("t", []Column{
+		{Name: "embedding", Type: VectorType},
+		{Name: "strict_metadata", Type: JsonType, StrictJSON: true},
+		{Name: "metadata", Type: JsonType},
+	}, false)
+	if err := b.SaveTable("default", table); err != nil {
+		t.Fatal(err)
+	}
+	var converted atomic.Int32
+	for i := 0; i < 50; i++ {
+		table.Rows = append(table.Rows, []any{[]float64{float64(i), 0.5}, rowBlockJSONSequence{&converted}, `{"sample":true}`})
+	}
+	openErr := errors.New("before writing row blocks")
+	setTableFileWriteHook(t, &tableFileWriteTestHook{Before: func(string) error { return openErr }})
+	if err := b.SaveTable("default", table); !errors.Is(err, openErr) {
+		t.Fatalf("save with write failure: %v", err)
+	}
+	if n := converted.Load(); n != 0 {
+		t.Fatalf("converted %d rows before writing began", n)
+	}
+	if old, err := b.LoadTable("default", "t"); err != nil || old == nil || len(old.Rows) != 0 {
+		t.Fatalf("previous file after failed save: %v, err=%v", old, err)
+	}
+	if _, err := os.Stat(tablePath(dir, false) + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary file after failed save: %v", err)
+	}
+	tableFileWriteHook.Store(nil)
+	if err := b.SaveTable("default", table); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.LoadTable("default", "t")
+	if err != nil || got == nil {
+		t.Fatalf("load converted rows: %v", err)
+	}
+	if len(got.Rows) != len(table.Rows) || converted.Load() != int32(len(table.Rows)) {
+		t.Fatalf("persisted %d rows after %d conversions, want %d", len(got.Rows), converted.Load(), len(table.Rows))
+	}
+	for i, row := range got.Rows {
+		want := []any{table.Rows[i][0], float64(i + 1), map[string]any{"sample": true}}
+		if !reflect.DeepEqual(row, want) {
+			t.Fatalf("row %d: got %v, want %v", i, row, want)
+		}
+	}
+
+	panicErr := errors.New("JSON marshaler panic")
+	table.Rows[20][1] = rowBlockJSONPanic{panicErr}
+	func() {
+		defer func() {
+			if p := recover(); p != panicErr {
+				t.Fatalf("save recovered %v, want %v", p, panicErr)
+			}
+		}()
+		_ = b.SaveTable("default", table)
+	}()
+	if _, err := os.Stat(tablePath(dir, false) + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary file after marshaler panic: %v", err)
+	}
+	if old, err := b.LoadTable("default", "t"); err != nil || old == nil || !reflect.DeepEqual(old.Rows, got.Rows) {
+		t.Fatalf("previous file changed after marshaler panic, err=%v", err)
 	}
 }
 
@@ -626,7 +760,8 @@ func TestRowBlockParallelErrorPathsDoNotLeakGoroutines(t *testing.T) {
 
 	// An encode that fails in the middle.
 	var sink bytes.Buffer
-	err := writeBlocksParallel(&sink, 0, 40, 4, func(i int) ([]byte, error) {
+	prepare := func(int) [][]any { return nil }
+	err := writeBlocksParallel(&sink, 0, 40, 4, prepare, func(i int, _ [][]any) ([]byte, error) {
 		if i == 13 {
 			return nil, fmt.Errorf("encode boom")
 		}
@@ -639,7 +774,7 @@ func TestRowBlockParallelErrorPathsDoNotLeakGoroutines(t *testing.T) {
 
 	// A write that fails in the middle.
 	fw := &failingWriter{w: &sink, left: 100}
-	err = writeBlocksParallel(fw, 0, 60, 4, func(i int) ([]byte, error) { return bytes.Repeat([]byte{1}, 30), nil })
+	err = writeBlocksParallel(fw, 0, 60, 4, prepare, func(int, [][]any) ([]byte, error) { return bytes.Repeat([]byte{1}, 30), nil })
 	if err == nil {
 		t.Fatal("a write error was swallowed")
 	}

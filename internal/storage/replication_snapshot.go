@@ -99,7 +99,7 @@ func captureReplicationSnapshot(ctx context.Context, db *DB, wal *AdvancedWAL) (
 						return nil, diskCatalog{}, 0, 0, err
 					}
 				}
-				image.Rows[i] = diskRowFromTable(table, row)
+				image.Rows[i] = diskRowFromTable(image.Cols, row)
 				cloneMutableCells(image.Rows[i])
 			}
 			for j := range image.Cols {

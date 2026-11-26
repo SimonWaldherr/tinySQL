@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -10,16 +11,30 @@ import (
 )
 
 func BenchmarkTriggerBoundedInsert(b *testing.B) {
+	benchmarkTriggerInsertWidth(b, 2)
+}
+
+func BenchmarkTriggerWideInsert(b *testing.B) {
+	benchmarkTriggerInsertWidth(b, 64)
+}
+
+func benchmarkTriggerInsertWidth(b *testing.B, width int) {
 	db := storage.NewDB()
+	b.Cleanup(func() { db.Close() })
 	ctx := context.Background()
-	for _, sql := range []string{`CREATE TABLE source (id INT, amount INT)`, `CREATE TABLE audit (id INT, amount INT)`, `CREATE TRIGGER audit_insert AFTER INSERT ON source BEGIN INSERT INTO audit VALUES (NEW.id, NEW.amount); END`} {
+	cols := []string{"id INT", "amount INT"}
+	for i := 2; i < width; i++ {
+		cols = append(cols, fmt.Sprintf("col%d INT", i))
+	}
+	for _, sql := range []string{"CREATE TABLE source (" + strings.Join(cols, ",") + ")", `CREATE TABLE audit (id INT, amount INT)`, `CREATE TRIGGER audit_insert AFTER INSERT ON source BEGIN INSERT INTO audit VALUES (NEW.id, NEW.amount); END`} {
 		if _, err := Execute(ctx, db, "default", mustParse(sql)); err != nil {
 			b.Fatal(err)
 		}
 	}
 	values := make([]string, 100)
+	extraValues := strings.Repeat(",0", width-2)
 	for i := range values {
-		values[i] = fmt.Sprintf("(%d,%d)", i, i*10)
+		values[i] = fmt.Sprintf("(%d,%d%s)", i, i*10, extraValues)
 	}
 	stmt := mustParse("INSERT INTO source VALUES " + strings.Join(values, ",")).(*Insert)
 	source, _ := db.Get("default", "source")
@@ -37,6 +52,63 @@ func BenchmarkTriggerBoundedInsert(b *testing.B) {
 		source.Rows = source.Rows[:0]
 		clear(audit.Rows)
 		audit.Rows = audit.Rows[:0]
+	}
+}
+
+func TestRawInsertTriggerBindingMatchesMap(t *testing.T) {
+	keys := newTableRowKeys([]storage.Column{{Name: "id"}, {Name: "source.id"}, {Name: "amount"}}, "source.")
+	values := []any{1, 2, nil}
+	mapped := triggerRowBinding{newRow: buildTableRow(keys, values)}
+	raw := triggerRowBinding{newValues: values, newCols: indexInsertTriggerColumns(keys)}
+	for _, name := range []string{"new.id", "id", "new.source.id", "source.id", "new.source.source.id", "new.amount", "new.missing", "old.id"} {
+		got, ok := lookupTriggerRow(&raw, name)
+		want, found := lookupTriggerRow(&mapped, name)
+		if got != want || ok != found {
+			t.Errorf("%s: got (%v, %t), want (%v, %t)", name, got, ok, want, found)
+		}
+	}
+	if got, want := triggerRowSuggestionRow(&raw), triggerRowSuggestionRow(&mapped); !reflect.DeepEqual(got, want) {
+		t.Fatalf("suggestion bindings: got %v, want %v", got, want)
+	}
+}
+
+func TestTriggerBatchNewSnapshotSurvivesProcedure(t *testing.T) {
+	const proc = "test_trigger_replace_inserted_cell"
+	if err := RegisterStoredProcedure(proc, func(pc ProcedureContext, _ []any) (*ResultSet, error) {
+		table, err := pc.env.db.Get(pc.Tenant(), "source")
+		if err != nil {
+			return nil, err
+		}
+		table.Rows[len(table.Rows)-1][0] = 99
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { UnregisterStoredProcedure(proc) })
+	for _, columns := range []string{"", "(id)"} {
+		db := storage.NewDB()
+		defer db.Close()
+		for _, sql := range []string{
+			`CREATE TABLE source (id INT)`,
+			`CREATE TABLE audit (id INT)`,
+			`CREATE TRIGGER audit_insert AFTER INSERT ON source BEGIN CALL ` + proc + `(); INSERT INTO audit VALUES (NEW.id); END`,
+			`INSERT INTO source ` + columns + ` VALUES (1),(2)`,
+		} {
+			if _, err := Execute(t.Context(), db, "default", mustParse(sql)); err != nil {
+				t.Fatal(sql, err)
+			}
+		}
+		source, err := db.Get("default", "source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		audit, err := db.Get("default", "audit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(source.Rows, [][]any{{99}, {99}}) || !reflect.DeepEqual(audit.Rows, [][]any{{1}, {2}}) {
+			t.Fatalf("columns %q: source %v, audit %v", columns, source.Rows, audit.Rows)
+		}
 	}
 }
 

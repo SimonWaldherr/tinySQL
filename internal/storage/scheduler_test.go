@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -342,9 +343,10 @@ func TestSchedulerCheckIntervalJobs(t *testing.T) {
 	jobs := []*CatalogJob{
 		{Name: "due", SQLText: "SELECT due", ScheduleType: "INTERVAL", IntervalMs: 1000, NextRunAt: &due, Enabled: true},
 		{Name: "future", SQLText: "SELECT future", ScheduleType: "INTERVAL", IntervalMs: 1000, NextRunAt: &future, Enabled: true},
-		{Name: "once", SQLText: "SELECT once", ScheduleType: "ONCE", RunAt: &due, NextRunAt: &due, Enabled: true},
+		{Name: "once", SQLText: "SELECT once", ScheduleType: "ONCE", RunAt: &now, NextRunAt: &now, Enabled: true},
 		{Name: "cron", SQLText: "SELECT cron", ScheduleType: "CRON", NextRunAt: &due, Enabled: true},
 		{Name: "unset", SQLText: "SELECT unset", ScheduleType: "INTERVAL", IntervalMs: 1000, Enabled: true},
+		{Name: "disabled", SQLText: "SELECT disabled", ScheduleType: "INTERVAL", IntervalMs: 1000, NextRunAt: &due},
 	}
 	for _, job := range jobs {
 		if err := db.Catalog().RegisterJob(job); err != nil {
@@ -355,8 +357,9 @@ func TestSchedulerCheckIntervalJobs(t *testing.T) {
 	s.checkIntervalJobs(now)
 	waitForScheduler(s)
 
-	if exec.callCount() != 2 {
-		t.Fatalf("executor calls = %d, want 2", exec.callCount())
+	slices.Sort(exec.calls)
+	if want := []string{"SELECT due", "SELECT once"}; !slices.Equal(exec.calls, want) {
+		t.Fatalf("executor calls = %v, want %v", exec.calls, want)
 	}
 	once, err := db.Catalog().GetJob("once")
 	if err != nil {

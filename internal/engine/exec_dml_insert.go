@@ -188,9 +188,11 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	if err != nil {
 		return nil, err
 	}
-	// Trigger bindings are consumed synchronously. RETURNING needs separate
-	// owned maps, while trigger-only rows can reuse one statement-local map.
-	var triggerRow Row
+	// Batch trigger-only rows share a column index and shallow value snapshot.
+	// Copy the interfaces before firing so NEW stays stable even if a Go
+	// procedure replaces cells in the inserted row. RETURNING owns its maps.
+	useRawTriggerBinding := rowCount > 1 && len(s.Returning) == 0
+	var binding triggerRowBinding
 	inserted := 0
 	updated := 0
 	// Reserve row headers once when every input row will be appended on
@@ -257,20 +259,19 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
 			return nil, err
 		}
-		var newRow Row
 		if needsInsertRow {
-			if len(s.Returning) > 0 {
-				newRow = buildTableRow(keys, row)
-			} else {
-				if triggerRow == nil {
-					triggerRow = make(Row, len(keys.key)*2)
+			if useRawTriggerBinding {
+				if binding.newCols == nil {
+					binding.newCols = indexInsertTriggerColumns(keys)
+					binding.newValues = make([]any, len(keys.key))
 				}
-				fillTableRow(triggerRow, keys, row)
-				newRow = triggerRow
+				copy(binding.newValues, row)
+			} else {
+				binding.newRow = buildTableRow(keys, row)
 			}
 		}
 		if hasBefore {
-			if err := beforeRunner.fire(env, newRow, nil); err != nil {
+			if err := beforeRunner.fireWithBinding(env, binding); err != nil {
 				return nil, err
 			}
 		}
@@ -282,12 +283,12 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 			return nil, err
 		}
 		if hasAfter {
-			if err := afterRunner.fire(env, newRow, nil); err != nil {
+			if err := afterRunner.fireWithBinding(env, binding); err != nil {
 				return nil, err
 			}
 		}
 		if len(s.Returning) > 0 {
-			returningRows = append(returningRows, newRow)
+			returningRows = append(returningRows, binding.newRow)
 		}
 		inserted++
 	}
@@ -371,9 +372,8 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 	if err != nil {
 		return nil, err
 	}
-	// Trigger bindings are consumed synchronously. RETURNING needs separate
-	// owned maps, while trigger-only rows can reuse one statement-local map.
-	var triggerRow Row
+	useRawTriggerBinding := rowCount > 1 && len(s.Returning) == 0
+	var binding triggerRowBinding
 	inserted := 0
 	updated := 0
 	// Reserve row headers once when every input row will be appended on
@@ -451,20 +451,19 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 		if err := t.CheckSecondaryIndexConstraints(row, -1); err != nil {
 			return nil, err
 		}
-		var newRow Row
 		if needsInsertRow {
-			if len(s.Returning) > 0 {
-				newRow = buildTableRow(keys, row)
-			} else {
-				if triggerRow == nil {
-					triggerRow = make(Row, len(keys.key)*2)
+			if useRawTriggerBinding {
+				if binding.newCols == nil {
+					binding.newCols = indexInsertTriggerColumns(keys)
+					binding.newValues = make([]any, len(keys.key))
 				}
-				fillTableRow(triggerRow, keys, row)
-				newRow = triggerRow
+				copy(binding.newValues, row)
+			} else {
+				binding.newRow = buildTableRow(keys, row)
 			}
 		}
 		if hasBefore {
-			if err := beforeRunner.fire(env, newRow, nil); err != nil {
+			if err := beforeRunner.fireWithBinding(env, binding); err != nil {
 				return nil, err
 			}
 		}
@@ -476,12 +475,12 @@ func executeInsertSpecificColumns(env ExecEnv, s *Insert, t *storage.Table, tmp 
 			return nil, err
 		}
 		if hasAfter {
-			if err := afterRunner.fire(env, newRow, nil); err != nil {
+			if err := afterRunner.fireWithBinding(env, binding); err != nil {
 				return nil, err
 			}
 		}
 		if len(s.Returning) > 0 {
-			returningRows = append(returningRows, newRow)
+			returningRows = append(returningRows, binding.newRow)
 		}
 		inserted++
 	}

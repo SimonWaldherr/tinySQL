@@ -137,19 +137,23 @@ func newRecursiveCTEAlignment(anchor, next []string, cteName string) *recursiveC
 
 func (a *recursiveCTEAlignment) align(rows []Row) []Row {
 	alignedRows := make([]Row, len(rows))
-	for rowIdx, r := range rows {
-		nr := make(Row, len(a.targets)*2)
-		for i, source := range a.sources {
-			val, ok := r[source]
-			if !ok {
-				val = r[a.columns[i]]
-			}
-			nr[a.targets[i]] = val
-			nr[a.qualified[i]] = val
-		}
-		alignedRows[rowIdx] = nr
+	for i, row := range rows {
+		aligned := make(Row, len(a.targets)*2)
+		a.alignRow(aligned, row)
+		alignedRows[i] = aligned
 	}
 	return alignedRows
+}
+
+func (a *recursiveCTEAlignment) alignRow(dst, src Row) {
+	for i, source := range a.sources {
+		value, ok := src[source]
+		if !ok {
+			value = src[a.columns[i]]
+		}
+		dst[a.targets[i]] = value
+		dst[a.qualified[i]] = value
+	}
 }
 
 // recursiveCTEMaxRows caps the total accumulated rows a recursive CTE may
@@ -224,6 +228,7 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 	}
 
 	var alignment *recursiveCTEAlignment
+	var aligned Row
 	cteKey := strings.ToLower(cte.Name)
 	iterLimit := 1024
 	for iter := 0; iter < iterLimit && len(frontier) > 0; iter++ {
@@ -259,10 +264,9 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 				nextRows = nextRows[:remaining]
 			}
 		}
-		alignedRows := alignment.align(nextRows)
 		if union.Type == UnionAll {
-			accRows = append(accRows, alignedRows...)
-			frontier = alignedRows
+			frontier = alignment.align(nextRows)
+			accRows = append(accRows, frontier...)
 			if maxRows >= 0 && len(accRows) >= maxRows {
 				frontier = nil
 				break
@@ -274,14 +278,21 @@ func evalRecursiveCTE(env ExecEnv, cte *CTE) (*ResultSet, error) {
 		}
 
 		frontier = frontier[:0]
-		for _, row := range alignedRows {
-			signatureBuf = appendSetOperationSignature(signatureBuf[:0], row, signatureColumns)
+		for _, row := range nextRows {
+			if aligned == nil {
+				aligned = make(Row, len(signatureColumns)*2)
+			}
+			// Alignment assigns every key on each row. A rejected duplicate
+			// can leave its map in place for the next candidate to overwrite.
+			alignment.alignRow(aligned, row)
+			signatureBuf = appendSetOperationSignature(signatureBuf[:0], aligned, signatureColumns)
 			if seen[string(signatureBuf)] {
 				continue
 			}
 			seen[string(signatureBuf)] = true
-			accRows = append(accRows, row)
-			frontier = append(frontier, row)
+			accRows = append(accRows, aligned)
+			frontier = append(frontier, aligned)
+			aligned = nil // the frontier now owns the accepted map
 			if maxRows >= 0 && len(accRows) >= maxRows {
 				frontier = nil
 				break

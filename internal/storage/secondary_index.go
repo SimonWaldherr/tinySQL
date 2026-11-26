@@ -847,12 +847,9 @@ func (t *Table) buildSecondaryIndex(idx *SecondaryIndex) (*SkipList, error) {
 			}
 			key = appendCanonicalIndexValue(key, row[pos])
 		}
-		if idx.Unique {
-			if _, found := fast.Get(key); found {
-				return nil, fmt.Errorf("unique index %q: duplicate key", idx.Name)
-			}
+		if !fast.insert(key, rowID, idx.Unique) {
+			return nil, fmt.Errorf("unique index %q: duplicate key", idx.Name)
 		}
-		fast.Insert(key, rowID)
 	}
 	return fast, nil
 }

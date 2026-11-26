@@ -24,6 +24,30 @@ func BenchmarkCreateAdditionalIndex(b *testing.B) {
 	}
 }
 
+func BenchmarkCreateUniqueIndex(b *testing.B) {
+	const rows = 1 << 14
+	for _, input := range []struct {
+		name   string
+		stride int
+	}{{"ascending", 1}, {"shuffled", 4051}} {
+		b.Run(input.name, func(b *testing.B) {
+			table := NewTable("unique_build", []Column{{Name: "id", Type: IntType}}, false)
+			table.Rows = make([][]any, rows)
+			for i := range table.Rows {
+				// Every odd stride permutes a power-of-two row count.
+				table.Rows[i] = []any{i * input.stride % rows}
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := table.CreateSecondaryIndex("unique_id", []string{"id"}, true); err != nil {
+					b.Fatal(err)
+				}
+				table.DropSecondaryIndex("unique_id")
+			}
+		})
+	}
+}
+
 func TestCreateIndexPreservesExistingStructures(t *testing.T) {
 	table := NewTable("independent_indexes", []Column{{Name: "id", Type: IntType}, {Name: "category", Type: IntType}}, false)
 	table.Rows = [][]any{{1, 7}, {2, 7}, {3, 9}}

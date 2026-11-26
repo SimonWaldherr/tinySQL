@@ -32,6 +32,30 @@ func (db *DB) getTenantRO(tn string) *tenantDB {
 	return db.tenants[strings.ToLower(tn)]
 }
 
+// ResidentTable checks the current table identity without I/O or LRU updates.
+// A caller using the table contents must already hold the content lock.
+func ResidentTable(db *DB, tenant, name string) *Table {
+	tn, key := strings.ToLower(tenant), strings.ToLower(name)
+	db.mu.RLock()
+	var table *Table
+	if td := db.tenants[tn]; td != nil {
+		table = td.tables[key]
+	}
+	backend := db.backend
+	db.mu.RUnlock()
+	if table != nil {
+		return table
+	}
+	switch b := backend.(type) {
+	case *HybridBackend:
+		return b.pool.peek(tn, key)
+	case *PagedIndexBackend:
+		return b.pool.peek(tn, key)
+	default:
+		return nil
+	}
+}
+
 // Get returns a table by name for the given tenant.
 // When a StorageBackend is attached, tables not found in memory are loaded
 // from the backend on demand (lazy loading).

@@ -607,6 +607,31 @@ func getVecColumnCache(tenant string, table *storage.Table, colIdx int, includeN
 }
 
 func refreshVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table, colIdx int, includeNorms bool, rows []int) vecSearchColumnCacheEntry {
+	normsReady := includeNorms || cached.normsReady
+	// The change log returns distinct rows. Only changes inside the published
+	// prefix need overrides; extendVecColumnCache reads the current tail.
+	covered := min(cached.rows, len(table.Rows))
+	limit := vecColumnOverrideLimit(len(table.Rows))
+	remaining := limit - len(cached.overrides)
+	if len(rows) > remaining {
+		for _, row := range rows {
+			if row < 0 || row >= covered {
+				continue
+			}
+			if _, exists := cached.overrides[row]; !exists {
+				remaining--
+			}
+			if remaining < 0 {
+				break
+			}
+		}
+	}
+	if remaining < 0 {
+		if len(cached.segments) > 1 && covered == cached.rows && cached.adjacentSegments(0, covered) {
+			return repackVecColumnUpdates(cached, table, colIdx, normsReady, rows)
+		}
+		return buildVecColumnCache(table, colIdx, normsReady)
+	}
 	entry := extendVecColumnCache(cached, table, colIdx, includeNorms)
 	if entry.shape == cached.shape {
 		entry.shape = new(vecColumnShapeCache)
@@ -614,28 +639,15 @@ func refreshVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Tabl
 	// Append-only views share immutable overrides. A norm upgrade already
 	// created a private map; otherwise take a copy before changing row values.
 	if len(cached.overrides) == 0 {
-		entry.overrides = make(map[int]vecColumnOverride, len(rows))
+		entry.overrides = make(map[int]vecColumnOverride, min(len(rows), limit))
 	} else if !includeNorms || cached.normsReady {
 		entry.overrides = maps.Clone(cached.overrides)
 	}
 	for _, row := range rows {
-		if row < 0 || row >= len(table.Rows) {
+		if row < 0 || row >= covered {
 			continue
 		}
-		value := vecColumnOverride{}
-		if colIdx < len(table.Rows[row]) && table.Rows[row][colIdx] != nil {
-			if vector, ok := vecRowValue(table.Rows[row][colIdx]); ok {
-				value.vector = append([]float64(nil), vector...)
-				value.valid = true
-				if includeNorms || cached.normsReady {
-					value.norm = vectorL2Norm(value.vector)
-				}
-			}
-		}
-		entry.overrides[row] = value
-	}
-	if vecColumnOverridesNeedCompaction(entry) {
-		return buildVecColumnCache(table, colIdx, includeNorms || cached.normsReady)
+		entry.overrides[row] = vecColumnOverrideOf(table.Rows[row], colIdx, normsReady)
 	}
 	// A refresh only adds or replaces overrides, so an unchanged count can
 	// keep sharing the published row list.
@@ -645,6 +657,63 @@ func refreshVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Tabl
 			entry.overrideRows = append(entry.overrideRows, row)
 		}
 		slices.Sort(entry.overrideRows)
+	}
+	return entry
+}
+
+// repackVecColumnUpdates replaces the touched segments of a complete cache.
+// The old segments and overrides may still be in use by concurrent searches.
+func repackVecColumnUpdates(cached vecSearchColumnCacheEntry, table *storage.Table, colIdx int, normsReady bool, rows []int) vecSearchColumnCacheEntry {
+	segmentIndex := func(row int) int {
+		return sort.Search(len(cached.segments), func(i int) bool {
+			segment := cached.segments[i]
+			return row < segment.start+len(segment.vectors)
+		})
+	}
+	changed := make([]bool, len(cached.segments))
+	for _, row := range rows {
+		if row >= 0 && row < cached.rows {
+			changed[segmentIndex(row)] = true
+		}
+	}
+	entry := vecSearchColumnCacheEntry{
+		table:         table,
+		version:       table.Version,
+		structVersion: table.StructVersion(),
+		rows:          len(table.Rows),
+		shape:         new(vecColumnShapeCache),
+		segments:      make([]vecColumnSegment, 0, len(cached.segments)),
+		normsReady:    normsReady,
+	}
+	upgradeNorms := normsReady && !cached.normsReady
+	for i, segment := range cached.segments {
+		if changed[i] {
+			end := segment.start + len(segment.vectors)
+			entry.segments = appendVecColumnSegments(entry.segments, table.Rows[segment.start:end], colIdx, normsReady, segment.start)
+			continue
+		}
+		if upgradeNorms {
+			segment.norms = vecSegmentNorms(segment)
+		}
+		entry.segments = append(entry.segments, segment)
+	}
+	if cached.rows < entry.rows {
+		entry.segments = appendVecColumnSegments(entry.segments, table.Rows[cached.rows:], colIdx, normsReady, cached.rows)
+	}
+	entry.segments = limitVecColumnSegments(entry.segments, normsReady)
+	for _, row := range cached.overrideRows {
+		if changed[segmentIndex(row)] {
+			continue
+		}
+		value := cached.overrides[row]
+		if upgradeNorms && value.valid {
+			value.norm = vectorL2Norm(value.vector)
+		}
+		if entry.overrides == nil {
+			entry.overrides = make(map[int]vecColumnOverride, len(cached.overrides))
+		}
+		entry.overrides[row] = value
+		entry.overrideRows = append(entry.overrideRows, row)
 	}
 	return entry
 }
@@ -666,13 +735,13 @@ func vecColumnOverrideLimit(rows int) int {
 	return limit
 }
 
-// buildVecColumnCache extracts one table column into a cache entry backed by
-// immutable, contiguous segments.  A cold build produces one segment; later
-// pure appends add compact tail segments instead of copying the existing data.
+// buildVecColumnCache extracts one table column into immutable, adjacent
+// segments. Larger columns are packed in bounded segments so later appends and
+// removals can keep the unchanged parts of the cache.
 //
 // This is a two-pass build: pass 1 classifies each row exactly as before
 // (skip missing/nil cells, skip whatever vecRowValue rejects) and tallies the
-// total float64 count; pass 2 makes the one allocation for all row data and
+// total float64 count; pass 2 makes one allocation for the segment data and
 // copies each valid row into its own tightly-packed region, in row order.
 // Two passes (rather than growing one slice with append) avoid repeated
 // reallocate-and-recopy of the whole buffer as it grows — exactly the
@@ -682,22 +751,49 @@ func vecColumnOverrideLimit(rows int) int {
 // row whose length doesn't match the query is excluded at search time
 // (vecSearchTopKRange, validCacheRow), never truncated or hard-errored here.
 func buildVecColumnCache(table *storage.Table, colIdx int, includeNorms bool) vecSearchColumnCacheEntry {
-	segment := buildVecColumnSegment(table.Rows, colIdx, includeNorms, 0)
 	return vecSearchColumnCacheEntry{
 		table:         table,
 		version:       table.Version,
 		structVersion: table.StructVersion(),
 		rows:          len(table.Rows),
 		shape:         new(vecColumnShapeCache),
-		segments:      []vecColumnSegment{segment},
+		segments:      appendVecColumnSegments(nil, table.Rows, colIdx, includeNorms, 0),
 		normsReady:    includeNorms,
 	}
 }
 
-// buildVecColumnSegment packs one column of rows into a segment. A cold build of
-// a large corpus (a million 768-dimensional embeddings is 6 GB to pack and, for
-// cosine, to take the norm of) is spread over the available cores; the result is
-// byte-for-byte the serial build's, see buildVecColumnSegmentParallel.
+const (
+	vecColumnSegmentMaxFloats = (32 << 20) / 8
+	vecColumnSegmentMaxRows   = 64 << 10
+)
+
+// appendVecColumnSegments bounds both the packed allocation and the arrays of
+// row metadata. An individual vector larger than the budget gets its own
+// segment. String cells can include legacy JSON vectors. Their byte length
+// gives an upper bound without parsing an embedding twice.
+func appendVecColumnSegments(dst []vecColumnSegment, rows [][]any, colIdx int, includeNorms bool, start int) []vecColumnSegment {
+	from, floats := 0, 0
+	for i, row := range rows {
+		dims := 0
+		if colIdx < len(row) {
+			switch value := row[colIdx].(type) {
+			case []float64:
+				dims = len(value)
+			case string:
+				dims = len(value) / 2 // a JSON coordinate needs at least a digit and a separator
+			}
+		}
+		if i > from && (dims > vecColumnSegmentMaxFloats-floats || i-from >= vecColumnSegmentMaxRows) {
+			dst = append(dst, buildVecColumnSegment(rows[from:i], colIdx, includeNorms, start+from))
+			from, floats = i, 0
+		}
+		floats += dims
+	}
+	return append(dst, buildVecColumnSegment(rows[from:], colIdx, includeNorms, start+from))
+}
+
+// buildVecColumnSegment packs one column of rows into a segment, spreading
+// larger builds across cores while preserving the serial build's results.
 func buildVecColumnSegment(rows [][]any, colIdx int, includeNorms bool, start int) vecColumnSegment {
 	if workers := vecBuildWorkerCount(len(rows)); workers > 1 {
 		return buildVecColumnSegmentParallel(rows, colIdx, includeNorms, start, workers)
@@ -868,9 +964,10 @@ func extendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 	}
 	cached.normsReady = cached.normsReady || includeNorms
 	if cached.rows < rows {
-		segments = append(segments, buildVecColumnSegment(table.Rows[cached.rows:], colIdx, cached.normsReady, cached.rows))
+		segments = appendVecColumnSegments(segments, table.Rows[cached.rows:], colIdx, cached.normsReady, cached.rows)
+		segments = limitVecColumnSegments(mergeVecColumnSegments(segments, cached.normsReady), cached.normsReady)
 	}
-	cached.segments = mergeVecColumnSegments(segments, cached.normsReady)
+	cached.segments = segments
 	cached.rows = rows
 	// Appends do not change existing row overrides or computed norms. Share
 	// their immutable map; refresh takes a private copy before a later UPDATE.
@@ -887,19 +984,18 @@ func extendVecColumnCache(cached vecSearchColumnCacheEntry, table *storage.Table
 	return cached
 }
 
-// mergeVecColumnSegments performs binary-counter compaction on similarly
-// sized adjacent tail segments.  Single-row ingestion therefore copies only
-// O(log appendedRows) small tail data amortized; the large original segment is
-// copied only once the accumulated append tail has become comparably large.
+// mergeVecColumnSegments joins similarly sized tail segments while they fit
+// the segment budget. Single-row ingestion copies only O(log appendedRows)
+// small tail segments amortized.
 func mergeVecColumnSegments(segments []vecColumnSegment, normsReady bool) []vecColumnSegment {
 	for len(segments) >= 2 {
 		right := segments[len(segments)-1]
 		left := segments[len(segments)-2]
-		if len(left.vectors) == 0 || len(right.vectors) == 0 || len(left.vectors) != len(right.vectors) {
+		if len(left.vectors) == 0 || len(left.vectors) != len(right.vectors) || !vecColumnSegmentsFit(left, right) {
 			break
 		}
 		last := len(segments) - 1
-		segments[last-1] = mergeTwoVecColumnSegments(left, right, normsReady)
+		segments[last-1] = repackVecColumnSegments(normsReady, left, right)
 		// The header slice is owned by this extension; release the superseded
 		// segment's packed arrays instead of keeping them in its unused tail.
 		segments[last] = vecColumnSegment{}
@@ -908,20 +1004,28 @@ func mergeVecColumnSegments(segments []vecColumnSegment, normsReady bool) []vecC
 	return segments
 }
 
-func mergeTwoVecColumnSegments(left, right vecColumnSegment, normsReady bool) vecColumnSegment {
-	rows := len(left.vectors) + len(right.vectors)
+func vecColumnSegmentsFit(left, right vecColumnSegment) bool {
+	return len(left.vectors)+len(right.vectors) <= vecColumnSegmentMaxRows &&
+		len(left.data)-left.garbage+len(right.data)-right.garbage <= vecColumnSegmentMaxFloats
+}
+
+// repackVecColumnSegments compacts the live values of one or more adjacent
+// segments into a single segment. The originals may still be held by readers.
+func repackVecColumnSegments(normsReady bool, segments ...vecColumnSegment) vecColumnSegment {
+	rows, total := 0, 0
+	for _, segment := range segments {
+		rows += len(segment.vectors)
+		total += len(segment.data) - segment.garbage
+	}
 	valid := make([]bool, rows)
 	vectors := make([][]float64, rows)
-	// Only the live floats are copied: a segment a removal was followed on holds
-	// the packed data of rows that are gone (see followVecColumnCache).
-	total := len(left.data) - left.garbage + len(right.data) - right.garbage
 	data := make([]float64, total)
 	var norms []float64
 	if normsReady {
 		norms = make([]float64, rows)
 	}
-	cursor := 0
-	copySegment := func(segment vecColumnSegment, offset int) {
+	cursor, offset := 0, 0
+	for _, segment := range segments {
 		for i, vector := range segment.vectors {
 			if !segment.valid[i] {
 				continue
@@ -939,10 +1043,9 @@ func mergeTwoVecColumnSegments(left, right vecColumnSegment, normsReady bool) ve
 			}
 			cursor += len(vector)
 		}
+		offset += len(segment.vectors)
 	}
-	copySegment(left, 0)
-	copySegment(right, len(left.vectors))
-	return vecColumnSegment{start: left.start, data: data, vectors: vectors, norms: norms, valid: valid}
+	return vecColumnSegment{start: segments[0].start, data: data, vectors: vectors, norms: norms, valid: valid}
 }
 
 func vectorL2Norm(v []float64) float64 {
@@ -1203,7 +1306,7 @@ func (scan vecFlatScan) topKParallel(ctx context.Context, rows [][]any, queryLen
 	return mergeVecSearchResults(results, k, len(rows))
 }
 
-func vecSearchTopKRange(ctx context.Context, rows [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {
+func vecSearchTopKRange(ctx context.Context, _ [][]any, start, end, queryLen, k int, cache vecSearchColumnCacheEntry, distFn vecDistanceFunc, needNorm bool) (vecScoredHeap, error) {
 	scoredRows := newScoredHeap(k, end-start)
 	if k >= vecTopKBatchMin && end-start >= vecTopKBatchMin {
 		var err error
@@ -1335,18 +1438,29 @@ func (f *VecSearchTableFunc) Execute(ctx context.Context, args []Expr, env ExecE
 // distances compact lets RAG_SEARCH fuse candidate sets before copying any
 // source columns; the public VEC_SEARCH function materializes them afterward.
 func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*storage.Table, []vecScoredRow, error) {
+	return findVecSearchCandidates(ctx, env, a, false)
+}
+
+func vecSearchSource(db *storage.DB, tenant string, a vecSearchArgs) (*storage.Table, int, error) {
+	table, err := db.Get(tenant, a.tableName)
+	if err != nil {
+		return nil, 0, fmt.Errorf("VEC_SEARCH: table %q not found: %w", a.tableName, err)
+	}
+	col, err := table.ColIndex(a.colName)
+	if err != nil {
+		return nil, 0, fmt.Errorf("VEC_SEARCH: %w", err)
+	}
+	return table, col, nil
+}
+
+func findVecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs, allowConcurrent bool) (*storage.Table, []vecScoredRow, error) {
 	tenant := env.tenant
 	if tenant == "" {
 		tenant = "default"
 	}
-	table, err := env.db.Get(tenant, a.tableName)
+	table, vecColIdx, err := vecSearchSource(env.db, tenant, a)
 	if err != nil {
-		return nil, nil, fmt.Errorf("VEC_SEARCH: table %q not found: %w", a.tableName, err)
-	}
-
-	vecColIdx, err := table.ColIndex(a.colName)
-	if err != nil {
-		return nil, nil, fmt.Errorf("VEC_SEARCH: %w", err)
+		return nil, nil, err
 	}
 
 	var queryNorm float64
@@ -1383,7 +1497,12 @@ func vecSearchCandidates(ctx context.Context, env ExecEnv, a vecSearchArgs) (*st
 	}
 	if !cacheHit {
 		cache := getVecColumnCache(tenant, table, vecColIdx, a.metric == "cosine")
-		scoredRowsOrdered, err = vecSearchTopKWithIndex(searchCtx, tenant, table, vecColIdx, a, queryNorm, cache)
+		if allowConcurrent && !cacheEnabled && a.indexMode == vecIndexFlat &&
+			largeVecScan(cache.rows, len(a.queryVec)) && storage.ResidentTable(env.db, tenant, a.tableName) == table {
+			table, scoredRowsOrdered, err = rankVecSearchAlongsideWrites(searchCtx, env, tenant, a, queryNorm, table, vecColIdx, cache)
+		} else {
+			scoredRowsOrdered, err = vecSearchTopKWithIndex(searchCtx, tenant, table, vecColIdx, a, queryNorm, cache)
+		}
 		if err != nil {
 			return nil, nil, err
 		}

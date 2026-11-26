@@ -189,6 +189,12 @@ func removeRowIDSorted(rowIDs []int, rowID int) ([]int, bool) {
 // by CheckSecondaryIndexConstraints; by the time Insert is called the value
 // being appended is already known-valid, exactly as today).
 func (s *SkipList) Insert(key []byte, rowID int) {
+	s.insert(key, rowID, false)
+}
+
+// insert reports whether the row was accepted. A unique build can reject an
+// existing key at the insertion position without a separate lookup.
+func (s *SkipList) insert(key []byte, rowID int, unique bool) bool {
 	var update [skipListMaxLevel]*skipListNode
 	x := s.head
 	for i := s.level - 1; i >= 0; i-- {
@@ -199,12 +205,15 @@ func (s *SkipList) Insert(key []byte, rowID int) {
 	}
 	next := x.forward[0]
 	if next != nil && bytes.Equal(next.key, key) {
+		if unique {
+			return false
+		}
 		next.rowIDs = insertRowIDSorted(next.rowIDs, rowID)
 		s.mutations++
 		if s.journaling {
 			s.record(next.key, rowID, false)
 		}
-		return
+		return true
 	}
 
 	newLevel := s.randomLevel()
@@ -229,6 +238,7 @@ func (s *SkipList) Insert(key []byte, rowID int) {
 	if s.journaling {
 		s.record(node.key, rowID, false)
 	}
+	return true
 }
 
 // Remove removes rowID from key's RowIDs. If RowIDs becomes empty the whole

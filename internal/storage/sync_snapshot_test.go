@@ -105,7 +105,7 @@ func TestTableSnapshotIsImmutableAfterLiveChanges(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			got := imageOf(snapshotToDisk("default", snap, true))
+			got := imageOf(snapshotFileImage("default", snap))
 			if !reflect.DeepEqual(got.rows, want.rows) {
 				t.Fatalf("snapshot rows changed with the live table")
 			}
@@ -147,7 +147,7 @@ func TestSnapshotReleaseKeepsLiveIndexWritesCheap(t *testing.T) {
 	}
 	// The snapshot still sees the list as it was, and releasing it after the
 	// live index took its own copy must not underflow the shared count.
-	if n := len(snapshotToDisk("default", held, true).Indexes["idx_id"].Entries); n != 22 {
+	if n := len(snapshotFileImage("default", held).Indexes["idx_id"].Entries); n != 22 {
 		t.Fatalf("held snapshot index has %d entries, want 22", n)
 	}
 	held.release()
@@ -539,8 +539,7 @@ func TestSnapshotFileMatchesLiveTableImage(t *testing.T) {
 	}
 }
 
-// Rows of tables with a JSON column must be converted exactly as before (the
-// snapshot path may only alias rows that need no conversion).
+// The snapshot file must normalize JSON cells exactly like a direct save.
 func TestSnapshotOfJSONColumnTableMatchesLiveImage(t *testing.T) {
 	live := NewTable("j", []Column{{Name: "id", Type: IntType}, {Name: "doc", Type: JsonType}}, false)
 	live.Rows = [][]any{{1, map[string]any{"a": 1.0}}, {2, `{"b":2}`}, {3, nil}}
@@ -553,10 +552,19 @@ func TestSnapshotOfJSONColumnTableMatchesLiveImage(t *testing.T) {
 	if err := b.SaveTable("default", live); err != nil {
 		t.Fatal(err)
 	}
-	want := readRawDiskTable(t, filepath.Join(dir, "default", "j.tbl"))
+	path := filepath.Join(dir, "default", "j.tbl")
+	want := readRawDiskTable(t, path)
+	live.Version++
 	snap := takeTableSnapshot("default", live, b.beginTableSnapshot("default", "j"))
 	defer snap.release()
-	got := snapshotToDisk("default", snap, true)
+	live.Rows[0] = []any{1, map[string]any{"a": 42.0}}
+	if err := b.saveTableSnapshot(snap); err != nil {
+		t.Fatal(err)
+	}
+	got := readRawDiskTable(t, path)
+	if got.Version != live.Version {
+		t.Fatalf("snapshot version = %d, want %d", got.Version, live.Version)
+	}
 	if !reflect.DeepEqual(got.Rows, want.Rows) {
 		t.Fatalf("JSON rows differ: %#v vs %#v", got.Rows, want.Rows)
 	}

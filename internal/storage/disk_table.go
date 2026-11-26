@@ -43,6 +43,12 @@ func tableToDiskImage(tn string, t *Table, from, to int, includeIndexes, include
 	if to > len(t.Rows) {
 		to = len(t.Rows)
 	}
+	dt := tableToDiskMetadata(tn, t, includeIndexes, includeSearchIndexes)
+	dt.Rows = diskRowsFromTable(dt.Cols, t.Rows[from:to])
+	return dt
+}
+
+func tableToDiskMetadata(tn string, t *Table, includeIndexes, includeSearchIndexes bool) diskTable {
 	var indexes map[string]*SecondaryIndex
 	var ftsIndexes map[string]*FTSIndex
 	var vectorIndexes map[string]*VectorIndex
@@ -61,7 +67,6 @@ func tableToDiskImage(tn string, t *Table, from, to int, includeIndexes, include
 		Version:          t.Version,
 		StructVersion:    t.structVersion,
 		Cols:             make([]diskColumn, len(t.Cols)),
-		Rows:             make([][]any, to-from),
 		Indexes:          indexes,
 		FTSIndexes:       ftsIndexes,
 		VectorIndexes:    vectorIndexes,
@@ -70,10 +75,6 @@ func tableToDiskImage(tn string, t *Table, from, to int, includeIndexes, include
 	for i, c := range t.Cols {
 		dt.Cols[i] = diskColumn(c)
 	}
-	for i := from; i < to; i++ {
-		dt.Rows[i-from] = diskRowFromTable(t, t.Rows[i])
-	}
-
 	return dt
 }
 
@@ -110,22 +111,39 @@ func tableToDiskRows(tn string, t *Table, indexes []int) (diskTable, []int) {
 		dt.Cols[i] = diskColumn(c)
 	}
 	for _, idx := range kept {
-		dt.Rows = append(dt.Rows, diskRowFromTable(t, t.Rows[idx]))
+		dt.Rows = append(dt.Rows, diskRowFromTable(dt.Cols, t.Rows[idx]))
 	}
 	return dt, kept
 }
 
+func hasDiskJSONColumns(cols []diskColumn) bool {
+	for _, c := range cols {
+		if c.Type == JsonType {
+			return true
+		}
+	}
+	return false
+}
+
+func diskRowsFromTable(cols []diskColumn, rows [][]any) [][]any {
+	out := make([][]any, len(rows))
+	for i, row := range rows {
+		out[i] = diskRowFromTable(cols, row)
+	}
+	return out
+}
+
 // diskRowFromTable converts one row to its on-disk representation, applying the
 // same JSON normalization tableToDiskRange does.
-func diskRowFromTable(t *Table, r []any) []any {
+func diskRowFromTable(cols []diskColumn, r []any) []any {
 	row := make([]any, len(r))
 	for j, v := range r {
 		if v == nil {
 			row[j] = nil
 			continue
 		}
-		if j < len(t.Cols) && t.Cols[j].Type == JsonType {
-			if t.Cols[j].StrictJSON {
+		if j < len(cols) && cols[j].Type == JsonType {
+			if cols[j].StrictJSON {
 				b, _ := JSONMarshal(v)
 				row[j] = string(b)
 				continue

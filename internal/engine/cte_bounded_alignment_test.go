@@ -109,3 +109,38 @@ func TestRecursiveCTEBoundedAlignmentKeepsErrors(t *testing.T) {
 		})
 	}
 }
+
+const recursiveCTEDistinctFanout = `
+	WITH RECURSIVE c(n,title) AS (
+		SELECT 0 AS seed, 'root' AS anchor_title
+		UNION
+		SELECT %s AS next_n, %s AS next_title
+		FROM (SELECT n FROM c WHERE n=0) seed
+		JOIN cte_fanout f ON 1=1
+		%s
+	)
+	SELECT q.n, q.title FROM c q ORDER BY q.n`
+
+func TestRecursiveCTEDistinctAlignsOnlyUniqueFrontierRows(t *testing.T) {
+	db := setupBoundedRecursiveCTE(t, 30)
+	const n = "CASE WHEN f.id < 4 THEN 2 WHEN f.id < 8 THEN 1 ELSE 3 END"
+	const title = "CASE WHEN f.id < 4 THEN NULL WHEN f.id < 8 THEN '' ELSE 'last' END"
+	for _, tc := range []struct {
+		tail   string
+		first  int
+		labels []any
+	}{
+		{"", 0, []any{"root", "", nil, "last"}},
+		{"LIMIT 2 OFFSET 1", 1, []any{"", nil}},
+	} {
+		rs := execSQL(t, db, fmt.Sprintf(recursiveCTEDistinctFanout, n, title, tc.tail))
+		if len(rs.Rows) != len(tc.labels) {
+			t.Fatalf("%s: got %v, want %d results", tc.tail, rs.Rows, len(tc.labels))
+		}
+		for i, want := range tc.labels {
+			if got := rs.Rows[i]; expectAsInt(t, got["q.n"]) != tc.first+i || got["q.title"] != want {
+				t.Fatalf("%s: row %d = %v, want %d / %v", tc.tail, i, got, tc.first+i, want)
+			}
+		}
+	}
+}

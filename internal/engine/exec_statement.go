@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -24,6 +25,18 @@ func executeStatementWithColumns(ctx context.Context, db *storage.DB, tenant str
 }
 
 func executeStatementWithColumnsAndProfile(ctx context.Context, db *storage.DB, tenant string, stmt Statement, columns *ColumnarResultSet, profile *queryProfile) (rs *ResultSet, err error) {
+	return executeStatementGuarded(ctx, db, tenant, stmt, columns, profile, nil)
+}
+
+// ExecuteWithReadGuard also holds the database/sql driver's read lock. Flat
+// vector scoring can temporarily release both locks in reverse order.
+func ExecuteWithReadGuard(ctx context.Context, db *storage.DB, tenant string, stmt Statement, guard *sync.RWMutex) (*ResultSet, error) {
+	guard.RLock()
+	defer guard.RUnlock()
+	return executeStatementGuarded(ctx, db, tenant, stmt, nil, nil, guard)
+}
+
+func executeStatementGuarded(ctx context.Context, db *storage.DB, tenant string, stmt Statement, columns *ColumnarResultSet, profile *queryProfile, guard *sync.RWMutex) (rs *ResultSet, err error) {
 	// ExecuteWithProfile starts the root as the collector's first stage.
 	const rootID = 1
 	var notifyTables []storage.TableRef
@@ -165,6 +178,10 @@ func executeStatementWithColumnsAndProfile(ctx context.Context, db *storage.DB, 
 	cache := newSubqueryResultCache()
 	defer releaseSubqueryResultCache(cache)
 	env := ExecEnv{ctx: ctx, tenant: tenant, db: db, statementWAL: statementWAL, now: time.Now(), subqueryCache: cache, dml: plan, procedureOverride: procedure, rollbackArmed: snapshot != nil}
+	if selectStmt, ok := stmt.(*Select); ok && selectStmt.From.TableFunc != nil && profile == nil && !db.IsShadow() && !db.IsRBACEnabled() {
+		env.vectorReadRoot = selectStmt
+		env.vectorReadGuard = guard
+	}
 	if profile != nil {
 		runPhase = profile.start(rootID, "RUN", profile.nodes[rootID-1].detail)
 		if _, isSelect := stmt.(*Select); isSelect {

@@ -29,11 +29,13 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	// gives that same shape the same benefit: skip bindPlaceholders' text
 	// render (which hex-encodes every []byte argument into a SQL literal)
 	// and the full lex/parse pass that would otherwise follow, per call.
-	if pq, _ := execPreparedFor(query); pq != nil && len(args) == pq.inputCount {
-		if exec, err := pq.acquire(); err == nil {
-			defer pq.release(exec)
-			pq.bind(exec, args)
-			return c.execStatement(ctx, exec.statement)
+	if len(args) != 0 {
+		if pq, _ := execPreparedFor(query); pq != nil && len(args) == pq.inputCount {
+			if exec, err := pq.acquire(); err == nil {
+				defer pq.release(exec)
+				pq.bind(exec, args)
+				return c.execStatement(ctx, exec.statement)
+			}
 		}
 	}
 	sqlStr, err := bindPlaceholders(query, args)
@@ -59,9 +61,11 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	// ExecContext call reusing the same text) is simply not reused here;
 	// queryPreparedAdHoc reports ok=false and this falls back to the
 	// existing text path.
-	if pq, _ := execPreparedFor(query); pq != nil && len(args) == pq.inputCount {
-		if rows, ok, err := c.queryPreparedAdHoc(ctx, pq, args); ok {
-			return rows, err
+	if len(args) != 0 {
+		if pq, _ := execPreparedFor(query); pq != nil && len(args) == pq.inputCount {
+			if rows, ok, err := c.queryPreparedAdHoc(ctx, pq, args); ok {
+				return rows, err
+			}
 		}
 	}
 	sqlStr, err := bindPlaceholders(query, args)
@@ -662,9 +666,7 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 		return nil, err
 	}
 	defer c.srv.releaseReader()
-	c.srv.mu.RLock()
-	defer c.srv.mu.RUnlock()
-	_, err := engine.Execute(ctx, c.currentDB(), c.tenant, st)
+	_, err := engine.ExecuteWithReadGuard(ctx, c.currentDB(), c.tenant, st, &c.srv.mu)
 	if err != nil {
 		return nil, err
 	}

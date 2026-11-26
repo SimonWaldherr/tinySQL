@@ -35,6 +35,8 @@ type HybridBackend struct {
 	dirtyLock sync.Mutex
 
 	loadCount atomic.Int64
+	// Concurrent cache misses for one table share a single disk decode.
+	loads sync.Map // hybridLoadKey -> *hybridTableLoad
 
 	// rejectedLogged holds the tenant:name keys already reported by
 	// noteAdmissionReject. A table too big for the budget is refused on
@@ -42,6 +44,14 @@ type HybridBackend struct {
 	// as long as the process runs; the operator needs the fact once, and
 	// BackendStats.AdmissionRejects carries the ongoing count.
 	rejectedLogged sync.Map
+}
+
+type hybridLoadKey struct{ tenant, table string }
+
+type hybridTableLoad struct {
+	done  chan struct{}
+	table *Table
+	err   error
 }
 
 // NewHybridBackend creates a HybridBackend.
@@ -108,7 +118,8 @@ func NewHybridBackend(dir string, maxMemoryBytes int64, compress bool, mode Stor
 
 // ──── StorageBackend interface ────────────────────────────────────────────
 
-// LoadTable tries the in-memory cache first, then loads from disk.
+// LoadTable tries the in-memory cache first, then shares a disk load with
+// simultaneous callers asking for the same table.
 func (h *HybridBackend) LoadTable(tenant, name string) (*Table, error) {
 	lc := strings.ToLower(name)
 	tn := strings.ToLower(tenant)
@@ -118,13 +129,29 @@ func (h *HybridBackend) LoadTable(tenant, name string) (*Table, error) {
 		return t, nil
 	}
 
-	// Load from disk
-	t, err := h.disk.LoadTable(tenant, name)
-	if err != nil {
-		return nil, err
+	key := hybridLoadKey{tenant: tn, table: lc}
+	call := &hybridTableLoad{done: make(chan struct{})}
+	if v, loaded := h.loads.LoadOrStore(key, call); loaded {
+		pending := v.(*hybridTableLoad)
+		<-pending.done
+		return pending.table, pending.err
 	}
-	if t == nil {
-		return nil, nil
+	defer func() {
+		close(call.done)
+		h.loads.Delete(key)
+	}()
+
+	// Another load may have populated the pool between the initial miss and
+	// claiming this load. This recheck does not count as a second lookup.
+	call.table = h.pool.peek(tn, lc)
+	if call.table != nil {
+		return call.table, nil
+	}
+
+	// Load from disk
+	call.table, call.err = h.disk.LoadTable(tenant, name)
+	if call.err != nil || call.table == nil {
+		return call.table, call.err
 	}
 
 	h.loadCount.Add(1)
@@ -133,11 +160,12 @@ func (h *HybridBackend) LoadTable(tenant, name string) (*Table, error) {
 	// is not an error for this caller — the table lease is still valid and
 	// is returned below — but it does mean this load will repeat on every
 	// future access, so it must not vanish silently.
-	if err := h.pool.Put(tn, lc, t); err != nil {
-		h.noteAdmissionReject(tn, lc, EstimateTableSize(t), err)
+	size := EstimateTableSize(call.table)
+	if err := h.pool.putWithSize(tn, lc, call.table, size); err != nil {
+		h.noteAdmissionReject(tn, lc, size, err)
 	}
 
-	return t, nil
+	return call.table, nil
 }
 
 // noteAdmissionReject reports the first time a table could not be admitted

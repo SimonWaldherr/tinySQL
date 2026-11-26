@@ -299,32 +299,19 @@ func (s *Scheduler) runIntervalScheduler(stopCh <-chan struct{}) {
 
 // checkIntervalJobs checks if any INTERVAL or ONCE jobs need to run
 func (s *Scheduler) checkIntervalJobs(now time.Time) {
-	jobs := s.catalog.ListEnabledJobs()
-	for _, job := range jobs {
-		if job.ScheduleType != "INTERVAL" && job.ScheduleType != "ONCE" {
+	for _, job := range s.catalog.dueIntervalJobs(now) {
+		if _, err := s.SubmitJob(job); err != nil {
 			continue
 		}
 
-		if job.NextRunAt == nil {
-			continue
-		}
-
-		if now.After(*job.NextRunAt) || now.Equal(*job.NextRunAt) {
-			if _, err := s.SubmitJob(job); err != nil {
-				continue
-			}
-
-			if job.ScheduleType == "INTERVAL" {
-				s.calculateNextRun(job)
-				s.catalog.setJobNextRun(job.Name, job.NextRunAt)
-			}
-
-			// For ONCE jobs, disable after execution
-			if job.ScheduleType == "ONCE" {
-				job.Enabled = false
-				if err := s.catalog.RegisterJob(job); err != nil {
-					log.Printf("Failed to disable ONCE job %q: %v", job.Name, err)
-				}
+		switch job.ScheduleType {
+		case "INTERVAL":
+			s.calculateNextRun(job)
+			s.catalog.setJobNextRun(job.Name, job.NextRunAt)
+		case "ONCE":
+			job.Enabled = false
+			if err := s.catalog.RegisterJob(job); err != nil {
+				log.Printf("Failed to disable ONCE job %q: %v", job.Name, err)
 			}
 		}
 	}
