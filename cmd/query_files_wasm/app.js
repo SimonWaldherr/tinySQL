@@ -853,6 +853,7 @@ function sqlMayMutate(sql) {
         if (char === ';' && depth === 0) {
             // If a leading WITH cannot be classified, persist conservatively.
             if (first === 'WITH' && !cteCommand) return true;
+            if (first === 'INSERT' || first === 'DISCARD') return true;
             first = ''; cteClosed = false; cteCommand = false; explainPrefix = false;
             continue;
         }
@@ -864,7 +865,11 @@ function sqlMayMutate(sql) {
         if (!first) {
             first = word;
             explainPrefix = first === 'EXPLAIN';
-            if (first !== 'WITH' && !readOnly.has(first)) return true;
+            if (first !== 'WITH' && first !== 'INSERT' && first !== 'DISCARD' && !readOnly.has(first)) return true;
+        } else if (first === 'INSERT' || first === 'DISCARD') {
+            if (word !== (first === 'INSERT' ? 'CACHED' : 'INSERTS')) return true;
+            // These commands only update the in-memory staging table.
+            first = 'STAGING';
         } else if (explainPrefix) {
             explainPrefix = false;
             // ANALYZE executes its wrapped statement. Classify that command
@@ -875,7 +880,7 @@ function sqlMayMutate(sql) {
             if (word === 'SELECT') cteCommand = true;
         }
     }
-    return first === 'WITH' && !cteCommand;
+    return (first === 'WITH' && !cteCommand) || first === 'INSERT' || first === 'DISCARD';
 }
 
 // The legacy path is still the compatible choice for real SQL scripts. A

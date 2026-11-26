@@ -72,6 +72,9 @@ type DB struct {
 	mu      sync.RWMutex
 	tenants map[string]*tenantDB
 	wal     *WALManager
+	// Staging tables are private to the live database. They are never part of
+	// the SQL catalog, transaction shadows or persisted snapshots.
+	stagedInserts map[TableRef]map[string]*Table
 
 	// extensions contains the statically linked Go extensions activated for
 	// this database instance. It deliberately lives outside the persisted

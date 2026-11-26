@@ -242,6 +242,7 @@ func (db *DB) Close() error {
 	db.lastCloseAt = time.Now()
 	if closeErr == nil {
 		db.closed = true
+		db.stagedInserts = nil
 		db.lastError = ""
 	} else {
 		db.lastError = closeErr.Error()

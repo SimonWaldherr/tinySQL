@@ -729,6 +729,10 @@ func ToSQL(stmt engine.Statement) string {
 		return selectToSQL(s)
 	case *engine.Insert:
 		return insertToSQL(s)
+	case *engine.FlushInserts:
+		return "FLUSH INSERTS INTO " + quoteSQLIdentifier(s.Table)
+	case *engine.DiscardInserts:
+		return "DISCARD INSERTS FROM " + quoteSQLIdentifier(s.Table)
 	case *engine.Update:
 		return updateToSQL(s)
 	case *engine.Delete:
@@ -887,7 +891,11 @@ func buildSelectClause(sb *strings.Builder, s *engine.Select) {
 	if s.Distinct {
 		sb.WriteString("DISTINCT ")
 	}
-	for i, proj := range s.Projs {
+	writeProjectionList(sb, s.Projs)
+}
+
+func writeProjectionList(sb *strings.Builder, items []engine.SelectItem) {
+	for i, proj := range items {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
@@ -1006,31 +1014,45 @@ func insertToSQL(i *engine.Insert) string {
 		}
 	}
 	sb.Grow(size)
-	sb.WriteString("INSERT INTO ")
-	sb.WriteString(i.Table)
+	if i.Cached {
+		sb.WriteString("INSERT CACHED INTO ")
+		sb.WriteString(quoteSQLIdentifier(i.Table))
+	} else {
+		sb.WriteString("INSERT INTO ")
+		sb.WriteString(i.Table)
+	}
 	if len(i.Cols) > 0 {
 		sb.WriteString(" (")
 		for n, col := range i.Cols {
 			if n > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(col)
+			if i.Cached {
+				sb.WriteString(quoteSQLIdentifier(col))
+			} else {
+				sb.WriteString(col)
+			}
 		}
 		sb.WriteString(")")
 	}
-	sb.WriteString(" VALUES ")
-	for ri, row := range i.Rows {
-		if ri > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString("(")
-		for ci, val := range row {
-			if ci > 0 {
+	if i.Select != nil {
+		sb.WriteByte(' ')
+		writeSelectSQL(&sb, i.Select)
+	} else {
+		sb.WriteString(" VALUES ")
+		for ri, row := range i.Rows {
+			if ri > 0 {
 				sb.WriteString(", ")
 			}
-			writeExprSQL(&sb, val)
+			sb.WriteString("(")
+			for ci, val := range row {
+				if ci > 0 {
+					sb.WriteString(", ")
+				}
+				writeExprSQL(&sb, val)
+			}
+			sb.WriteString(")")
 		}
-		sb.WriteString(")")
 	}
 	switch {
 	case i.OnConflict != nil:
@@ -1038,7 +1060,15 @@ func insertToSQL(i *engine.Insert) string {
 	case i.OnConflictDoNothing:
 		sb.WriteString(" ON CONFLICT DO NOTHING")
 	}
+	if len(i.Returning) > 0 {
+		sb.WriteString(" RETURNING ")
+		writeProjectionList(&sb, i.Returning)
+	}
 	return sb.String()
+}
+
+func quoteSQLIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // writeOnConflictSQL renders an ON CONFLICT clause in the form the parser

@@ -95,6 +95,9 @@ func requiredPermission(stmt Statement) (perm storage.Permission, schema, table 
 	case *Insert:
 		schema, table = splitObjectName(s.Table)
 		return storage.PermInsert, schema, table, true
+	case *FlushInserts:
+		schema, table = splitObjectName(s.Table)
+		return storage.PermInsert, schema, table, true
 	case *Update:
 		schema, table = splitObjectName(s.Table)
 		return storage.PermUpdate, schema, table, true

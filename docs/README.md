@@ -36,6 +36,7 @@ current behavior and keep performance claims scoped to the workload they measure
   `timeseries` table profiles.
 - [Automatic indexes](automatic-indexes.md) — opt-in observation and index
   creation.
+- [Cached inserts](cached-inserts.md) — stage rows and apply them in one batch.
 - [Delayed inserts](delayed-inserts.md) — durable scheduled INSERT work.
 - [Asynchronous runtime](async-runtime.md) — jobs and the transactional event log.
 - [Reactive SQL queries](subscribe-sql.md) — `SubscribeSQL`, limits, and delivery

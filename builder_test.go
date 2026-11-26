@@ -310,3 +310,23 @@ func TestBuilderInsertToSQLKeepsOnConflictClause(t *testing.T) {
 		}
 	}
 }
+
+func TestCachedInsertToSQLRoundTrip(t *testing.T) {
+	for _, sql := range []string{
+		`INSERT CACHED INTO "Pending ""Batch""" ("item id") VALUES (1), (2)`,
+		`WITH source AS (SELECT 7 AS id) INSERT CACHED INTO pending (id) SELECT id FROM source WHERE id = 7`,
+		`INSERT CACHED INTO pending VALUES (1) RETURNING id`,
+		`FLUSH INSERTS INTO "INTO"`,
+		`DISCARD INSERTS FROM "FROM"`,
+	} {
+		want, err := ParseSQL(sql)
+		if err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		rendered := ToSQL(want)
+		got, err := ParseSQL(rendered)
+		if err != nil || !reflect.DeepEqual(got, want) {
+			t.Errorf("round-trip %q through %q = %#v, %v; want %#v", sql, rendered, got, err, want)
+		}
+	}
+}

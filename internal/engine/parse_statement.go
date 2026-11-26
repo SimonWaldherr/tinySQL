@@ -32,6 +32,14 @@ func (p *Parser) parseStatement() (Statement, error) {
 	}
 	defer p.exitRecursion()
 	if p.cur.Typ == tIdent {
+		if p.contextualWord(p.peek, "INSERTS") {
+			switch {
+			case p.contextualWord(p.cur, "FLUSH"):
+				return p.parseInsertBufferCommand("INTO")
+			case p.contextualWord(p.cur, "DISCARD"):
+				return p.parseInsertBufferCommand("FROM")
+			}
+		}
 		return p.parseBareTableSelect()
 	}
 	if p.cur.Typ != tKeyword {

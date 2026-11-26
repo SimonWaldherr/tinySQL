@@ -10,6 +10,9 @@ import (
 // lock. Nested execution must use this function rather than Execute because
 // sync.RWMutex is not reentrant.
 func execStmt(env ExecEnv, stmt Statement) (*ResultSet, error) {
+	if isCachedInsertCommand(stmt) {
+		return nil, fmt.Errorf("cached insert commands require a top-level statement")
+	}
 	if env.db.IsReadOnly() {
 		if err := rejectIfMutating(stmt); err != nil {
 			return nil, err

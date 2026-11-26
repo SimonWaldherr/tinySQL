@@ -546,9 +546,8 @@ func normalizeTransactionSQL(sqlStr string) string {
 	return strings.Join(strings.Fields(strings.ToUpper(s)), " ")
 }
 
-// affectedRows extracts the affected-row count from an UPDATE/DELETE result.
-// The engine returns a single {countCell: n} row for the plain form; a
-// RETURNING clause instead projects one row per affected row.
+// affectedRows extracts the count from a command's single {countCell: n}
+// result row. RETURNING instead projects one result row per affected row.
 func affectedRows(rs *engine.ResultSet, countCell string) int64 {
 	if rs == nil {
 		return 0
@@ -579,10 +578,22 @@ func isWriteStatement(st engine.Statement) bool {
 // RETURNING so those rows do not accidentally run under a reader lock or skip
 // the durability acknowledgement that ExecContext provides.
 func (c *conn) executeWriteStatement(ctx context.Context, st engine.Statement) (*engine.ResultSet, error) {
-	// This connection has now attempted a write; Close() must persist,
-	// mirroring the persist() call that follows a successful write below
-	// (directly here for autocommit, via commitTx for a transaction).
-	c.wrote = true
+	var cacheOnly, cachedCommand bool
+	switch s := st.(type) {
+	case *engine.Insert:
+		cacheOnly, cachedCommand = s.Cached, s.Cached
+	case *engine.DiscardInserts:
+		cacheOnly, cachedCommand = true, true
+	case *engine.FlushInserts:
+		cachedCommand = true
+	}
+	if c.inTx && cachedCommand {
+		return nil, fmt.Errorf("tinysql: cached insert commands require autocommit")
+	}
+	if !cacheOnly {
+		// Close also persists after an attempted storage write.
+		c.wrote = true
+	}
 	if c.srv.db.IsReadOnly() || (c.inTx && c.txReadOnly) {
 		return nil, fmt.Errorf("tinysql: write attempted in read-only transaction")
 	}
@@ -620,6 +631,9 @@ func (c *conn) executeWriteStatement(ctx context.Context, st engine.Statement) (
 	if err != nil {
 		return nil, err
 	}
+	if cacheOnly {
+		return rs, nil
+	}
 	// Fail the statement if it could not be made durable, rather than
 	// acknowledging a write that a restart will not find.
 	if err := c.srv.persist(); err != nil {
@@ -646,13 +660,18 @@ func (c *conn) execStatement(ctx context.Context, st engine.Statement) (driver.R
 		if err != nil {
 			return nil, err
 		}
-		// Report affected rows for UPDATE/DELETE. The engine returns a single
-		// {updated|deleted: n} cell for the plain form; a RETURNING clause
-		// projects one row per affected row. INSERT's AST retains its VALUES
-		// rows, which is the database/sql-visible inserted count.
+		// An ordinary INSERT keeps its existing count from the VALUES list.
+		// Cached commands report their actual staged, flushed, or discarded rows.
 		switch s := st.(type) {
 		case *engine.Insert:
+			if s.Cached {
+				return driver.RowsAffected(affectedRows(rs, "cached")), nil
+			}
 			return driver.RowsAffected(int64(len(s.Rows))), nil
+		case *engine.FlushInserts:
+			return driver.RowsAffected(affectedRows(rs, "inserted")), nil
+		case *engine.DiscardInserts:
+			return driver.RowsAffected(affectedRows(rs, "discarded")), nil
 		case *engine.Update:
 			return driver.RowsAffected(affectedRows(rs, "updated")), nil
 		case *engine.Delete:

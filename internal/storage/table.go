@@ -16,6 +16,9 @@ import (
 type Table struct {
 	Name string
 	Cols []Column
+	// Copies of one logical table retain its incarnation. A new table may
+	// have the same name and Version as one dropped in the same transaction.
+	incarnation uint64
 	// Rows holds the table's rows. A stored row slice is immutable: a writer
 	// that changes a row builds a new slice and replaces the slot
 	// (Rows[i] = next), it never assigns into an existing row's cells, and it
@@ -557,13 +560,19 @@ func CloneCheckConstraints(src []CheckConstraint) []CheckConstraint {
 	return out
 }
 
+var tableIncarnations atomic.Uint64
+
 // NewTable creates a new Table with case-insensitive column lookup indices.
 func NewTable(name string, cols []Column, isTemp bool) *Table {
+	return newTable(name, cols, isTemp, tableIncarnations.Add(1))
+}
+
+func newTable(name string, cols []Column, isTemp bool, incarnation uint64) *Table {
 	pos := make(map[string]int, len(cols))
 	for i, c := range cols {
 		pos[strings.ToLower(c.Name)] = i
 	}
-	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, dirtyFrom: -1, Indexes: make(map[string]*SecondaryIndex), FTSIndexes: make(map[string]*FTSIndex), VectorIndexes: make(map[string]*VectorIndex)}
+	return &Table{Name: name, Cols: cols, colPos: pos, IsTemp: isTemp, incarnation: incarnation, dirtyFrom: -1, Indexes: make(map[string]*SecondaryIndex), FTSIndexes: make(map[string]*FTSIndex), VectorIndexes: make(map[string]*VectorIndex)}
 }
 
 // Analyze computes exact cardinality, null and simple range summaries for the

@@ -21,6 +21,7 @@ test('read-only queries and quoted text do not cause unnecessary snapshots', () 
         '/* INSERT */ SELECT 1 -- DELETE\n', 'EXPLAIN INSERT INTO t VALUES (1)',
         'EXPLAIN ANALYZE SELECT 1', 'EXPLAIN SELECT analyze FROM t',
         'EXPLAIN ANALYZE WITH src AS (SELECT 1) SELECT * FROM src',
+        `INSERT /* buffer */ CACHED INTO t VALUES (1); DISCARD INSERTS FROM t`,
     ]) assert.equal(sandbox.classify(sql), false, sql);
 });
 
@@ -40,5 +41,7 @@ test('mutations and uncertain WITH forms schedule snapshots', () => {
         'EXPLAIN ANALYZE DELETE FROM t',
         'EXPLAIN ANALYZE WITH src AS (SELECT 1) INSERT INTO t SELECT * FROM src',
         'EXPLAIN ANALYZE EXPLAIN ANALYZE DELETE FROM t',
+        'INSERT CACHED INTO t VALUES (1); FLUSH INSERTS INTO t',
+        'DISCARD INSERTS t; INSERT INTO t VALUES (1)',
     ]) assert.equal(sandbox.classify(sql), true, sql);
 });

@@ -40,9 +40,16 @@ func executeStatementGuarded(ctx context.Context, db *storage.DB, tenant string,
 	// ExecuteWithProfile starts the root as the collector's first stage.
 	const rootID = 1
 	var notifyTables []storage.TableRef
+	auditStmt := stmt
+	var flush *FlushInserts
+	var stage *storage.Table
+	var stageOwner string
 	if err := checkPermission(ctx, db, stmt); err != nil {
 		recordAudit(ctx, db, tenant, stmt, err)
 		return nil, err
+	}
+	if explain, ok := stmt.(*Explain); ok && explain.Analyze && isCachedInsertCommand(explain.Statement) {
+		return nil, fmt.Errorf("cached insert commands are not supported by EXPLAIN ANALYZE")
 	}
 
 	// A CALL's procedure is resolved once here rather than separately by
@@ -82,6 +89,30 @@ func executeStatementGuarded(ctx context.Context, db *storage.DB, tenant string,
 			lockPhase.finish(0)
 			preparePhase = profile.start(rootID, "PREPARE", "write plan and rollback state")
 		}
+		if isCachedInsertCommand(stmt) {
+			// Private staging tables never appear in transaction shadows.
+			notifyTables = []storage.TableRef{}
+			if _, ambient := db.AmbientWALTx(); db.IsShadow() || ambient {
+				return nil, fmt.Errorf("cached insert commands require autocommit")
+			}
+			flush, _ = stmt.(*FlushInserts)
+			if flush == nil {
+				if preparePhase != nil {
+					preparePhase.finish(0)
+				}
+				return executeInsertBufferOnly(ctx, db, tenant, stmt)
+			}
+			if db.IsReadOnly() {
+				return nil, rejectIfMutating(stmt)
+			}
+			stageOwner = insertCacheOwner(ctx)
+			stage = db.StagedInsertTable(tenant, flush.Table, stageOwner)
+			if stage == nil {
+				return insertCacheCount("inserted", 0), nil
+			}
+			stmt = &Insert{Table: flush.Table, stagedRows: stage.Rows}
+			notifyTables = nil
+		}
 		// A direct ResultStream pins only its source table, not contentMu for
 		// the lifetime of a slow client. Detach a pinned target before WAL/DML
 		// planning records table pointers so this statement mutates a private
@@ -103,6 +134,20 @@ func executeStatementGuarded(ctx context.Context, db *storage.DB, tenant string,
 	if !readOnly {
 		plan = newDMLPlan(&planStorage, db, tenant, stmt)
 	}
+	if flush != nil {
+		target := planTable(plan)
+		if target == nil {
+			return nil, fmt.Errorf("cannot flush cached inserts: no target table %q", flush.Table)
+		}
+		if storage.ResidentTable(db, tenant, flush.Table) != target {
+			// An evictable backend can return an untracked read lease after
+			// rejecting admission. Sync would not see mutations to that lease.
+			return nil, fmt.Errorf("cannot flush cached inserts: %q did not fit in the table cache", flush.Table)
+		}
+		if err := checkInsertStageSchema(target, stage); err != nil {
+			return nil, err
+		}
+	}
 
 	var snapshot *storage.StatementSnapshot
 	switch {
@@ -112,8 +157,8 @@ func executeStatementGuarded(ctx context.Context, db *storage.DB, tenant string,
 			snapshot, snapshotErr = db.SnapshotForRowUpdateStatement(tenant, table, rowIDs)
 		} else if table, rowIDs, ok := rowDeleteSnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForRowDeleteStatement(tenant, table, rowIDs)
-		} else if table, ok := appendOnlySnapshotTarget(plan); ok {
-			snapshot, snapshotErr = db.SnapshotForAppendOnlyTableStatement(tenant, table)
+		} else if canSnapshotAppendOnly(plan) {
+			snapshot = db.SnapshotForAppendOnlyTableStatement(tenant, plan.table)
 		} else if table, ok := rowsOnlySnapshotTarget(plan); ok {
 			snapshot, snapshotErr = db.SnapshotForRowsOnlyStatement(tenant, table)
 		} else if table, ok := tableScopedSnapshotTarget(plan); ok {
@@ -125,7 +170,7 @@ func executeStatementGuarded(ctx context.Context, db *storage.DB, tenant string,
 			if preparePhase != nil {
 				preparePhase.finish(0)
 			}
-			recordAudit(ctx, db, tenant, stmt, snapshotErr)
+			recordAudit(ctx, db, tenant, auditStmt, snapshotErr)
 			return nil, snapshotErr
 		}
 	case walBefore != nil:
@@ -151,7 +196,7 @@ func executeStatementGuarded(ctx context.Context, db *storage.DB, tenant string,
 	// statement's pre-image instead. See storage.ReleaseStatementSnapshot.
 	statementWAL := newStatementWAL(db)
 	defer db.ReleaseStatementSnapshot(snapshot)
-	defer func() { recordAudit(ctx, db, tenant, stmt, err) }()
+	defer func() { recordAudit(ctx, db, tenant, auditStmt, err) }()
 	defer func() {
 		if err == nil || snapshot == nil {
 			return
@@ -211,6 +256,10 @@ func executeStatementGuarded(ctx context.Context, db *storage.DB, tenant string,
 	}
 	if err == nil {
 		err = maybeLogToWALManager(db, walBefore)
+	}
+	if err == nil && flush != nil {
+		db.DiscardStagedInserts(tenant, flush.Table, stageOwner)
+		rs = insertCacheCount("inserted", len(stage.Rows))
 	}
 	// The driver opens an ambient AdvancedWAL transaction before every write in
 	// an explicit SQL transaction. That makes statementWAL.started true even
@@ -482,7 +531,7 @@ func newDMLPlan(out *dmlPlan, db *storage.DB, tenant string, stmt Statement) *dm
 	return plan
 }
 
-// appendOnlySnapshotTarget identifies the narrow INSERT fast path whose
+// canSnapshotAppendOnly identifies the narrow INSERT fast path whose
 // failed execution can be rolled back by truncating appended rows and, when
 // the table carries secondary indexes, removing exactly those rows' entries
 // from each one (see restoreAppendOnlyTable). A table with any OTHER
@@ -501,21 +550,12 @@ func newDMLPlan(out *dmlPlan, db *storage.DB, tenant string, stmt Statement) *dm
 // too, so that cost is gone on the (overwhelmingly common) successful path;
 // only an actual rollback pays a now much smaller O(rows this statement
 // appended) price instead of the old O(table size) one.
-func appendOnlySnapshotTarget(plan *dmlPlan) (string, bool) {
-	if plan == nil {
-		return "", false
+func canSnapshotAppendOnly(plan *dmlPlan) bool {
+	if plan == nil || plan.table == nil || plan.hasTriggers() {
+		return false
 	}
 	s, ok := plan.stmt.(*Insert)
-	if !ok || plan.hasTriggers() {
-		return "", false
-	}
-	if s.OnConflict != nil && !s.OnConflict.DoNothing {
-		return "", false
-	}
-	if plan.table == nil {
-		return "", false
-	}
-	return s.Table, true
+	return ok && (s.OnConflict == nil || s.OnConflict.DoNothing)
 }
 
 // rowUpdateSnapshotTarget identifies an UPDATE whose index candidate set

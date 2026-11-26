@@ -191,12 +191,12 @@ func (w *WALManager) LogTransaction(changes []WALChange) (bool, error) {
 			dirty := ch.Table.DirtyFrom()
 			updated, exact := ch.Table.DirtyRows()
 			switch {
-			case dirty >= 0 && dirty < len(ch.Table.Rows):
+			case !ch.recreated && dirty >= 0 && dirty < len(ch.Table.Rows):
 				// Append-only change: write only the new rows.
 				dt := tableToDiskRange(ch.Tenant, ch.Table, dirty, len(ch.Table.Rows))
 				rec.Type = walRecordAppendRows
 				rec.Table = &dt
-			case exact && len(updated) < len(ch.Table.Rows):
+			case !ch.recreated && exact && len(updated) < len(ch.Table.Rows):
 				// In-place UPDATE: write only the rows that changed. Without
 				// this an UPDATE of one row in a large table serialized and
 				// fsynced every row in it.

@@ -11,7 +11,7 @@
 // going through engine.Execute's SQL INSERT path: any statement that
 // mutates a table with a secondary index takes the general
 // SnapshotForTableStatement rollback path (see
-// internal/engine/exec_statement.go's appendOnlySnapshotTarget /
+// internal/engine/exec_statement.go's canSnapshotAppendOnly /
 // tableScopedSnapshotTarget choice), which clones every index on the table
 // once per statement (cloneSecondaryIndexes) for MVCC rollback -- an O(n)
 // cost by design, present identically before and after this fix (the old

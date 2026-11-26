@@ -114,7 +114,7 @@ func TestSecondaryIndexUniqueInvalidationAndSnapshotPersistence(t *testing.T) {
 }
 
 // TestAppendOnlyRollbackRemovesIndexEntriesOnUniqueViolation guards
-// appendOnlySnapshotTarget/restoreAppendOnlyTable (exec_statement.go /
+// canSnapshotAppendOnly/restoreAppendOnlyTable (exec_statement.go /
 // statement_snapshot.go) now allowing the cheap append-only rollback path for
 // a table with secondary indexes, not just an index-free one: a multi-row
 // INSERT that fails partway through — here, a later row's key colliding with

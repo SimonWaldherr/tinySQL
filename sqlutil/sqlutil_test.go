@@ -79,6 +79,20 @@ func TestAnalyzeRejectsMultipleStatements(t *testing.T) {
 	}
 }
 
+func TestAnalyzeCachedInsertCommands(t *testing.T) {
+	for query, kind := range map[string]StatementKind{
+		"INSERT CACHED INTO users VALUES (1)": KindInsert,
+		"FLUSH INSERTS INTO users":            KindFlushInserts,
+		"DISCARD INSERTS FROM users":          KindDiscardInserts,
+	} {
+		got, err := Analyze(query)
+		want := Analysis{Kind: kind, ObjectName: "users", Mutation: true}
+		if err != nil || got != want {
+			t.Errorf("Analyze(%q) = %#v, %v, want %#v", query, got, err, want)
+		}
+	}
+}
+
 func TestAnalysisHelpersCoverMutationsAndUnknownStatements(t *testing.T) {
 	for _, tc := range []struct {
 		stmt engine.Statement

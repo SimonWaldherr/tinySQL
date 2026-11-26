@@ -514,6 +514,9 @@ func returnsRows(query string) bool {
 	switch word {
 	case "INSERT", "UPDATE", "DELETE", "REPLACE", "UPSERT":
 		return containsWord(rest, "RETURNING")
+	case "FLUSH", "DISCARD":
+		next, _ := firstWord(rest)
+		return next != "INSERTS"
 	case "CREATE", "DROP", "ALTER", "BEGIN", "COMMIT", "ROLLBACK", "END", "START",
 		"SAVEPOINT", "RELEASE", "REFRESH", "GRANT", "REVOKE", "TRUNCATE", "SET":
 		return false

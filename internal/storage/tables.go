@@ -217,6 +217,7 @@ func (db *DB) Replace(tn string, t *Table) error {
 			return fmt.Errorf("backend save %s/%s: %w", tn, t.Name, err)
 		}
 	}
+	db.discardAllStagedInserts(tn, t.Name)
 	return nil
 }
 
@@ -272,6 +273,7 @@ func (db *DB) Drop(tn, name string) error {
 	if err := db.dropFromBackend(tn, name, onDisk); err != nil {
 		return fmt.Errorf("backend delete %s/%s: %w", tn, name, err)
 	}
+	db.discardAllStagedInserts(tn, name)
 	return nil
 }
 

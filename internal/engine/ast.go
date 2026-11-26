@@ -316,9 +316,21 @@ type Insert struct {
 	Cols                []string
 	Rows                [][]Expr
 	Select              *Select // INSERT INTO ... SELECT ...
+	Cached              bool    // INSERT CACHED queues rows for an explicit flush.
 	OnConflictDoNothing bool
 	OnConflict          *OnConflictClause
 	Returning           []SelectItem
+	stagedRows          [][]any // typed rows supplied by FLUSH INSERTS
+}
+
+// FlushInserts represents FLUSH INSERTS [INTO] table.
+type FlushInserts struct {
+	Table string
+}
+
+// DiscardInserts represents DISCARD INSERTS [FROM] table.
+type DiscardInserts struct {
+	Table string
 }
 
 // Update represents an UPDATE statement.

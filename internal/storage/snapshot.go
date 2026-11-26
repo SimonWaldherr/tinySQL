@@ -102,7 +102,7 @@ func (db *DB) SnapshotForTx() (base *DB, shadow *DB) {
 // mutated, and any schema change bumps Version, so a stale shared header
 // cannot hide a change.
 func cloneTableMeta(t *Table) *Table {
-	nt := NewTable(t.Name, t.Cols, t.IsTemp)
+	nt := newTable(t.Name, t.Cols, t.IsTemp, t.incarnation)
 	nt.CheckConstraints = CloneCheckConstraints(t.CheckConstraints)
 	nt.Version = t.Version
 	nt.structVersion = t.structVersion
@@ -187,7 +187,7 @@ func cloneTableWithRows(t *Table, rows [][]any, copySearchIndexes bool) *Table {
 func cloneTableCore(t *Table, rows [][]any, copySearchIndexes, borrow bool) *Table {
 	cols := make([]Column, len(t.Cols))
 	copy(cols, t.Cols)
-	nt := NewTable(t.Name, cols, t.IsTemp)
+	nt := newTable(t.Name, cols, t.IsTemp, t.incarnation)
 	nt.CheckConstraints = CloneCheckConstraints(t.CheckConstraints)
 	nt.Version = t.Version
 	nt.structVersion = t.structVersion

@@ -66,10 +66,14 @@ func explainStatement(env ExecEnv, rows *[]Row, stmt Statement) {
 	case *Select:
 		explainSelect(env, rows, q, "")
 	case *Insert:
-		addExplainStep(rows, "INSERT", q.Table)
+		addExplainStep(rows, statementName(q), q.Table)
 		if len(q.Returning) > 0 {
 			addExplainStep(rows, "RETURNING", fmt.Sprintf("%d projection(s)", len(q.Returning)))
 		}
+	case *FlushInserts:
+		addExplainStep(rows, "FLUSH INSERTS", q.Table)
+	case *DiscardInserts:
+		addExplainStep(rows, "DISCARD INSERTS", q.Table)
 	case *Update:
 		addExplainStep(rows, "UPDATE", q.Table)
 		addExplainStep(rows, "SET", fmt.Sprintf("%d column(s)", len(q.Sets)))
@@ -244,11 +248,18 @@ func addExplainStep(rows *[]Row, op, detail string) {
 }
 
 func statementName(stmt Statement) string {
-	switch stmt.(type) {
+	switch s := stmt.(type) {
 	case *Select:
 		return "SELECT"
 	case *Insert:
+		if s.Cached {
+			return "INSERT CACHED"
+		}
 		return "INSERT"
+	case *FlushInserts:
+		return "FLUSH INSERTS"
+	case *DiscardInserts:
+		return "DISCARD INSERTS"
 	case *Update:
 		return "UPDATE"
 	case *Delete:

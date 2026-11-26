@@ -45,10 +45,11 @@ type walOperation struct {
 
 // WALChange describes a persistent change that will be written to the WAL.
 type WALChange struct {
-	Tenant string
-	Name   string
-	Table  *Table
-	Drop   bool
+	Tenant    string
+	Name      string
+	Table     *Table
+	Drop      bool
+	recreated bool
 }
 
 // CollectWALChanges computes the delta between two MVCC snapshots.
@@ -74,8 +75,9 @@ func CollectWALChanges(prev, next *DB) []WALChange {
 			if next.isTxShared(nt) {
 				continue
 			}
-			if pv == nil || pv.Version != nt.Version {
-				changes = append(changes, WALChange{Tenant: tn, Name: nt.Name, Table: nt})
+			recreated := pv != nil && pv.incarnation != 0 && nt.incarnation != 0 && pv.incarnation != nt.incarnation
+			if pv == nil || pv.Version != nt.Version || recreated {
+				changes = append(changes, WALChange{Tenant: tn, Name: nt.Name, Table: nt, recreated: recreated})
 			}
 		}
 	}
@@ -117,6 +119,7 @@ func (db *DB) ApplyWALChanges(changes []WALChange) error {
 					return fmt.Errorf("backend delete %s/%s: %w", ch.Tenant, ch.Name, err)
 				}
 			}
+			db.discardAllStagedInserts(ch.Tenant, ch.Name)
 			continue
 		}
 		if ch.Table == nil {
@@ -127,6 +130,9 @@ func (db *DB) ApplyWALChanges(changes []WALChange) error {
 		key := strings.ToLower(ch.Name)
 		replaced := tables[key]
 		tables[key] = ch.Table
+		if ch.recreated {
+			delete(db.stagedInserts, stagedInsertKey(ch.Tenant, ch.Name))
+		}
 		db.adoptTwins(replaced, ch.Table)
 		db.mu.Unlock()
 	}

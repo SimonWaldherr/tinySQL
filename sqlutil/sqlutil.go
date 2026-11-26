@@ -19,6 +19,8 @@ const (
 	KindAnalyze                StatementKind = "analyze"
 	KindPragma                 StatementKind = "pragma"
 	KindInsert                 StatementKind = "insert"
+	KindFlushInserts           StatementKind = "flush_inserts"
+	KindDiscardInserts         StatementKind = "discard_inserts"
 	KindUpdate                 StatementKind = "update"
 	KindDelete                 StatementKind = "delete"
 	KindCreateTable            StatementKind = "create_table"
@@ -76,6 +78,10 @@ func AnalyzeStatement(stmt engine.Statement) Analysis {
 		return Analysis{Kind: KindPragma, ReadOnly: true, ResultProducing: true}
 	case *engine.Insert:
 		return Analysis{Kind: KindInsert, ObjectName: s.Table, Mutation: true, ResultProducing: len(s.Returning) > 0}
+	case *engine.FlushInserts:
+		return Analysis{Kind: KindFlushInserts, ObjectName: s.Table, Mutation: true}
+	case *engine.DiscardInserts:
+		return Analysis{Kind: KindDiscardInserts, ObjectName: s.Table, Mutation: true}
 	case *engine.Update:
 		return Analysis{Kind: KindUpdate, ObjectName: s.Table, Mutation: true, ResultProducing: len(s.Returning) > 0}
 	case *engine.Delete:

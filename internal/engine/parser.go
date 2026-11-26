@@ -91,6 +91,12 @@ func (p *Parser) expectKeyword(kw string) error {
 	return p.errf("expected keyword %q", kw)
 }
 
+// contextualWord matches an unquoted word kept out of the lexer keyword list
+// so it remains usable as an identifier or alias elsewhere.
+func (p *Parser) contextualWord(tok token, word string) bool {
+	return tok.Typ == tIdent && strings.EqualFold(tok.Val, word) && p.lx.s[tok.Pos] != '"'
+}
+
 func (p *Parser) errf(format string, a ...any) error {
 	return fmt.Errorf("parse error near %q: %s", p.cur.Val, fmt.Sprintf(format, a...))
 }

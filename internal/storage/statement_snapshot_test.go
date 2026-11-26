@@ -50,11 +50,7 @@ func TestAppendOnlyStatementSnapshotTruncatesRowsAndRestoresMetadata(t *testing.
 	}
 
 	db.LockContentForWrite()
-	snapshot, err := db.SnapshotForAppendOnlyTableStatement("default", "items")
-	if err != nil {
-		db.UnlockContentForWrite()
-		t.Fatal(err)
-	}
+	snapshot := db.SnapshotForAppendOnlyTableStatement("default", table)
 	table.Rows = append(table.Rows, []any{2})
 	table.Version++
 	table.dirtyFrom = 0
@@ -205,9 +201,6 @@ func TestTableScopedSnapshotsRejectMissingTable(t *testing.T) {
 	defer db.UnlockContentForWrite()
 	if _, err := db.SnapshotForTableStatement("default", "missing"); err == nil {
 		t.Fatal("table-scoped snapshot of missing table succeeded")
-	}
-	if _, err := db.SnapshotForAppendOnlyTableStatement("default", "missing"); err == nil {
-		t.Fatal("append-only snapshot of missing table succeeded")
 	}
 	if _, err := db.SnapshotForRowUpdateStatement("default", "missing", []int{0}); err == nil {
 		t.Fatal("row-update snapshot of missing table succeeded")

@@ -140,6 +140,7 @@ func versionStub(t *Table) *Table {
 	return &Table{
 		Name:          t.Name,
 		Cols:          t.Cols,
+		incarnation:   t.incarnation,
 		IsTemp:        t.IsTemp,
 		Version:       t.Version,
 		structVersion: t.structVersion,

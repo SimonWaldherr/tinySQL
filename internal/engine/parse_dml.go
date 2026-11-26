@@ -4,6 +4,10 @@ package engine
 //nolint:gocyclo // INSERT parsing covers column lists and multi-row value sets.
 func (p *Parser) parseInsert() (Statement, error) {
 	p.next()
+	cached := p.contextualWord(p.cur, "CACHED")
+	if cached {
+		p.next()
+	}
 	if err := p.expectKeyword("INTO"); err != nil {
 		return nil, err
 	}
@@ -56,7 +60,23 @@ func (p *Parser) parseInsert() (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Insert{Table: tname, Cols: cols, Rows: rows, Select: selectSource, OnConflictDoNothing: onConflictDoNothing, OnConflict: onConflict, Returning: returning}, nil
+	return &Insert{Table: tname, Cols: cols, Rows: rows, Select: selectSource, Cached: cached, OnConflictDoNothing: onConflictDoNothing, OnConflict: onConflict, Returning: returning}, nil
+}
+
+func (p *Parser) parseInsertBufferCommand(preposition string) (Statement, error) {
+	p.next() // FLUSH or DISCARD
+	p.next() // INSERTS
+	if p.cur.Typ == tKeyword && p.cur.Val == preposition {
+		p.next()
+	}
+	table := p.parseIdentLike()
+	if table == "" {
+		return nil, p.errf("expected table name")
+	}
+	if preposition == "INTO" {
+		return &FlushInserts{Table: table}, nil
+	}
+	return &DiscardInserts{Table: table}, nil
 }
 
 func (p *Parser) parseInsertOnConflict() (bool, *OnConflictClause, error) {

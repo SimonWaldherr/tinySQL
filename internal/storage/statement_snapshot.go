@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"unsafe"
@@ -17,6 +18,9 @@ import (
 // DB.Get from observing a failed statement's half-applied row changes.
 type StatementSnapshot struct {
 	tables map[string]map[string]tableState
+	// Nested DDL may remove buffers. Cached writes themselves are top-level,
+	// so the owner maps and their staged rows need no copying.
+	stagedInserts map[TableRef]map[string]*Table
 	// tenant is the tenant a compact (single-table) snapshot belongs to; the
 	// map-shaped forms carry it as their key instead. See RestoredTables.
 	tenant  string
@@ -205,6 +209,7 @@ func captureDirtyRows(t *Table) []int { return t.dirtyRows }
 type appendOnlyTableState struct {
 	table          *Table
 	rowCount       int
+	emptyRows      [][]any // releases an adopted staging array on rollback
 	version        int
 	stats          *TableStats
 	dirtyFrom      int
@@ -276,6 +281,7 @@ func (db *DB) SnapshotForStatement() *StatementSnapshot {
 		full:    true,
 	}
 	db.mu.RLock()
+	snapshot.stagedInserts = maps.Clone(db.stagedInserts)
 	for tenant, tenantDB := range db.tenants {
 		tables := make(map[string]tableState, len(tenantDB.tables))
 		for name, table := range tenantDB.tables {
@@ -378,19 +384,13 @@ func (db *DB) SnapshotForRowsOnlyStatement(tenant, name string) (*StatementSnaps
 
 // SnapshotForAppendOnlyTableStatement captures the lightweight rollback state
 // for a statement that can only append rows to one table. It is intended for
-// the executor's triggerless INSERT fast path (see appendOnlySnapshotTarget in
+// the executor's triggerless INSERT fast path (see canSnapshotAppendOnly in
 // package engine) and works whether or not the table carries secondary
 // indexes -- restoreAppendOnlyTable removes an appended row's index entries
 // before truncating it away. Other callers must use SnapshotForTableStatement
-// or SnapshotForStatement.
-func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*StatementSnapshot, error) {
-	if db == nil {
-		return nil, nil
-	}
-	table, err := db.Get(tenant, name)
-	if err != nil {
-		return nil, err
-	}
+// or SnapshotForStatement. The table is the one resolved and held by the
+// write plan, which may be the only reference after a rejected cache admission.
+func (db *DB) SnapshotForAppendOnlyTableStatement(tenant string, table *Table) *StatementSnapshot {
 	snap := &StatementSnapshot{
 		tenant: tenant,
 		appendOnlyState: appendOnlyTableState{
@@ -404,8 +404,11 @@ func (db *DB) SnapshotForAppendOnlyTableStatement(tenant, name string) (*Stateme
 		},
 		catalog: armCatalogRollback(db.Catalog()),
 	}
+	if len(table.Rows) == 0 {
+		snap.appendOnlyState.emptyRows = table.Rows
+	}
 	snap.appendOnly = &snap.appendOnlyState
-	return snap, nil
+	return snap
 }
 
 // SnapshotForRowUpdateStatement captures a lightweight rollback point for an
@@ -569,6 +572,7 @@ func (db *DB) RestoreStatementSnapshot(snapshot *StatementSnapshot) {
 			restored[tenant] = tenantDB
 		}
 		db.tenants = restored
+		db.stagedInserts = snapshot.stagedInserts
 	} else {
 		for tenant, tables := range snapshot.tables {
 			tenantDB := db.getTenant(tenant)
@@ -618,7 +622,11 @@ func restoreAppendOnlyTable(state *appendOnlyTableState) {
 	table := state.table
 	removeAppendedIndexEntries(table, state.rowCount)
 	table.dropDerivedExclusive()
-	table.Rows = table.Rows[:state.rowCount:state.rowCount]
+	if state.rowCount == 0 {
+		table.Rows = state.emptyRows[:0:0]
+	} else {
+		table.Rows = table.Rows[:state.rowCount:state.rowCount]
+	}
 	table.Version = state.version
 	table.Stats = cloneTableStats(state.stats)
 	table.dirtyFrom = state.dirtyFrom
@@ -636,7 +644,7 @@ func restoreAppendOnlyTable(state *appendOnlyTableState) {
 // commonly a later row violating a UNIQUE secondary index against an earlier
 // row in the same statement — which the ordinary successful commit never
 // reaches. It costs O(rows this statement appended × indexes), not O(table
-// size): appendOnlySnapshotTarget (package engine) now allows this fast path
+// size): canSnapshotAppendOnly (package engine) now allows this fast path
 // for any triggerless INSERT regardless of secondary indexes specifically
 // because this makes that trade safe, in exchange for the previous
 // alternative of a full cloneTable/cloneRows copy on every single INSERT

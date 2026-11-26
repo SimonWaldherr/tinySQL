@@ -53,9 +53,30 @@ func TestRunDetectsRowProducingStatements(t *testing.T) {
 		"PRAGMA table_info(t)": true, "EXPLAIN SELECT 1": true,
 		"delete from t returning *": true, "DELETE FROM t -- returning": false,
 		"BEGIN": false, "commit": false, "CREATE TABLE x (id INT)": false, "insert into t values (1, 'x')": false,
+		"flush": true, "discard": true, "FLUSH /* staged */ INSERTS INTO t": false, "DISCARD INSERTS FROM t": false,
 	} {
 		if got := returnsRows(query); got != want {
 			t.Errorf("returnsRows(%q) = %v, want %v", query, got, want)
+		}
+	}
+}
+
+func TestCachedInsertsAutoModeReportsAffectedRows(t *testing.T) {
+	id := testDatabase(t)
+	for _, step := range []struct {
+		query string
+		count int64
+	}{
+		{"CREATE TABLE t (id INT)", 0},
+		{"INSERT CACHED INTO t VALUES (1), (2)", 2},
+		{"FLUSH INSERTS INTO t", 2},
+		{"INSERT CACHED INTO t VALUES (3)", 1},
+		{"DISCARD INSERTS FROM t", 1},
+		{"FLUSH INSERTS INTO t", 0},
+	} {
+		got, err := runSQL(id, step.query, "", modeAuto)
+		if err != nil || got.RowsAffected != step.count || got.Columns != nil {
+			t.Fatalf("%s = %#v, %v, want %d affected rows", step.query, got, err, step.count)
 		}
 	}
 }

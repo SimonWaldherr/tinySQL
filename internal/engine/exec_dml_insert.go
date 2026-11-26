@@ -17,7 +17,7 @@ import (
 )
 
 func executeInsert(env ExecEnv, s *Insert) (*ResultSet, error) {
-	rows := insertRowSource{values: s.Rows}
+	rows := insertRowSource{values: s.Rows, staged: s.stagedRows}
 	if s.Select != nil {
 		var err error
 		rows, err = executeInsertSource(env, s.Select)
@@ -79,6 +79,7 @@ func directInsertSourceProjections(projs []SelectItem) bool {
 // rows and RETURNING maps retain values, never the temporary expressions.
 type insertRowSource struct {
 	values      [][]Expr
+	staged      [][]any
 	selected    *ResultSet
 	columnar    *ColumnarResultSet
 	columns     []string
@@ -111,6 +112,9 @@ func (s *insertRowSource) prepareSlots(width int) {
 }
 
 func (s *insertRowSource) len() int {
+	if s.staged != nil {
+		return len(s.staged)
+	}
 	if s.columnar != nil {
 		return s.columnar.RowCount
 	}
@@ -197,29 +201,49 @@ func executeInsertAllColumns(env ExecEnv, s *Insert, t *storage.Table, tmp Row, 
 	updated := 0
 	// Reserve row headers once when every input row will be appended on
 	// success. A trigger or ON CONFLICT can change how many rows are appended.
-	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && onConflictPrep == nil && rowCount > 1 {
-		t.Rows = slices.Grow(t.Rows, rowCount)
+	copyStaged := needsInsertRow || len(t.CheckConstraints) != 0
+	if !hasBefore && !hasAfter && !s.OnConflictDoNothing && onConflictPrep == nil {
+		if rows.staged != nil && !copyStaged && len(t.Rows) == 0 {
+			// Append reuses the staged row headers as it publishes each
+			// validated row. The rollback point restores the old empty slice
+			// if validation or the WAL fails.
+			t.Rows = rows.staged[:0:rowCount]
+		} else if rowCount > 1 {
+			t.Rows = slices.Grow(t.Rows, rowCount)
+		}
 	}
 	arena := dmlRowArena{rowsPerBlock: min(rowCount, 64)}
 	for ri := 0; ri < rowCount; ri++ {
-		vals := rows.at(ri)
-		if len(vals) != expected {
-			return nil, fmt.Errorf("INSERT expects %d values", expected)
-		}
 		if err := checkCtx(env.ctx); err != nil {
 			return nil, err
 		}
-		row := arena.row(expected)
-		for i, e := range vals {
-			v, err := evalExpr(env, e, tmp)
-			if err != nil {
-				return nil, err
+		var row []any
+		if rows.staged != nil {
+			row = rows.staged[ri]
+			if copyStaged {
+				// A failed CHECK or trigger must leave staging retryable.
+				row = arena.row(expected)
+				for i, cell := range rows.staged[ri] {
+					row[i] = storage.CloneRowCell(cell)
+				}
 			}
-			cv, err := coerceColumnValue(v, t.Cols[i])
-			if err != nil {
-				return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
+		} else {
+			vals := rows.at(ri)
+			if len(vals) != expected {
+				return nil, fmt.Errorf("INSERT expects %d values", expected)
 			}
-			row[i] = cv
+			row = arena.row(expected)
+			for i, e := range vals {
+				v, err := evalExpr(env, e, tmp)
+				if err != nil {
+					return nil, err
+				}
+				cv, err := coerceColumnValue(v, t.Cols[i])
+				if err != nil {
+					return nil, fmt.Errorf("column %q: %w", t.Cols[i].Name, err)
+				}
+				row[i] = cv
+			}
 		}
 		if s.OnConflictDoNothing {
 			if err := validateInsertNonUniqueConstraints(env, t, row, constrainedCols, fks); err != nil {
