@@ -12,6 +12,25 @@ import (
 	"testing"
 )
 
+func BenchmarkCoerceEmbeddingJSON(b *testing.B) {
+	vector := make([]float64, 768)
+	for i := range vector {
+		vector[i] = float64(i-384) / 1024
+	}
+	data, err := json.Marshal(vector)
+	if err != nil {
+		b.Fatal(err)
+	}
+	input := any(string(data))
+	b.ReportAllocs()
+	for b.Loop() {
+		value, err := coerceToVector(input)
+		if err != nil || len(value.([]float64)) != len(vector) {
+			b.Fatalf("embedding conversion failed: %v", err)
+		}
+	}
+}
+
 func TestVectorJSONCompatibility(t *testing.T) {
 	inputs := []string{
 		`[]`, `[ ]`, `null`, ` [1, -2, 0.125, 4e20, 5E-10] `,
@@ -32,6 +51,11 @@ func TestVectorJSONCompatibility(t *testing.T) {
 			}
 			if err == nil {
 				assertVectorCodecBits(t, got, want)
+				coerced, err := coerceToVector(input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertVectorCodecBits(t, coerced.([]float64), want)
 			}
 		})
 	}
@@ -67,6 +91,18 @@ func TestVectorJSONErrorCompatibility(t *testing.T) {
 				t.Fatalf("VEC_FROM_JSON error = %v, want %v", gotErr, wantErr)
 			}
 		})
+	}
+}
+
+func TestVectorJSONBeyondInitialCapacity(t *testing.T) {
+	const dimensions = 5000
+	input := "[" + strings.Repeat("-0,", dimensions-1) + "null]"
+	got, err := parseVectorJSON(input)
+	if err != nil || len(got) != dimensions {
+		t.Fatalf("decoded %d dimensions, error %v", len(got), err)
+	}
+	if math.Float64bits(got[dimensions-2]) != math.Float64bits(math.Copysign(0, -1)) || math.Float64bits(got[dimensions-1]) != 0 {
+		t.Fatal("negative zero or NULL changed when growing the vector")
 	}
 }
 

@@ -125,14 +125,24 @@ func TestAdvancedWALCheckpointPersistsBootstrapWatermarkAcrossReopen(t *testing.
 		t.Fatal("missing advanced WAL")
 	}
 	db.LockContentForWrite()
-	table.Rows = append(table.Rows, []any{1})
-	table.Version++
+	table.Rows = append(table.Rows, []any{1}, []any{2})
+	table.Version += 2
 	if _, err := wal.LogBegin(1); err != nil {
 		t.Fatalf("LogBegin: %v", err)
 	}
-	insertLSN, err := wal.LogInsert(1, "default", "events", 0, []any{1}, cols)
+	if _, err := wal.LogInsert(1, "default", "events", 0, []any{1}, cols); err != nil {
+		t.Fatalf("LogInsert: %v", err)
+	}
+	if _, err := wal.LogBegin(2); err != nil {
+		t.Fatalf("LogBegin: %v", err)
+	}
+	insertLSN, err := wal.LogInsert(2, "default", "events", 1, []any{2}, cols)
 	if err != nil {
 		t.Fatalf("LogInsert: %v", err)
+	}
+	// The highest row LSN belongs to the transaction that commits first.
+	if _, err := wal.LogCommit(2); err != nil {
+		t.Fatalf("LogCommit: %v", err)
 	}
 	commitLSN, err := wal.LogCommit(1)
 	db.UnlockContentForWrite()

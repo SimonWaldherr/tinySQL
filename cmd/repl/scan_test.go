@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -94,6 +95,65 @@ func TestRowsToSliceReportsIterationError(t *testing.T) {
 	_, err = rowsToSlice(rows, cols)
 	if !errors.Is(err, failure) {
 		t.Fatalf("error=%v, want %v", err, failure)
+	}
+}
+
+func TestWriteResultTable(t *testing.T) {
+	db := sql.OpenDB(replScanConnector{})
+	defer db.Close()
+	for _, tc := range []struct {
+		name      string
+		markdown  bool
+		count     bool
+		duplicate bool
+		want      string
+	}{
+		{"table", false, false, false, "id  payload  optional\n--  -------  --------\n0   [97]     first   \n1   [98]     NULL    \n"},
+		{"read", false, true, false, "id  payload  optional\n--  -------  --------\n0   [97]     first   \n1   [98]     NULL    \n(2 row(s))\n"},
+		{"markdown", true, false, false, "| id | payload | optional |\n|----|---------|----------|\n| 0  | [97]    | first    |\n| 1  | [98]    | NULL     |\n"},
+		{"duplicate", false, false, true, "payload  payload  optional\n-------  -------  --------\n[97]     [97]     first   \n[98]     [98]     NULL    \n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, err := db.Query("fixture")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			cols, err := rows.Columns()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.duplicate {
+				cols = []string{"payload", "payload", "optional"}
+			}
+			var out bytes.Buffer
+			if err := writeResultTable(&out, rows, cols, tc.markdown, tc.count); err != nil {
+				t.Fatal(err)
+			}
+			if out.String() != tc.want {
+				t.Fatalf("table = %q, want %q", out.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestWriteResultTableReportsLateErrorBeforeOutput(t *testing.T) {
+	failure := errors.New("read failed after partial results")
+	db := sql.OpenDB(replScanConnector{terminal: failure})
+	defer db.Close()
+	rows, err := db.Query("fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err = writeResultTable(&out, rows, cols, false, false)
+	if !errors.Is(err, failure) || out.Len() != 0 {
+		t.Fatalf("table = %q, error = %v", out.String(), err)
 	}
 }
 

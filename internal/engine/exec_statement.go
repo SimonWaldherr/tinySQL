@@ -372,9 +372,8 @@ type dmlPlan struct {
 	// table is the statement's target table, or nil when it does not resolve.
 	// The handler reports that lookup error itself, with its own wording.
 	table *storage.Table
-	// tenantFK is tenantHasAnyForeignKeys for this statement's tenant, which
-	// costs a full ListTables (two allocations, a sort, and a backend
-	// directory listing in the disk-backed modes) per call. tenantFKKnown is
+	// tenantFK records whether this statement's tenant has foreign keys.
+	// Checking it can load schemas from a persistent backend. tenantFKKnown is
 	// false when the statement shape never asks for it, so a future consumer
 	// that does cannot silently read the zero value as "no foreign keys".
 	tenantFK             bool
@@ -439,16 +438,13 @@ func planConstraintRows(plan *dmlPlan, seek func() ([]int, bool)) ([]int, bool) 
 	return seek()
 }
 
-// planTenantHasForeignKeys answers tenantHasAnyForeignKeys for stmt, reusing
-// the plan's answer when there is one. The uncached call lists every table in
-// the tenant — two allocations and a sort, plus a backend directory listing in
-// the disk-backed storage modes — so a statement that asks more than once pays
-// for it more than once.
+// planTenantHasForeignKeys reuses the tenant schema check already done for stmt
+// while choosing the rollback snapshot.
 func planTenantHasForeignKeys(env ExecEnv, stmt Statement) bool {
 	if plan := env.planFor(stmt); plan != nil && plan.tenantFKKnown {
 		return plan.tenantFK
 	}
-	return tenantHasAnyForeignKeys(env)
+	return env.db.TenantHasForeignKeys(env.tenant)
 }
 
 // newDMLPlan precomputes the shared facts about a mutating statement into out,
@@ -485,7 +481,7 @@ func newDMLPlan(out *dmlPlan, db *storage.DB, tenant string, stmt Statement) *dm
 	// A trigger may create a referencing table between upserted rows. The
 	// full snapshot already covers its side effects; resolve FKs at runtime.
 	if !isInsert || (upsert && !plan.hasTriggers()) {
-		plan.tenantFK = tenantHasAnyForeignKeys(ExecEnv{tenant: tenant, db: db})
+		plan.tenantFK = db.TenantHasForeignKeys(tenant)
 		plan.tenantFKKnown = true
 	}
 	table, err := db.Get(tenant, name)

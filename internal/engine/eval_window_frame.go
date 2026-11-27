@@ -6,51 +6,73 @@ import (
 	"strings"
 )
 
-func evalWindowFrameValue(env ExecEnv, ex *FuncCall, rows []Row, current int, last bool) (any, error) {
+func evalWindowFrameValue(env ExecEnv, ex *FuncCall, rows []Row, current int, entry *windowPartitionEntry, last bool) (any, error) {
 	if len(ex.Args) != 1 {
 		return nil, fmt.Errorf("%s requires one argument", ex.Name)
 	}
-	frame, err := windowFrameRows(env, rows, current, ex.Over)
-	if err != nil || len(frame) == 0 {
+	// Value functions with only peer or unbounded endpoints do not need
+	// to prepare numeric keys for the entire partition.
+	if frame := ex.Over.Frame; frame != nil && !isOffsetWindowBound(frame.StartType) && !isOffsetWindowBound(frame.EndType) {
+		entry = nil
+	}
+	start, end, err := windowFrameBounds(env, rows, current, ex.Over, entry)
+	if err != nil || start == end {
 		return nil, err
 	}
-	index := 0
+	index := start
 	if last {
-		index = len(frame) - 1
+		index = end - 1
 	}
-	return evalExpr(env, ex.Args[0], frame[index])
+	return evalExpr(env, ex.Args[0], rows[index])
 }
 
-func windowFrameRows(env ExecEnv, rows []Row, current int, over *OverClause) ([]Row, error) {
+// windowFrameBounds returns a half-open interval in the ordered partition.
+func windowFrameBounds(env ExecEnv, rows []Row, current int, over *OverClause, entry *windowPartitionEntry) (int, int, error) {
 	if len(rows) == 0 || current < 0 || current >= len(rows) {
-		return nil, nil
+		return 0, 0, nil
 	}
 	frame := over.Frame
 	if frame == nil {
 		if len(over.OrderBy) == 0 {
-			return rows, nil
+			return 0, len(rows), nil
 		}
-		return rows[:lastWindowPeerIndex(rows, current, over.OrderBy)+1], nil
+		return 0, lastWindowPeerIndex(rows, current, over.OrderBy) + 1, nil
+	}
+	if frame.StartType == "UNBOUNDED_PRECEDING" && frame.EndType == "UNBOUNDED_FOLLOWING" {
+		return 0, len(rows), nil
 	}
 	var start, end int
 	if frame.Mode == "RANGE" {
-		var err error
-		start, err = rangeWindowBound(env, rows, current, over.OrderBy, frame.StartType, frame.StartValue, true)
+		values, err := windowIntegerRange(env.ctx, entry, over.OrderBy)
 		if err != nil {
-			return nil, err
+			return 0, 0, err
 		}
-		end, err = rangeWindowBound(env, rows, current, over.OrderBy, frame.EndType, frame.EndValue, false)
-		if err != nil {
-			return nil, err
+		if values != nil {
+			desc := over.OrderBy[0].Desc
+			start = intRangeBound(values, current, desc, frame.StartType, frame.StartValue, true)
+			end = intRangeBound(values, current, desc, frame.EndType, frame.EndValue, false)
+		} else {
+			start, err = rangeWindowBound(env, rows, current, over.OrderBy, frame.StartType, frame.StartValue, true)
+			if err != nil {
+				return 0, 0, err
+			}
+			end, err = rangeWindowBound(env, rows, current, over.OrderBy, frame.EndType, frame.EndValue, false)
+			if err != nil {
+				return 0, 0, err
+			}
 		}
 	} else {
 		start = rowsWindowBound(current, len(rows), frame.StartType, frame.StartValue, true)
 		end = rowsWindowBound(current, len(rows), frame.EndType, frame.EndValue, false)
 	}
 	if start > end || start >= len(rows) || end < 0 {
-		return nil, nil
+		return 0, 0, nil
 	}
-	return rows[start : end+1], nil
+	return start, end + 1, nil
+}
+
+func isOffsetWindowBound(kind string) bool {
+	return kind == "OFFSET_PRECEDING" || kind == "OFFSET_FOLLOWING"
 }
 
 func rowsWindowBound(current, total int, kind string, offset int, start bool) int {

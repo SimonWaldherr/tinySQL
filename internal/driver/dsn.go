@@ -65,6 +65,8 @@ type cfg struct {
 // driver does not have to rewrite its connection string to try tinySQL.
 const memoryDSNTarget = ":memory:"
 
+func defaultDSNConfig() cfg { return cfg{tenant: "default", maxWriters: 1} }
+
 // parseDSN parses a tinySQL DSN into a driver configuration.
 //
 // Accepted forms:
@@ -85,9 +87,7 @@ const memoryDSNTarget = ":memory:"
 // Silently creating that file would turn a one-character typo into a database
 // the caller can never find again.
 func parseDSN(dsn string) (cfg, error) {
-	var c cfg
-	c.tenant = "default"
-	c.maxWriters = 1
+	c := defaultDSNConfig()
 	if dsn == "" {
 		c.defaultDSN = true
 		return c, nil

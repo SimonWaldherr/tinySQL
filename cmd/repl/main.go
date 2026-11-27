@@ -212,7 +212,9 @@ func replReadAndExecFile(db replSession, filename string) {
 				continue
 			}
 			cols, _ := rows.Columns()
-			replPrintRows(rows, cols)
+			if err := writeResultTable(os.Stdout, rows, cols, false, true); err != nil {
+				fmt.Println("ERR:", err)
+			}
 			rows.Close()
 		} else {
 			if _, err := db.ExecContext(context.Background(), s); err != nil {
@@ -404,60 +406,6 @@ func replDePtr(p any) any {
 	return p
 }
 
-// replPrintRows prints a simple table for .read results.
-func replPrintRows(rows *sql.Rows, cols []string) {
-	data, err := rowsToSlice(rows, cols)
-	if err != nil {
-		fmt.Println("ERR:", err)
-		return
-	}
-
-	cell := func(v any) string {
-		if v == nil {
-			return "NULL"
-		}
-		return fmt.Sprintf("%v", v)
-	}
-
-	width := make([]int, len(cols))
-	for i, c := range cols {
-		width[i] = len(c)
-	}
-	for _, r := range data {
-		for i, c := range cols {
-			if w := len(cell(r[c])); w > width[i] {
-				width[i] = w
-			}
-		}
-	}
-
-	for i, c := range cols {
-		if i > 0 {
-			fmt.Print("  ")
-		}
-		fmt.Print(c + strings.Repeat(" ", max(0, width[i]-len(c))))
-	}
-	fmt.Println()
-	for i := range cols {
-		if i > 0 {
-			fmt.Print("  ")
-		}
-		fmt.Print(strings.Repeat("-", width[i]))
-	}
-	fmt.Println()
-	for _, r := range data {
-		for i, c := range cols {
-			if i > 0 {
-				fmt.Print("  ")
-			}
-			s := cell(r[c])
-			fmt.Print(s + strings.Repeat(" ", max(0, width[i]-len(s))))
-		}
-		fmt.Println()
-	}
-	fmt.Printf("(%d row(s))\n", len(data))
-}
-
 // handleSelectStatement executes a SELECT/CTE query and appends HTML parts when requested.
 func handleSelectStatement(db replSession, q string, beautiful, htmlMode, errorsOnly bool, format string, srcLines []string, htmlParts *[]string, interactive bool) error {
 	var sqlFrag string
@@ -582,13 +530,23 @@ func handleNonSelectStatement(db replSession, q string, beautiful, htmlMode, err
 }
 
 func printRows(rows *sql.Rows, cols []string, format string) {
+	format = strings.ToLower(format)
+	switch format {
+	case "json", "yaml", "csv", "tsv":
+	default:
+		if err := writeResultTable(os.Stdout, rows, cols, format == "markdown" || format == "md", false); err != nil {
+			fmt.Println("ERR:", err)
+		}
+		return
+	}
+
 	out, err := rowsToSlice(rows, cols)
 	if err != nil {
 		fmt.Println("ERR:", err)
 		return
 	}
 
-	switch strings.ToLower(format) {
+	switch format {
 	case "json":
 		printJSON(out)
 	case "yaml":
@@ -597,71 +555,18 @@ func printRows(rows *sql.Rows, cols []string, format string) {
 		printCSV(out, cols)
 	case "tsv":
 		printTSV(out, cols)
-	case "markdown", "md":
-		printMarkdown(out, cols)
-	default:
-		printTable(out, cols)
-	}
-}
-
-func printTable(out []map[string]any, cols []string) {
-	width := make([]int, len(cols))
-	for i, c := range cols {
-		width[i] = len(c)
-	}
-	for _, r := range out {
-		for i, c := range cols {
-			if w := len(cell(r[c])); w > width[i] {
-				width[i] = w
-			}
-		}
-	}
-	for i, c := range cols {
-		fmt.Print(padRight(c, width[i]))
-		if i < len(cols)-1 {
-			fmt.Print("  ")
-		}
-	}
-	fmt.Println()
-	for i := range cols {
-		fmt.Print(strings.Repeat("-", width[i]))
-		if i < len(cols)-1 {
-			fmt.Print("  ")
-		}
-	}
-	fmt.Println()
-	for _, r := range out {
-		for i, c := range cols {
-			fmt.Print(padRight(cell(r[c]), width[i]))
-			if i < len(cols)-1 {
-				fmt.Print("  ")
-			}
-		}
-		fmt.Println()
-	}
-}
-
-func padRight(s string, w int) string {
-	if len(s) >= w {
-		return s
-	}
-	return s + strings.Repeat(" ", w-len(s))
-}
-
-func dePtr(p any) any {
-	switch v := p.(type) {
-	case *any:
-		return *v
-	default:
-		return v
 	}
 }
 
 func cell(v any) string {
-	if v == nil {
+	switch value := v.(type) {
+	case nil:
 		return "NULL"
+	case string:
+		return value
+	default:
+		return fmt.Sprint(value)
 	}
-	return fmt.Sprintf("%v", v)
 }
 
 func printJSON(out []map[string]any) {
@@ -710,7 +615,7 @@ func rowsToSlice(rows *sql.Rows, cols []string) ([]map[string]any, error) {
 		}
 		m := make(rowMap, len(cols))
 		for i, c := range cols {
-			m[c] = dePtr(ptrs[i])
+			m[c] = cells[i]
 		}
 		out = append(out, m)
 	}
@@ -1309,49 +1214,6 @@ func printTSV(out []map[string]any, cols []string) {
 				fmt.Print("\t")
 			}
 			fmt.Print(cell(r[c]))
-		}
-		fmt.Println()
-	}
-}
-
-func printMarkdown(out []map[string]any, cols []string) {
-	// Calculate widths
-	width := make([]int, len(cols))
-	for i, c := range cols {
-		width[i] = len(c)
-	}
-	for _, r := range out {
-		for i, c := range cols {
-			if w := len(cell(r[c])); w > width[i] {
-				width[i] = w
-			}
-		}
-	}
-
-	// Header
-	fmt.Print("|")
-	for i, c := range cols {
-		fmt.Print(" ")
-		fmt.Print(padRight(c, width[i]))
-		fmt.Print(" |")
-	}
-	fmt.Println()
-
-	// Separator
-	fmt.Print("|")
-	for i := range cols {
-		fmt.Print(strings.Repeat("-", width[i]+2))
-		fmt.Print("|")
-	}
-	fmt.Println()
-
-	// Rows
-	for _, r := range out {
-		fmt.Print("|")
-		for i, c := range cols {
-			fmt.Print(" ")
-			fmt.Print(padRight(cell(r[c]), width[i]))
-			fmt.Print(" |")
 		}
 		fmt.Println()
 	}

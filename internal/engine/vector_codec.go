@@ -58,12 +58,15 @@ func parseVectorJSON(s string) ([]float64, error) {
 		if dimensions > int(^uint(0)>>1)/8 {
 			return nil, fmt.Errorf("vector too large")
 		}
-		out := make([]float64, dimensions)
-		for i := range out {
+		// A comma count is only a size hint until the elements are valid.
+		// Avoid reserving a large vector for malformed input.
+		out := make([]float64, 0, min(dimensions, 4096))
+		for range dimensions {
 			var part string
 			part, body, _ = strings.Cut(body, ",")
 			part = strings.Trim(part, " \t\r\n")
 			if part == "null" {
+				out = append(out, 0)
 				continue
 			}
 			if !isVectorJSONNumber(part) {
@@ -73,7 +76,7 @@ func parseVectorJSON(s string) ([]float64, error) {
 			if err != nil {
 				goto fallback
 			}
-			out[i] = f
+			out = append(out, f)
 		}
 		return out, nil
 	}

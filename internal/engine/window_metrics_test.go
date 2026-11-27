@@ -4,12 +4,64 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"math/big"
+	"reflect"
 	"slices"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
 	_ "modernc.org/sqlite"
 )
+
+func TestWindowMetricTotalsMatchScalar(t *testing.T) {
+	db := storage.NewDB()
+	t.Cleanup(func() { _ = db.Close() })
+	execSQL(t, db, `CREATE TABLE metric_totals (id INT, series TEXT, value INT)`)
+	table, err := db.Get("default", "metric_totals")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addRows := func(series string, values ...any) {
+		for i := range 160 {
+			table.Rows = append(table.Rows, []any{i, series, values[i%len(values)]})
+		}
+	}
+	addRows("integer", -7, int64(5), 3, nil, -2)
+	addRows("null", nil)
+	// An intermediate overflow promotes SUM even if later terms undo it.
+	addRows("overflow", int64(math.MaxInt64), 1, -1, nil)
+	addRows("float", 1e16, 1.0, -1e16)
+	addRows("decimal", big.NewRat(1, 3), 1, nil)
+	table.Version++
+
+	checkRows := func(label string, got, want []Row) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s: got %d rows, want %d", label, len(got), len(want))
+		}
+		for i := range got {
+			if !reflect.DeepEqual(got[i], want[i]) {
+				t.Fatalf("%s row %d: got %v, want %v", label, i, got[i], want[i])
+			}
+		}
+	}
+	for _, frame := range []string{
+		"ROWS BETWEEN 75 PRECEDING AND 7 FOLLOWING",
+		"ROWS BETWEEN 65 FOLLOWING AND 140 FOLLOWING",
+		"RANGE BETWEEN 75 PRECEDING AND 7 FOLLOWING",
+	} {
+		for _, direction := range []string{"ASC", "DESC"} {
+			over := " OVER (PARTITION BY series ORDER BY id " + direction + " " + frame + ")"
+			got := execSQL(t, db, "SELECT SUM(value)"+over+" AS total, AVG(value)"+over+" AS mean FROM metric_totals")
+			want := execSQL(t, db, "SELECT SUM(COALESCE(value, NULL))"+over+" AS total, AVG(COALESCE(value, NULL))"+over+" AS mean FROM metric_totals")
+			checkRows(direction+" "+frame, got.Rows, want.Rows)
+		}
+	}
+	const over = " OVER (PARTITION BY series ORDER BY id DESC)"
+	got := execSQL(t, db, "SELECT MOVING_SUM(100, value)"+over+" AS total, MOVING_AVG(100, value)"+over+" AS mean FROM metric_totals")
+	want := execSQL(t, db, "SELECT MOVING_SUM(100, COALESCE(value, NULL))"+over+" AS total, MOVING_AVG(100, COALESCE(value, NULL))"+over+" AS mean FROM metric_totals")
+	checkRows("moving totals", got.Rows, want.Rows)
+}
 
 func TestWindowMetricCountsAgreeWithSQLite(t *testing.T) {
 	db := storage.NewDB()
@@ -97,5 +149,26 @@ func TestIntegerRangeBoundsMatchGeneral(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestWindowValuePeerFrameSkipsIntegerRangeCache(t *testing.T) {
+	rows := []Row{{"time": 1, "value": 3}, {"time": 1, "value": 4}, {"time": 2, "value": 5}}
+	entry := &windowPartitionEntry{rows: rows}
+	call := &FuncCall{
+		Args: []Expr{newVarRef("value")},
+		Over: &OverClause{
+			OrderBy: []OrderItem{{Col: "time"}},
+			Frame:   &WindowFrame{Mode: "RANGE", StartType: "CURRENT", EndType: "CURRENT"},
+		},
+	}
+	env := ExecEnv{ctx: t.Context()}
+	first, firstErr := evalWindowFrameValue(env, call, rows, 1, entry, false)
+	last, lastErr := evalWindowFrameValue(env, call, rows, 0, entry, true)
+	if first != 3 || last != 4 || firstErr != nil || lastErr != nil {
+		t.Fatalf("peer frame values = %v, %v (%v, %v)", first, last, firstErr, lastErr)
+	}
+	if entry.integerRangeChecked {
+		t.Fatal("peer frame prepared unused integer range keys")
 	}
 }

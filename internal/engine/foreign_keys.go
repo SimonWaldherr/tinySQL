@@ -50,21 +50,6 @@ type fkActionKey struct {
 	value  string
 }
 
-// tenantHasAnyForeignKeys reports whether any table in the tenant declares a
-// FOREIGN KEY column at all. DELETE/UPDATE call this first so the common
-// case (no foreign keys anywhere) pays no cost beyond one cheap metadata
-// scan, and can keep using their existing raw fast paths.
-func tenantHasAnyForeignKeys(env ExecEnv) bool {
-	for _, t := range env.db.ListTables(env.tenant) {
-		for _, c := range t.Cols {
-			if c.Constraint == storage.ForeignKey && c.ForeignKey != nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // findReferencingForeignKeys returns every column, across every table in the
 // tenant, whose FOREIGN KEY targets (parentTable, parentCol).
 func findReferencingForeignKeys(env ExecEnv, parentTable, parentCol string, forUpdate bool) []fkReference {
@@ -96,7 +81,7 @@ func findReferencingForeignKeys(env ExecEnv, parentTable, parentCol string, forU
 // tables and returns nil, in which case the caller may proceed to remove
 // deletedRows from t.
 func fkOnDeleteCheckAllColumns(env ExecEnv, t *storage.Table, deletedRows [][]any) error {
-	if len(deletedRows) == 0 || !tenantHasAnyForeignKeys(env) {
+	if len(deletedRows) == 0 || !env.db.TenantHasForeignKeys(env.tenant) {
 		return nil
 	}
 	for colIdx, col := range t.Cols {
@@ -412,12 +397,11 @@ func cascadeForeignKeyReference(env ExecEnv, ref fkReference, changes map[any]fk
 // each of executeDelete's three paths about foreign keys individually —
 // keeps this a single, easy-to-audit choke point, at the cost of
 // evaluating WHERE twice when (and only when) the tenant has any foreign
-// keys defined at all (tenantHasAnyForeignKeys short-circuits the common
+// keys defined at all (TenantHasForeignKeys short-circuits the common
 // case where none exist).
 func checkForeignKeysBeforeDelete(env ExecEnv, t *storage.Table, s *Delete) error {
 	// The statement plan already answered this while choosing a rollback
-	// snapshot shape. Recomputing it costs a full sorted ListTables, and a
-	// backend directory listing in the disk-backed storage modes.
+	// snapshot shape. Recomputing it scans schemas and may load cold tables.
 	if !planTenantHasForeignKeys(env, s) {
 		return nil
 	}

@@ -821,12 +821,11 @@ func (c *CatalogManager) MarkMaterializedViewsStaleByDependency(schema, changedN
 	c.lockWrite()
 	defer c.unlockWrite()
 	affected := make([]string, 0)
-	for key, deps := range c.dependencies {
-		mv := c.mviews[key]
-		if mv == nil || !mv.InvalidateOnChange {
+	for key, mv := range c.mviews {
+		if !mv.InvalidateOnChange {
 			continue
 		}
-		for _, dep := range deps {
+		for _, dep := range c.dependencies[key] {
 			depKey := strings.ToLower(dep.DependsOnSchema + "." + dep.DependsOnName)
 			if depKey != changedKey {
 				continue
@@ -854,15 +853,11 @@ func (c *CatalogManager) MarkMaterializedViewsStaleByDependency(schema, changedN
 func (c *CatalogManager) anyMaterializedViewDependsOn(changedKey string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if len(c.mviews) == 0 {
-		return false
-	}
-	for key, deps := range c.dependencies {
-		mv := c.mviews[key]
-		if mv == nil || !mv.InvalidateOnChange || mv.IsStale {
+	for key, mv := range c.mviews {
+		if !mv.InvalidateOnChange || mv.IsStale {
 			continue
 		}
-		for _, dep := range deps {
+		for _, dep := range c.dependencies[key] {
 			if strings.ToLower(dep.DependsOnSchema+"."+dep.DependsOnName) == changedKey {
 				return true
 			}

@@ -289,8 +289,7 @@ func coerceToVector(v any) (any, error) {
 		if s == "" {
 			return nil, fmt.Errorf("cannot convert empty string to VECTOR")
 		}
-		var arr []float64
-		if err := json.Unmarshal([]byte(s), &arr); err == nil {
+		if arr, err := parseVectorJSON(s); err == nil {
 			return arr, nil
 		}
 		// Try parsing as []any from JSON

@@ -47,13 +47,6 @@ func BenchmarkAdvancedWALCalculateChecksum(b *testing.B) {
 }
 
 // benchWALBlobCols is a row shape carrying a BLOB and a narrow-int column.
-// The narrow-int (uint32) column benefits from hashWALValue's fast path (see
-// its comment: skipping %T's reflect.TypeOf call is a large relative win for
-// a lone scalar). The BLOB column deliberately does not: fmt already has a
-// non-reflective, pooled-buffer fast path for []byte under %v, and a
-// hand-rolled replacement measured slower, so hashWALValue still falls
-// through to fmt for it. This benchmark exists to show the net effect on a
-// row shape that carries both.
 var benchWALBlobCols = []Column{
 	{Name: "id", Type: IntType},
 	{Name: "flags", Type: Uint32Type},

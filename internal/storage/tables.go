@@ -340,6 +340,45 @@ func (db *DB) ListTables(tn string) []*Table {
 	return out
 }
 
+// TenantHasForeignKeys reports whether any table in the tenant declares a
+// foreign key. The caller must hold the content lock while inspecting schemas.
+func (db *DB) TenantHasForeignKeys(tenant string) bool {
+	db.mu.RLock()
+	_, memory := db.backend.(*MemoryBackend)
+	if db.backend == nil || memory {
+		// These backends keep every table in the tenant directory. An
+		// existence check can stop at the first match and needs no sort.
+		defer db.mu.RUnlock()
+		if td := db.getTenantRO(tenant); td != nil {
+			for _, table := range td.tables {
+				if tableHasForeignKeys(table) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	db.mu.RUnlock()
+
+	// A persistent backend may have nonresident tables with foreign keys.
+	for _, table := range db.ListTables(tenant) {
+		if tableHasForeignKeys(table) {
+			return true
+		}
+	}
+	return false
+}
+
+func tableHasForeignKeys(table *Table) bool {
+	for i := range table.Cols {
+		col := &table.Cols[i]
+		if col.Constraint == ForeignKey && col.ForeignKey != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // tableForgetter is implemented by backends that need to hear about the DROP of
 // a table they never persisted, so a snapshot write of that table that is in
 // flight (DB.Sync) does not install it afterwards. See DiskBackend.forgetTable.

@@ -91,7 +91,7 @@ func compareOldVsNewForOverClause(t *testing.T, label string, over *OverClause, 
 		env.windowIndex = i
 
 		oldRows, oldIdx := oldStyleResolvePartition(env, over, allRows, row, i)
-		newRows, newIdx := resolveWindowPartition(env, &FuncCall{Name: "TEST", Over: over}, allRows, row)
+		newRows, newIdx, _ := resolveWindowPartition(env, &FuncCall{Name: "TEST", Over: over}, allRows, row)
 
 		if !idsEqual(rowIDs(oldRows), rowIDs(newRows)) {
 			t.Errorf("%s: row id=%v (idx %d): partition row sequence differs\n  old: %v\n  new: %v",
@@ -181,8 +181,8 @@ func TestWindowPartitionCacheReusedAcrossMultipleFuncCalls(t *testing.T) {
 	env := ExecEnv{windowRows: allRows, windowPartitions: newWindowPartitionCache()}
 	for i, row := range allRows {
 		env.windowIndex = i
-		rows1, idx1 := resolveWindowPartition(env, ex1, allRows, row)
-		rows2, idx2 := resolveWindowPartition(env, ex2, allRows, row)
+		rows1, idx1, _ := resolveWindowPartition(env, ex1, allRows, row)
+		rows2, idx2, _ := resolveWindowPartition(env, ex2, allRows, row)
 		// Same OVER clause shape and same current row -> same partition
 		// content and same resolved position from the shared cache entry.
 		if !idsEqual(rowIDs(rows1), rowIDs(rows2)) {
@@ -217,8 +217,8 @@ func TestWindowPartitionCacheKeepsDifferentShapesSeparate(t *testing.T) {
 	sawDifferentOrder := false
 	for i, row := range allRows {
 		env.windowIndex = i
-		descRows, _ := resolveWindowPartition(env, desc, allRows, row)
-		ascRows, _ := resolveWindowPartition(env, asc, allRows, row)
+		descRows, _, _ := resolveWindowPartition(env, desc, allRows, row)
+		ascRows, _, _ := resolveWindowPartition(env, asc, allRows, row)
 		if !idsEqual(rowIDs(descRows), rowIDs(ascRows)) {
 			sawDifferentOrder = true
 		}

@@ -331,6 +331,44 @@ func BenchmarkUpdateArithmeticByPrimaryKey(b *testing.B) {
 	benchmarkUpdateByPrimaryKey(b, "score + 1")
 }
 
+func BenchmarkPointCRUD(b *testing.B) {
+	for _, tableCount := range []int{1, 500} {
+		b.Run(fmt.Sprintf("%dTables", tableCount), func(b *testing.B) {
+			db := storage.NewDB()
+			b.Cleanup(func() { _ = db.Close() })
+			setup := []Statement{
+				mustParse("CREATE TABLE records (id INT PRIMARY KEY, score INT, label TEXT)"),
+				mustParse("INSERT INTO records VALUES (1, 0, 'keep'), (2, 0, 'cycle')"),
+			}
+			for _, stmt := range setup {
+				if _, err := Execute(b.Context(), db, "default", stmt); err != nil {
+					b.Fatal(err)
+				}
+			}
+			for i := 1; i < tableCount; i++ {
+				stmt := mustParse(fmt.Sprintf("CREATE TABLE extra_%d (id INT PRIMARY KEY, score INT, label TEXT)", i))
+				if _, err := Execute(b.Context(), db, "default", stmt); err != nil {
+					b.Fatal(err)
+				}
+			}
+			work := []Statement{
+				mustParse("INSERT INTO records VALUES (3, 0, 'new')"),
+				mustParse("SELECT score FROM records WHERE id = 3"),
+				mustParse("UPDATE records SET score = score + 1 WHERE id = 3"),
+				mustParse("DELETE FROM records WHERE id = 3"),
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				for _, stmt := range work {
+					if _, err := Execute(b.Context(), db, "default", stmt); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+	}
+}
+
 func benchmarkUpdateByPrimaryKey(b *testing.B, value string) {
 	db := storage.NewDB()
 	ctx := context.Background()

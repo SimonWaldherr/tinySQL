@@ -74,6 +74,27 @@ func TestAddDependencySkipsCTEsInternalAndCatalogTables(t *testing.T) {
 	}
 }
 
+func TestSelectDependenciesKeepNestedCTEsLocal(t *testing.T) {
+	from := func(name string) *Select { return &Select{From: FromItem{Table: name}} }
+	query := &Select{
+		CTEs: []CTE{{Name: "outer_cte", Select: from("source")}},
+		From: FromItem{Subquery: &Select{
+			CTEs: []CTE{{Name: "local_cte", Select: from("outer_cte")}},
+			From: FromItem{Table: "local_cte"},
+		}},
+		Joins: []JoinClause{{Right: FromItem{Table: "local_cte"}}},
+	}
+	deps := selectDependencies(nil, "main", "report", "VIEW", query)
+	if len(deps) != 2 {
+		t.Fatalf("expected dependencies on source and local_cte, got %v", deps)
+	}
+	for _, dep := range deps {
+		if dep.DependsOnName != "source" && dep.DependsOnName != "local_cte" {
+			t.Fatalf("unexpected dependency: %v", dep)
+		}
+	}
+}
+
 func TestDependencyObjectTypesAndIgnoredFromItems(t *testing.T) {
 	cat := storage.NewCatalogManager()
 	if err := cat.RegisterView("main", "saved_view", "SELECT 1"); err != nil {

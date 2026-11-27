@@ -1,6 +1,30 @@
 package storage
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
+
+func BenchmarkMaterializedViewDependencyMiss(b *testing.B) {
+	cat := NewCatalogManager()
+	if err := cat.RegisterMaterializedView(&CatalogMaterializedView{Name: "summary", InvalidateOnChange: true}); err != nil {
+		b.Fatal(err)
+	}
+	cat.SetDependencies("main", "summary", "MATERIALIZED_VIEW", []CatalogDependency{{DependsOnName: "orders"}})
+	for i := range 2000 {
+		name := "view_" + strconv.Itoa(i)
+		if err := cat.RegisterView("main", name, "SELECT * FROM orders"); err != nil {
+			b.Fatal(err)
+		}
+		cat.SetDependencies("main", name, "VIEW", []CatalogDependency{{DependsOnName: "orders"}})
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if affected := cat.MarkMaterializedViewsStaleByDependency("main", "events"); len(affected) != 0 {
+			b.Fatalf("unexpected invalidation: %v", affected)
+		}
+	}
+}
 
 // The catalog half of a StatementSnapshot is copy-on-write: nothing is copied
 // until the statement actually mutates the catalog, and nothing is restored if

@@ -149,8 +149,9 @@ type AdvancedWAL struct {
 	// TABLE/VIEW/trigger is not lost merely because no later DML arrives.
 	checkpointRequested bool
 
-	// Active transactions (for recovery)
-	activeTxs map[TxID]*WALTxState
+	// Last logged row operation per active transaction. Zero means the
+	// transaction has not logged any rows yet.
+	activeTxs map[TxID]LSN
 
 	// Committed LSN (for durability guarantees)
 	committedLSN LSN
@@ -260,14 +261,6 @@ func newWALEpoch() uint64 {
 		e = 1
 	}
 	return e
-}
-
-// WALTxState tracks the state of a transaction in the WAL.
-type WALTxState struct {
-	TxID       TxID
-	StartLSN   LSN
-	Operations []LSN
-	Status     TxStatus
 }
 
 // AdvancedWALConfig configures the advanced WAL.
@@ -409,7 +402,7 @@ func OpenAdvancedWAL(config AdvancedWALConfig) (*AdvancedWAL, error) {
 		checkpointMaxBytes:      normalizeCheckpointMaxBytes(config.CheckpointMaxBytes),
 		syncMode:                config.SyncMode,
 		lastCheckpoint:          time.Now(),
-		activeTxs:               make(map[TxID]*WALTxState),
+		activeTxs:               make(map[TxID]LSN),
 		nextLSN:                 checkpointWatermark + 1,
 		checkpointWatermark:     checkpointWatermark,
 		checkpointDataWatermark: checkpointDataWatermark,
@@ -502,12 +495,7 @@ func (w *AdvancedWAL) LogBegin(txID TxID) (LSN, error) {
 		return 0, err
 	}
 
-	w.activeTxs[txID] = &WALTxState{
-		TxID:       txID,
-		StartLSN:   lsn,
-		Operations: make([]LSN, 0, 16),
-		Status:     TxStatusInProgress,
-	}
+	w.activeTxs[txID] = 0
 
 	return lsn, nil
 }
@@ -584,8 +572,8 @@ func (w *AdvancedWAL) LogInsert(txID TxID, tenant, table string, rowID int64, da
 		return 0, err
 	}
 
-	if txState, exists := w.activeTxs[txID]; exists {
-		txState.Operations = append(txState.Operations, lsn)
+	if _, active := w.activeTxs[txID]; active {
+		w.activeTxs[txID] = lsn
 	}
 
 	w.recordsSinceCP++
@@ -618,8 +606,8 @@ func (w *AdvancedWAL) LogUpdate(txID TxID, tenant, table string, rowID int64, be
 		return 0, err
 	}
 
-	if txState, exists := w.activeTxs[txID]; exists {
-		txState.Operations = append(txState.Operations, lsn)
+	if _, active := w.activeTxs[txID]; active {
+		w.activeTxs[txID] = lsn
 	}
 
 	w.recordsSinceCP++
@@ -657,8 +645,8 @@ func (w *AdvancedWAL) LogDelete(txID TxID, tenant, table string, rowID int64, be
 		return 0, err
 	}
 
-	if txState, exists := w.activeTxs[txID]; exists {
-		txState.Operations = append(txState.Operations, lsn)
+	if _, active := w.activeTxs[txID]; active {
+		w.activeTxs[txID] = lsn
 	}
 
 	w.recordsSinceCP++
@@ -690,15 +678,10 @@ func (w *AdvancedWAL) LogCommit(txID TxID) (LSN, error) {
 		return 0, err
 	}
 
-	if txState, exists := w.activeTxs[txID]; exists {
-		txState.Status = TxStatusCommitted
-		if n := len(txState.Operations); n > 0 {
-			// A feed exposes only row-operation records, never this COMMIT
-			// marker. Preserve their actual high-water mark for checkpoint
-			// compaction so a replica that resumed at the final operation is
-			// not spuriously considered behind.
-			w.committedDataLSN = txState.Operations[n-1]
-		}
+	if dataLSN, active := w.activeTxs[txID]; active {
+		// A feed resumes at a row operation, and transactions can commit
+		// in a different order from their last row operation.
+		w.committedDataLSN = max(w.committedDataLSN, dataLSN)
 		delete(w.activeTxs, txID)
 	}
 
@@ -729,10 +712,7 @@ func (w *AdvancedWAL) LogAbort(txID TxID) (LSN, error) {
 		return 0, err
 	}
 
-	if txState, exists := w.activeTxs[txID]; exists {
-		txState.Status = TxStatusAborted
-		delete(w.activeTxs, txID)
-	}
+	delete(w.activeTxs, txID)
 	// An aborted transaction can be the last active one that kept the
 	// scheduler from checkpointing earlier committed work. Wake it so a
 	// long-lived explicit transaction does not unnecessarily pin WAL growth
@@ -1358,15 +1338,6 @@ func hashWALValue(h io.Writer, v any, scratch *[40]byte) {
 	// string instead pays off even though the value itself is cheap to
 	// format either way. These fast paths must stay byte-identical to that
 	// fallback for the same reason the scalar cases above do.
-	//
-	// []byte (BLOB) deliberately has no such case: unlike the scalar %T cost
-	// above, fmt's fmt.(*pp).printArg already special-cases []byte under %v
-	// via fmtBytes -- a non-reflective loop over the concrete []byte that
-	// writes into a buffer pooled across calls -- so it is not paying the
-	// reflection cost this file exists to avoid. A from-scratch
-	// reimplementation was tried and measured 4x slower for a 256-byte
-	// value (one fresh per-call allocation losing to fmt's pooled buffer),
-	// so it was reverted rather than kept for symmetry with the int cases.
 	case int8:
 		b := append(scratch[:0], "int8"...)
 		b = strconv.AppendInt(b, int64(t), 10)
@@ -1406,6 +1377,26 @@ func hashWALValue(h io.Writer, v any, scratch *[40]byte) {
 		b := append(scratch[:0], "uint64"...)
 		b = strconv.AppendUint(b, t, 10)
 		b = append(b, ';')
+		_, _ = h.Write(b)
+	case []byte:
+		// Preserve the historical %T%v; representation without letting a
+		// large BLOB allocate a buffer for its entire decimal expansion.
+		b := append(scratch[:0], "[]uint8["...)
+		for i, value := range t {
+			if len(b) > len(scratch)-4 {
+				_, _ = h.Write(b)
+				b = scratch[:0]
+			}
+			if i != 0 {
+				b = append(b, ' ')
+			}
+			b = strconv.AppendUint(b, uint64(value), 10)
+		}
+		if len(b) > len(scratch)-2 {
+			_, _ = h.Write(b)
+			b = scratch[:0]
+		}
+		b = append(b, ']', ';')
 		_, _ = h.Write(b)
 	case []float64:
 		_, _ = io.WriteString(h, "V")

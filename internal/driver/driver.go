@@ -23,7 +23,6 @@ package driver
 import (
 	"database/sql"
 	"errors"
-	"net/url"
 	"time"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -84,11 +83,13 @@ func CurrentDefaultDB() *storage.DB {
 // OpenInMemory returns a *sql.DB backed by an in-memory tinySQL server.
 // If tenant is empty the default tenant is used.
 func OpenInMemory(tenant string) (*sql.DB, error) {
-	dsn := "mem://"
+	config := defaultDSNConfig()
 	if tenant != "" {
-		dsn += "?tenant=" + url.QueryEscape(tenant)
+		if err := applyDSNOption(&config, "tenant", tenant); err != nil {
+			return nil, err
+		}
 	}
-	return sql.Open("tinysql", dsn)
+	return sql.OpenDB(&connector{driver: defaultDrv, cfg: config}), nil
 }
 
 // OpenWithDB binds a SQL pool to a caller-owned database without changing the

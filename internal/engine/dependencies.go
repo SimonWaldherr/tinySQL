@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"maps"
 	"strings"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -8,7 +9,7 @@ import (
 
 func selectDependencies(cat *storage.CatalogManager, objectSchema, objectName, objectType string, sel *Select) []storage.CatalogDependency {
 	seen := make(map[string]storage.CatalogDependency)
-	collectSelectDependencies(cat, sel, map[string]bool{}, seen)
+	collectSelectDependencies(cat, sel, nil, seen)
 
 	out := make([]storage.CatalogDependency, 0, len(seen))
 	for _, dep := range seen {
@@ -24,9 +25,13 @@ func collectSelectDependencies(cat *storage.CatalogManager, sel *Select, outerCT
 	if sel == nil {
 		return
 	}
-	ctes := cloneCTEMap(outerCTEs)
-	for _, cte := range sel.CTEs {
-		ctes[strings.ToLower(cte.Name)] = true
+	ctes := outerCTEs
+	if len(sel.CTEs) != 0 {
+		ctes = make(map[string]bool, len(outerCTEs)+len(sel.CTEs))
+		maps.Copy(ctes, outerCTEs)
+		for _, cte := range sel.CTEs {
+			ctes[strings.ToLower(cte.Name)] = true
+		}
 	}
 	for _, cte := range sel.CTEs {
 		collectSelectDependencies(cat, cte.Select, outerCTEs, seen)
@@ -122,20 +127,21 @@ func addDependency(cat *storage.CatalogManager, table string, ctes map[string]bo
 	if schema == "sys" || schema == "catalog" {
 		return
 	}
-	depType := dependencyObjectType(cat, schema, name)
-	key := strings.ToLower(schema + "." + name)
+	key := schema + "." + lowerName
+	if dep, ok := seen[key]; ok && dep.DependsOnName == name {
+		return
+	}
 	seen[key] = storage.CatalogDependency{
 		DependsOnSchema: schema,
 		DependsOnName:   name,
-		DependsOnType:   depType,
+		DependsOnType:   dependencyObjectType(cat, schema, name),
 		DependencyType:  "NORMAL",
 	}
 }
 
 func splitObjectName(name string) (string, string) {
-	parts := strings.SplitN(strings.TrimSpace(name), ".", 2)
-	if len(parts) == 2 {
-		return strings.ToLower(parts[0]), parts[1]
+	if schema, object, qualified := strings.Cut(strings.TrimSpace(name), "."); qualified {
+		return strings.ToLower(schema), object
 	}
 	return "main", name
 }
@@ -151,12 +157,4 @@ func dependencyObjectType(cat *storage.CatalogManager, schema, name string) stri
 		return "MATERIALIZED_VIEW"
 	}
 	return "TABLE"
-}
-
-func cloneCTEMap(in map[string]bool) map[string]bool {
-	out := make(map[string]bool, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
 }

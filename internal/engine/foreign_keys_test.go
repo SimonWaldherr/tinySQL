@@ -7,6 +7,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/SimonWaldherr/tinySQL/internal/storage"
@@ -66,6 +67,39 @@ func TestForeignKeyDefaultRestrictsDelete(t *testing.T) {
 	rs = execSQL(t, db, `SELECT COUNT(*) AS cnt FROM child`)
 	if got := expectAsInt(t, rs.Rows[0]["cnt"]); got != 1 {
 		t.Errorf("expected child row to be untouched by a RESTRICTed delete, got %d rows", got)
+	}
+}
+
+func TestForeignKeyDeleteChecksColdChildTable(t *testing.T) {
+	config := storage.StorageConfig{Mode: storage.ModeDisk, Path: t.TempDir()}
+	db, err := storage.OpenDB(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	execSQL(t, db, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+	execSQL(t, db, `CREATE TABLE child (parent_id INT REFERENCES parent(id))`)
+	execSQL(t, db, `INSERT INTO parent VALUES (1)`)
+	execSQL(t, db, `INSERT INTO child VALUES (1)`)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = storage.OpenDB(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if child := storage.ResidentTable(db, "default", "child"); child != nil {
+		t.Fatal("expected the child table to require a backend lookup")
+	}
+	stmt := mustParse(`DELETE FROM parent WHERE id = 1`)
+	if _, err := Execute(t.Context(), db, "default", stmt); err == nil || !strings.Contains(err.Error(), "FOREIGN KEY") {
+		t.Fatalf("delete returned %v, want a foreign key violation", err)
+	}
+	rows := execSQL(t, db, `SELECT id FROM parent`).Rows
+	if len(rows) != 1 || rows[0]["id"] != 1 {
+		t.Fatalf("expected the parent row to survive a restricted delete, got %v", rows)
 	}
 }
 

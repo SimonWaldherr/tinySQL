@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"strconv"
@@ -9,6 +11,22 @@ import (
 	"testing"
 	"time"
 )
+
+func TestWALBlobChecksumPreservesByteStream(t *testing.T) {
+	var payload [1024]byte
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	for _, blob := range [][]byte{nil, {}, payload[:1], payload[:99], payload[:]} {
+		var got bytes.Buffer
+		var scratch [40]byte
+		hashWALValue(&got, blob, &scratch)
+		want := fmt.Sprintf("%T%v;", blob, blob)
+		if got.String() != want {
+			t.Fatalf("BLOB length %d changed checksum input", len(blob))
+		}
+	}
+}
 
 // Freeze the previous complete CRC stream, including header and descriptors.
 func referenceWALChecksum(record *WALRecord) uint32 {

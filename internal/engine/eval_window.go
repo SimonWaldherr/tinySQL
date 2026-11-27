@@ -135,7 +135,7 @@ func lastWindowPeerIndex(partitionRows []Row, currentIdx int, orderBy []OrderIte
 }
 
 // evalMovingAggregate evaluates MOVING_SUM and MOVING_AVG window functions
-func evalMovingAggregate(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int, row Row) (any, error) {
+func evalMovingAggregate(env ExecEnv, ex *FuncCall, partitionRows []Row, currentIdx int, row Row, entry *windowPartitionEntry) (any, error) {
 	// Get window size from first argument
 	if len(ex.Args) == 0 {
 		return nil, fmt.Errorf("%s requires window size argument", ex.Name)
@@ -168,6 +168,10 @@ func evalMovingAggregate(env ExecEnv, ex *FuncCall, partitionRows []Row, current
 		} else {
 			return nil, fmt.Errorf("%s requires value expression", ex.Name)
 		}
+	}
+
+	if value, used, err := cachedWindowTotal(env, entry, partitionRows, startIdx, currentIdx+1, ex.Name, valueExpr); used || err != nil {
+		return value, err
 	}
 
 	// Calculate sum over window
@@ -222,22 +226,21 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	// that partition. See windowPartitionCache: this is memoized per distinct
 	// PARTITION BY key so a query with N output rows across P partitions does
 	// the O(N)-filter + O(N log N)-sort work P times, not N times.
-	partitionRows, currentIdx := resolveWindowPartition(env, ex, allRows, row)
+	partitionRows, currentIdx, entry := resolveWindowPartition(env, ex, allRows, row)
 
 	if isAggregateName(ex.Name) {
-		if count, used, err := cachedWindowFrameCount(env, ex, row, partitionRows, currentIdx); used || err != nil {
-			return count, err
-		}
-		frame, used, err := cachedWindowIntRange(env, ex, row, partitionRows, currentIdx)
-		if !used && err == nil {
-			frame, err = windowFrameRows(env, partitionRows, currentIdx, ex.Over)
-		}
+		start, end, err := windowFrameBounds(env, partitionRows, currentIdx, ex.Over, entry)
 		if err != nil {
 			return nil, err
 		}
+		if !ex.Star && !ex.Distinct && ex.Filter == nil && len(ex.Args) == 1 {
+			if value, used, err := cachedWindowTotal(env, entry, partitionRows, start, end, ex.Name, ex.Args[0]); used || err != nil {
+				return value, err
+			}
+		}
 		call := *ex
 		call.Over = nil
-		return evalAggregateFuncCall(env, &call, frame)
+		return evalAggregateFuncCall(env, &call, partitionRows[start:end])
 	}
 
 	// Evaluate the specific window function
@@ -263,11 +266,11 @@ func evalWindowFunction(env ExecEnv, ex *FuncCall, row Row) (any, error) {
 	case "LEAD":
 		return evalLeadFunction(env, ex, partitionRows, currentIdx, row)
 	case "FIRST_VALUE":
-		return evalWindowFrameValue(env, ex, partitionRows, currentIdx, false)
+		return evalWindowFrameValue(env, ex, partitionRows, currentIdx, entry, false)
 	case "LAST_VALUE":
-		return evalWindowFrameValue(env, ex, partitionRows, currentIdx, true)
+		return evalWindowFrameValue(env, ex, partitionRows, currentIdx, entry, true)
 	case "MOVING_SUM", "MOVING_AVG":
-		return evalMovingAggregate(env, ex, partitionRows, currentIdx, row)
+		return evalMovingAggregate(env, ex, partitionRows, currentIdx, row, entry)
 	default:
 		return nil, fmt.Errorf("unsupported window function: %s", ex.Name)
 	}
@@ -426,9 +429,11 @@ type windowPartitionShape struct {
 }
 
 type windowPartitionEntry struct {
-	rows          []Row
-	countPrefixes map[string][]int
-	integerRanges map[string][]int64
+	rows                []Row
+	countPrefixes       map[string][]int
+	integerTotals       map[string][]windowIntegerTotal
+	integerRange        []int64
+	integerRangeChecked bool
 	// posByOrigIdx maps a row's index within env.windowRows to that row's
 	// position within rows (post partition-filter, post sort). Built once
 	// per partition (see buildWindowPartition) so evalWindowFunction can
@@ -448,7 +453,7 @@ func newWindowPartitionCache() *windowPartitionCache {
 // window-function evaluation and the current row's index within it, building
 // that row set at most once per distinct partition (see windowPartitionCache)
 // instead of once per output row.
-func resolveWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, row Row) ([]Row, int) {
+func resolveWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, row Row) ([]Row, int, *windowPartitionEntry) {
 	cache := env.windowPartitions
 	if cache == nil {
 		// Defensive fallback: windowRows was set up without a cache (not
@@ -462,7 +467,7 @@ func resolveWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, row Row) (
 		if len(ex.Over.OrderBy) > 0 {
 			partitionRows = sortRows(partitionRows, ex.Over.OrderBy)
 		}
-		return partitionRows, findRowIndex(partitionRows, row, env.windowIndex)
+		return partitionRows, findRowIndex(partitionRows, row, env.windowIndex), nil
 	}
 
 	shape := cache.shapeFor(ex)
@@ -487,13 +492,15 @@ func resolveWindowPartition(env ExecEnv, ex *FuncCall, allRows []Row, row Row) (
 		cache.entries[key] = entry
 	}
 
-	if pos, ok := entry.posByOrigIdx[env.windowIndex]; ok {
-		return entry.rows, pos
+	pos, ok := entry.posByOrigIdx[env.windowIndex]
+	if !ok {
+		// A missing hint falls back to the original content-equality scan.
+		pos = findRowIndex(entry.rows, row, -1)
 	}
-	// env.windowIndex didn't resolve to a position (e.g. an unset/invalid
-	// hint) -- fall back to the same content-equality scan evalWindowFunction
-	// always used, so correctness never depends on the hint being right.
-	return entry.rows, findRowIndex(entry.rows, row, -1)
+	if !shape.shareable {
+		return entry.rows, pos, nil
+	}
+	return entry.rows, pos, entry
 }
 
 // shapeFor returns the canonical partition-building shape for one function
